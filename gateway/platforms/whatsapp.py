@@ -81,16 +81,40 @@ from gateway.platforms.base import (
 )
 
 
+def _resolve_node_path() -> Optional[str]:
+    import shutil
+    import glob
+    from pathlib import Path
+    
+    node_path = shutil.which("node")
+    if node_path:
+        return node_path
+        
+    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_dir.exists():
+        node_binaries = glob.glob(str(nvm_dir / "*" / "bin" / "node"))
+        if node_binaries:
+            return sorted(node_binaries)[-1]
+            
+    for path in ["/usr/local/bin/node", "/opt/homebrew/bin/node"]:
+        if Path(path).exists():
+            return path
+            
+    return None
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
     
     WhatsApp requires a Node.js bridge for most implementations.
     """
-    # Check for Node.js
+    node_path = _resolve_node_path()
+    if not node_path:
+        return False
+
     try:
         result = subprocess.run(
-            ["node", "--version"],
+            [node_path, "--version"],
             capture_output=True,
             text=True,
             timeout=5
@@ -362,9 +386,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
 
+            node_path = _resolve_node_path()
+            if not node_path:
+                logger.error("[%s] Node.js not found in PATH or standard NVM locations", self.name)
+                self._set_fatal_error("whatsapp_no_node", "Node.js not installed", retryable=False)
+                return False
+
             self._bridge_process = subprocess.Popen(
                 [
-                    "node",
+                    node_path,
                     str(bridge_path),
                     "--port", str(self._bridge_port),
                     "--session", str(self._session_path),
