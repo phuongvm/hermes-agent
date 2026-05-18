@@ -22,6 +22,7 @@ Optional env vars:
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -34,10 +35,9 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 try:
-    from langfuse import Langfuse, propagate_attributes
+    from langfuse import Langfuse
 except Exception:  # pragma: no cover - fail-open when optional dep is missing
     Langfuse = None
-    propagate_attributes = None
 
 
 @dataclass
@@ -557,42 +557,24 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     if session_id:
         trace_ctx["session_id"] = session_id
 
-    if propagate_attributes is not None:
-        try:
-            with propagate_attributes(
-                session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
-            ):
-                root_ctx = client.start_as_current_observation(
-                    trace_context=trace_ctx,
-                    name="Hermes turn",
-                    as_type="chain",
-                    input=trace_input,
-                    metadata=metadata,
-                    end_on_exit=False,
-                )
-                root_span = root_ctx.__enter__()
-        except Exception:
-            root_ctx = client.start_as_current_observation(
-                trace_context=trace_ctx,
-                name="Hermes turn",
-                as_type="chain",
-                input=trace_input,
-                metadata=metadata,
-                end_on_exit=False,
-            )
-            root_span = root_ctx.__enter__()
-    else:
-        root_ctx = client.start_as_current_observation(
-            trace_context=trace_ctx,
-            name="Hermes turn",
-            as_type="chain",
-            input=trace_input,
-            metadata=metadata,
-            end_on_exit=False,
-        )
-        root_span = root_ctx.__enter__()
+    # Use start_observation() instead of start_as_current_observation().
+    # start_as_current_observation() attaches to the OpenTelemetry context
+    # via contextvars, which causes ValueError("was created in a different
+    # Context") when the agent is interrupted/cancelled and __exit__ runs
+    # in a different execution context than __enter__.  Since this plugin
+    # manages span lifecycle manually via _TRACE_STATE (calling .end()
+    # explicitly), OTel context attachment is unnecessary and harmful.
+    #
+    # Note: propagate_attributes() (OTel baggage/attributes propagation)
+    # is intentionally NOT used here — it would re-introduce contextvars
+    # attachment.  Session grouping and tags are handled via trace_context.
+    root_span = client.start_observation(
+        trace_context=trace_ctx,
+        name="Hermes turn",
+        as_type="chain",
+        input=trace_input,
+        metadata=metadata,
+    )
 
     try:
         root_span.set_trace_io(input=trace_input)
@@ -600,7 +582,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    # root_ctx is None — we use start_observation() which doesn't return
+    # a context manager.  Kept in TraceState for backward compatibility.
+    return TraceState(trace_id=trace_id, root_ctx=None, root_span=root_span)
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -633,6 +617,13 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
         if update_kwargs:
             observation.update(**update_kwargs)
         observation.end()
+    except ValueError as exc:
+        # OpenTelemetry contextvars token created in a different execution
+        # context — happens when the agent is interrupted/cancelled and
+        # span cleanup runs in a different thread/async context.  The span
+        # is already ended; this is safe to ignore.
+        if "was created in a different Context" not in str(exc):
+            _debug(f"end observation failed: {exc}")
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"end observation failed: {exc}")
 
@@ -669,6 +660,9 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             state.root_span.set_trace_io(output=final_output)
             state.root_span.update(output=final_output)
         state.root_span.end()
+    except ValueError as exc:
+        if "was created in a different Context" not in str(exc):
+            _debug(f"finish trace failed: {exc}")
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
@@ -676,6 +670,68 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             client.flush()
         except Exception:
             pass
+
+
+def _cleanup_single_state(state: TraceState) -> None:
+    """End all observations for a single trace state (used for stale cleanup)."""
+    try:
+        for observation in state.generations.values():
+            observation.end()
+        for observation in state.tools.values():
+            observation.end()
+        for queue in state.pending_tools_by_name.values():
+            for observation in queue:
+                observation.end()
+        state.root_span.end()
+    except ValueError as exc:
+        if "was created in a different Context" not in str(exc):
+            _debug(f"cleanup stale trace failed: {exc}")
+    except Exception:
+        pass
+
+
+def _cleanup_all_traces() -> None:
+    """Force-end all pending traces.
+
+    Call this when the agent is interrupted, cancelled, or shutting down
+    to prevent orphan _TRACE_STATE entries from leaking across sessions.
+    This is a hard cleanup — it forcibly pops all states from the global
+    dict and ends their spans without waiting for the normal hook flow.
+
+    IMPORTANT: Uses the already-cached _LANGFUSE_CLIENT directly. Does NOT
+    call the client getter, which could trigger SDK initialization during
+    interpreter shutdown (causes "cannot schedule new futures after
+    interpreter shutdown").
+    """
+    global _LANGFUSE_CLIENT
+    if _LANGFUSE_CLIENT is None or _LANGFUSE_CLIENT is _INIT_FAILED:
+        return
+    client = _LANGFUSE_CLIENT
+
+    with _STATE_LOCK:
+        states = list(_TRACE_STATE.values())
+        _TRACE_STATE.clear()
+
+    for state in states:
+        try:
+            for observation in state.generations.values():
+                observation.end()
+            for observation in state.tools.values():
+                observation.end()
+            for queue in state.pending_tools_by_name.values():
+                for observation in queue:
+                    observation.end()
+            state.root_span.end()
+        except ValueError as exc:
+            if "was created in a different Context" not in str(exc):
+                _debug(f"cleanup trace failed: {exc}")
+        except Exception:
+            pass
+
+    try:
+        client.flush()
+    except Exception:
+        pass
 
 
 def _assistant_has_tool_calls(message: Any) -> bool:
@@ -710,6 +766,11 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
+        if state is not None:
+            # Previous trace for this task_key was never cleaned up
+            # (interrupt/crash before post_llm_call). End it now.
+            _cleanup_single_state(state)
+            state = None
         if state is None:
             state = _start_root_trace(
                 task_key,
@@ -764,6 +825,12 @@ def on_pre_llm_request(
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
+        if state is not None:
+            # Previous trace for this task_key was never cleaned up
+            # (interrupt/crash before post_api_request). End it now
+            # before starting the new trace to prevent leaks.
+            _cleanup_single_state(state)
+            state = None
         if state is None:
             state = _start_root_trace(
                 task_key,
@@ -1002,3 +1069,12 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+
+    # Flush pending traces on process exit (covers interrupt/crash paths
+    # where post_api_request never fires).  Wrapped in try/except because
+    # the plugin may be loaded during interpreter shutdown (e.g. lazy
+    # gateway reload), at which point atexit.register() raises RuntimeError.
+    try:
+        atexit.register(_cleanup_all_traces)
+    except RuntimeError:
+        _debug("atexit.register() skipped — interpreter already shutting down")
