@@ -923,16 +923,42 @@ def _tui_need_npm_install(root: Path) -> bool:
     entry = root / "dist" / "entry.js"
     # Prebuilt self-contained bundle (nix / packaged release): no lockfile
     # shipped, dist/entry.js is the single runtime artefact.
-    if entry.is_file() and not lock.is_file():
-        return False
+    try:
+        if entry.is_file() and not lock.is_file():
+            return False
+    except OSError:
+        pass
 
     ink = root / "node_modules" / "@hermes" / "ink" / "package.json"
-    if not ink.is_file():
+    is_ink_installed = False
+    try:
+        is_ink_installed = ink.is_file()
+    except OSError:
+        try:
+            is_ink_installed = ink.is_symlink() or os.path.exists(ink.parent)
+        except OSError:
+            is_ink_installed = True
+
+    if not is_ink_installed:
         return True
-    if not lock.is_file():
+
+    try:
+        if not lock.is_file():
+            return False
+    except OSError:
         return False
+
     marker = root / "node_modules" / ".package-lock.json"
-    if not marker.is_file():
+    is_marker_file = False
+    try:
+        is_marker_file = marker.is_file()
+    except OSError:
+        try:
+            is_marker_file = marker.is_symlink() or os.path.exists(marker.parent)
+        except OSError:
+            is_marker_file = True
+
+    if not is_marker_file:
         return True
 
     # Compare lockfile contents, not mtimes: git checkouts and npm rewrites
@@ -942,7 +968,10 @@ def _tui_need_npm_install(root: Path) -> bool:
         wanted = json.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
         installed = json.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return lock.stat().st_mtime > marker.stat().st_mtime
+        try:
+            return lock.stat().st_mtime > marker.stat().st_mtime
+        except OSError:
+            return True
 
     def comparable(pkg: dict) -> dict:
         return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
