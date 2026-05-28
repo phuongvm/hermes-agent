@@ -283,6 +283,17 @@ class TestTeamsAdapterInit:
         adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
         assert adapter._port == 5000
 
+    def test_invalid_port_from_extra_falls_back_to_default(self):
+        adapter = TeamsAdapter(
+            _make_config(client_id="id", client_secret="secret", tenant_id="tenant", port="abc")
+        )
+        assert adapter._port == 3978
+
+    def test_invalid_port_from_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_PORT", "abc")
+        adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
+        assert adapter._port == 3978
+
     def test_platform_value(self):
         adapter = TeamsAdapter(_make_config(client_id="id", client_secret="secret", tenant_id="tenant"))
         assert adapter.platform.value == "teams"
@@ -538,12 +549,16 @@ class TestTeamsSummaryWriter:
 
     @pytest.mark.anyio
     async def test_existing_record_is_reused_without_force_resend(self):
+        from plugins.platforms.teams.adapter import _compute_summary_hash
+
         graph_client = SimpleNamespace(post_json=AsyncMock())
         writer = TeamsSummaryWriter(graph_client=graph_client)
-        existing = {"delivery_mode": "graph", "message_id": "msg-existing"}
+        payload = _make_summary_payload()
+        content_hash = _compute_summary_hash(payload)
+        existing = {"delivery_mode": "graph", "message_id": "msg-existing", "content_hash": content_hash}
 
         result = await writer.write_summary(
-            _make_summary_payload(),
+            payload,
             {
                 "delivery_mode": "graph",
                 "team_id": "team-1",
@@ -752,7 +767,7 @@ def _install_fake_aiohttp(monkeypatch, session):
     """Replace ``aiohttp`` in ``sys.modules`` so ``import aiohttp as _aiohttp``
     inside ``_standalone_send`` picks up our fake."""
     fake_aiohttp = types.SimpleNamespace(
-        ClientSession=lambda timeout=None: session,
+        ClientSession=lambda timeout=None, **kwargs: session,
         ClientTimeout=lambda total=None: None,
     )
     monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
