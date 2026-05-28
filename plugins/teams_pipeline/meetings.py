@@ -389,7 +389,7 @@ async def _list_artifacts_from_organizer_drive(
 
 
 def _wrap_graph_error(exc: MicrosoftGraphAPIError, *, missing_message: str) -> TeamsMeetingError:
-    if exc.status_code in (401, 403):
+    if exc.status_code in {401, 403}:
         return TeamsMeetingPermissionError(str(exc))
     if exc.status_code == 404:
         return TeamsMeetingNotFoundError(missing_message)
@@ -1357,7 +1357,7 @@ async def fetch_call_record_artifact(
     try:
         payload = await client.get_json(f"/communications/callRecords/{quote(call_record_id, safe='')}")
     except MicrosoftGraphAPIError as exc:
-        if exc.status_code in (401, 403) and allow_permission_errors:
+        if exc.status_code in {401, 403} and allow_permission_errors:
             return None
         if exc.status_code == 404:
             return None

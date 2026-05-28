@@ -117,6 +117,13 @@ def _parse_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
+def _coerce_port(value: Any, *, default: int = _DEFAULT_PORT) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _compute_summary_hash(payload: Any) -> str:
     """Compute a SHA-256 hash of the summary content for dedup comparison.
 
@@ -732,7 +739,7 @@ async def _standalone_send(
         # Per-request timeouts so a slow STS endpoint cannot starve the
         # subsequent activity POST of its budget.
         per_request_timeout = _aiohttp.ClientTimeout(total=15.0)
-        async with _aiohttp.ClientSession() as session:
+        async with _aiohttp.ClientSession(trust_env=True) as session:
             async with session.post(
                 token_url,
                 data={
@@ -796,7 +803,9 @@ class TeamsAdapter(BasePlatformAdapter):
         self._client_id = extra.get("client_id") or os.getenv("TEAMS_CLIENT_ID", "")
         self._client_secret = extra.get("client_secret") or os.getenv("TEAMS_CLIENT_SECRET", "")
         self._tenant_id = extra.get("tenant_id") or os.getenv("TEAMS_TENANT_ID", "")
-        self._port = int(extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT)))
+        self._port = _coerce_port(
+            extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT))
+        )
         self._app: Optional["App"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._dedup = MessageDeduplicator(max_size=1000)
@@ -1005,7 +1014,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # bot silently treated every clicker as authorized — meaning any
         # Teams user who could message the bot could approve dangerous commands.
         allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
-        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in ("1", "true", "yes")
+        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
 
         if not allow_all:
             if not allowed_csv:
