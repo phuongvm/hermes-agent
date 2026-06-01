@@ -606,7 +606,8 @@ class DiscordAdapter(BasePlatformAdapter):
             import ctypes.util
             opus_path = ctypes.util.find_library("opus")
             # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
-            # so fall back to known Homebrew paths if needed.
+            # and on Windows when running as a service (PATH is minimal).
+            # Fall back to known platform-specific paths if needed.
             if not opus_path:
                 _homebrew_paths = (
                     "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
@@ -617,9 +618,19 @@ class DiscordAdapter(BasePlatformAdapter):
                         if os.path.isfile(_hp):
                             opus_path = _hp
                             break
+                elif sys.platform == "win32":
+                    # discord.py bundles libopus in its bin/ directory
+                    import pathlib
+                    _discord_bin = pathlib.Path(discord.__file__).parent / "bin"
+                    for _name in ("libopus-0.x64.dll", "libopus-0.x86.dll", "libopus-0.dll"):
+                        _candidate = _discord_bin / _name
+                        if _candidate.is_file():
+                            opus_path = str(_candidate)
+                            break
             if opus_path:
                 try:
                     discord.opus.load_opus(opus_path)
+                    logger.info("Opus codec loaded from: %s", opus_path)
                 except Exception:
                     logger.warning("Opus codec found at %s but failed to load", opus_path)
             if not discord.opus.is_loaded():
