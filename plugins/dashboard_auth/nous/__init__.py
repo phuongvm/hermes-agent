@@ -447,6 +447,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
                 # Contract: issuer is the Portal base URL.
                 issuer=self._portal_url,
                 options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+                leeway=60,
             )
         except jwt.ExpiredSignatureError as exc:
             # verify_session() catches this and returns None per protocol.

@@ -633,6 +633,8 @@ def run_doctor(args):
             check_ok(name)
         except ImportError:
             _fail_and_issue(name, "(missing)", f"Install {name}: {_python_install_cmd()} {module}", issues)
+        except Exception as e:
+            _fail_and_issue(name, f"(import failed: {e})", f"Repair {name} installation", issues)
     
     for module, name in optional_packages:
         try:
@@ -640,7 +642,9 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
-    
+        except Exception as e:
+            check_warn(name, f"(optional, import failed: {e})")
+
     _section("Configuration Files")
     # Check ~/.hermes/.env (primary location for user config)
     env_path = HERMES_HOME / '.env'
