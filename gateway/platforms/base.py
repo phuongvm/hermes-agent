@@ -753,7 +753,6 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2, he
                 async with client.stream(
                     "GET",
                     url,
-<<<<<<< HEAD
                     headers=req_headers,
                 ) as response:
                     response.raise_for_status()

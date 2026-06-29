@@ -283,6 +283,12 @@ class ToolRegistry:
         with self._lock:
             return self._toolset_aliases.get(alias)
 
+    def register_toolset_check(self, toolset: str, check_fn: Callable) -> None:
+        """Explicitly set or override the canonical availability check for a toolset."""
+        with self._lock:
+            self._toolset_checks[toolset] = check_fn
+            self._generation += 1
+
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
