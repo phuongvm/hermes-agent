@@ -485,6 +485,12 @@ class TeamsSummaryWriter:
         return "\n".join(lines)
 
     def _render_summary_html(self, payload: Any) -> str:
+        # Use pre-rendered template-driven HTML when available (pipeline v1.0+)
+        rendered = getattr(payload, "rendered_html", None)
+        if rendered and isinstance(rendered, str) and rendered.strip():
+            return rendered
+
+        # Fallback: hardcoded HTML renderer (original behavior)
         sections = [
             ("Summary", [self._text(getattr(payload, "summary", None), "No summary available.")]),
             ("Key decisions", list(getattr(payload, "key_decisions", None) or [])),

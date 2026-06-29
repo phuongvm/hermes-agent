@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from plugins.teams_pipeline import register
 from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
 from plugins.teams_pipeline.store import TeamsPipelineStore
-from plugins.teams_pipeline.models import MeetingArtifact
+from plugins.teams_pipeline.models import MeetingArtifact, TeamsMeetingRef, TeamsMeetingSummaryPayload
 
 
 class FakeGraphClient:
@@ -110,6 +110,107 @@ def test_build_pipeline_runtime_reuses_existing_teams_adapter_surface(monkeypatc
 
     assert isinstance(runtime.teams_sender, FakeWriter)
     assert runtime.teams_sender.platform_config is gateway.config.platforms[Platform("teams")]
+
+
+@pytest.mark.anyio
+async def test_build_pipeline_runtime_notifies_review_target_via_delivery_router(monkeypatch, tmp_path):
+    from plugins.teams_pipeline import runtime as runtime_module
+    from plugins.teams_pipeline.models import TeamsMeetingPipelineJob
+
+    deliveries = []
+
+    class FakeDeliveryRouter:
+        async def deliver(self, content, targets, metadata=None, **kwargs):
+            deliveries.append(
+                {
+                    "content": content,
+                    "targets": [target.to_string() for target in targets],
+                    "metadata": metadata,
+                }
+            )
+            return {"matrix:!review:example.org": {"success": True}}
+
+    monkeypatch.setattr(runtime_module, "build_graph_client", lambda: object())
+    monkeypatch.setattr("plugins.platforms.teams.adapter.TeamsSummaryWriter", object)
+    monkeypatch.setattr(runtime_module, "resolve_teams_pipeline_store_path", lambda: tmp_path / "teams-store.json")
+
+    gateway = SimpleNamespace(
+        config=GatewayConfig(
+            platforms={
+                Platform("teams"): PlatformConfig(enabled=False),
+                Platform.MATRIX: PlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform.MATRIX,
+                        chat_id="!review:example.org",
+                        name="Review",
+                    ),
+                ),
+            }
+        ),
+        delivery_router=FakeDeliveryRouter(),
+    )
+    runtime = runtime_module.build_pipeline_runtime(gateway)
+    job = TeamsMeetingPipelineJob(
+        job_id="teams-job-review",
+        event_id="event-review",
+        source_event_type="graph.notification",
+        dedupe_key="event-review",
+        status="pending_review",
+    )
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="meeting-review"),
+        title="Review me",
+    )
+
+    await runtime._notify_pending_review(job, payload)
+
+    assert deliveries
+    assert deliveries[0]["targets"] == ["matrix:!review:example.org"]
+    assert "teams-job-review" in deliveries[0]["content"]
+    assert deliveries[0]["metadata"]["teams_pipeline_status"] == "pending_review"
+
+
+def test_default_summary_template_lives_under_skills_templates():
+    from plugins.teams_pipeline.pipeline import DEFAULT_TEMPLATE_PATH, _load_summary_template
+
+    repo_root = Path(__file__).resolve().parents[2]
+    template_path = Path(DEFAULT_TEMPLATE_PATH).resolve()
+
+    assert template_path.is_relative_to(repo_root / "skills" / "templates")
+    assert template_path.is_file()
+    assert _load_summary_template() is not None
+
+
+@pytest.mark.anyio
+async def test_pending_review_notifier_is_injected(tmp_path):
+    from plugins.teams_pipeline.models import TeamsMeetingPipelineJob
+
+    notifications = []
+
+    async def _notify(job, payload):
+        notifications.append((job.job_id, payload.title))
+
+    pipeline = TeamsMeetingPipeline(
+        graph_client=FakeGraphClient(),
+        store=TeamsPipelineStore(tmp_path / "teams-store.json"),
+        pending_review_notifier=_notify,
+    )
+    job = TeamsMeetingPipelineJob(
+        job_id="teams-job-review",
+        event_id="event-review",
+        source_event_type="graph.notification",
+        dedupe_key="event-review",
+        status="pending_review",
+    )
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="meeting-review"),
+        title="Review me",
+    )
+
+    await pipeline._notify_pending_review(job, payload)
+
+    assert notifications == [("teams-job-review", "Review me")]
 
 
 @pytest.mark.anyio
@@ -758,3 +859,495 @@ class TestTeamsMeetingPipeline:
         assert len(store.list_jobs()) == 1
         receipt_key = TeamsPipelineStore.build_notification_receipt_key(notification)
         assert store.has_notification_receipt(receipt_key) is True
+
+
+# ─── HTML Rendering Tests (Group 7) ────────────────────────────────
+
+
+def _make_full_payload() -> TeamsMeetingSummaryPayload:
+    """Build a payload with all extended fields populated for HTML rendering tests."""
+    from plugins.teams_pipeline.models import (
+        SpeakerUpdate, StrategicDiscussion, StructuredActionItem, StructuredRisk,
+    )
+    from datetime import datetime, timezone
+
+    return TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(
+            meeting_id="meeting-html-test",
+            metadata={"organizer": "Ted Blackmon"},
+        ),
+        title="Daily Stand-up",
+        start_time=datetime(2026, 5, 22, 6, 59, tzinfo=timezone.utc),
+        end_time=datetime(2026, 5, 22, 8, 23, tzinfo=timezone.utc),
+        participants=["Phuong Lambert", "Markus Chen", "Shadi Shaheen"],
+        speakers=[
+            SpeakerUpdate(
+                name="Phuong",
+                topic_label="Database Modeling",
+                bullets=[
+                    "Refactored schema.py with new MeetingArtifact class",
+                    "Fixed config.yaml loading for template_path",
+                ],
+            ),
+            SpeakerUpdate(
+                name="Markus",
+                topic_label="Frontend Updates",
+                bullets=["Completed TaskList component with drag-and-drop"],
+            ),
+        ],
+        decision_headline="Adopt tiered visibility",
+        decision_chosen="Three-tier model: public, internal, confidential.",
+        decision_rejected="Flat permission model was too coarse.",
+        strategic_discussions=[
+            StrategicDiscussion(topic="Q3 Roadmap", content="Expanding AI features."),
+        ],
+        structured_action_items=[
+            StructuredActionItem(who="Phuong", action="Finalize schema PR"),
+            StructuredActionItem(who="Markus", action="Write unit tests"),
+            StructuredActionItem(who="Shadi", action="Review proposal"),
+            StructuredActionItem(who="Team", action="Schedule review meeting"),
+        ],
+        structured_risks=[
+            StructuredRisk(risk="OAuth token expiry", impact="Summaries fail silently"),
+        ],
+    )
+
+
+def test_render_html_contains_expected_tags_and_sections():
+    """7.9: HTML output contains expected tags and section order."""
+    from plugins.teams_pipeline.pipeline import _render_summary_html
+
+    payload = _make_full_payload()
+    result = _render_summary_html(payload)
+
+    # Header
+    assert "<h2>📋 Meeting Summary: Daily Stand-up</h2>" in result
+    assert "May 22, 2026" in result
+    assert "06:59–08:23 UTC" in result
+    assert "~84 min" in result
+    assert "Ted Blackmon" in result
+    assert "Phuong Lambert, Markus Chen, Shadi Shaheen" in result
+
+    # Status updates
+    assert "<b>Phuong — Database Modeling</b>" in result
+    assert "<ul>" in result
+    assert "<li>" in result
+    assert "<code>schema.py</code>" in result
+    assert "<code>config.yaml</code>" in result
+
+    # Decision
+    assert "🎯 Key Decision: Adopt tiered visibility" in result
+    assert "Three-tier model" in result
+    assert "<i>Rejected:" in result
+
+    # Strategic
+    assert "📌 Q3 Roadmap" in result
+
+    # Action items table
+    assert "<th>Who</th>" in result
+    assert "<th>Action</th>" in result
+
+    # Risks table
+    assert "<th>Risk</th>" in result
+    assert "<th>Impact</th>" in result
+
+    # Separators
+    assert "<hr>" in result
+
+    # Section order: header → status → decision → strategic → actions → risks
+    idx_status = result.index("📊 Status Updates")
+    idx_decision = result.index("🎯 Key Decision")
+    idx_strategic = result.index("📌 Q3 Roadmap")
+    idx_actions = result.index("✅ Action Items")
+    idx_risks = result.index("⚠️ Risks")
+    assert idx_status < idx_decision < idx_strategic < idx_actions < idx_risks
+
+
+def test_render_html_action_items_sorted_alphabetically():
+    """7.10: Action items table sorted alphabetically by Who, Team last."""
+    from plugins.teams_pipeline.pipeline import _render_summary_html
+    import re
+
+    payload = _make_full_payload()
+    result = _render_summary_html(payload)
+
+    # Extract Who values in order from table rows
+    who_values = re.findall(r'<tr><td><b>([^<]+)</b></td>', result)
+    assert who_values == ["Markus", "Phuong", "Shadi", "Team"]
+
+
+def test_render_html_conditional_sections_omitted_when_empty():
+    """7.11: Conditional sections omitted when data is empty."""
+    from plugins.teams_pipeline.pipeline import _render_summary_html
+
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="empty-meeting"),
+        title="Empty Meeting",
+    )
+    result = _render_summary_html(payload)
+
+    assert "📊 Status Updates" not in result
+    assert "🎯 Key Decision" not in result
+    assert "📌" not in result
+    assert "<table>" not in result
+    assert "⚠️ Risks" not in result
+    # Header should still be present
+    assert "<h2>📋 Meeting Summary: Empty Meeting</h2>" in result
+
+
+def test_render_html_legacy_action_items():
+    """Legacy string action_items auto-extracted into Who/Action table."""
+    from plugins.teams_pipeline.pipeline import _render_summary_html
+
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="legacy"),
+        title="Legacy Meeting",
+        action_items=["Phuong: Fix the auth bug", "Team: Review PR #42"],
+    )
+    result = _render_summary_html(payload)
+
+    assert "<b>Phuong</b>" in result
+    assert "Fix the auth bug" in result
+    # Phuong before Team (alphabetical, Team last)
+    assert result.index("<b>Phuong</b>") < result.index("<b>Team</b>")
+
+
+# ─── Teams Sink Integration Tests (Group 8) ─────────────────────────
+
+
+def test_teams_writer_uses_pre_rendered_html_when_available():
+    """8.4: Teams writer passes through pre-rendered template-driven HTML."""
+    from plugins.platforms.teams.adapter import TeamsSummaryWriter
+
+    writer = TeamsSummaryWriter()
+
+    # Create payload with pre-rendered HTML
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="pre-rendered"),
+        title="Template Meeting",
+        summary="This should not appear",
+        rendered_html="<h2>📋 Pre-rendered Template HTML</h2><hr><h3>✅ Action Items</h3><table><tr><th>Who</th><th>Action</th></tr></table>",
+    )
+
+    result = writer._render_summary_html(payload)
+
+    # Should use pre-rendered HTML, not generate its own
+    assert "📋 Pre-rendered Template HTML" in result
+    assert "This should not appear" not in result
+    assert "<h3>✅ Action Items</h3>" in result
+
+
+def test_teams_writer_fallback_to_hardcoded_when_no_pre_rendered_html():
+    """8.3: Teams writer falls back to hardcoded renderer when rendered_html is None."""
+    from plugins.platforms.teams.adapter import TeamsSummaryWriter
+
+    writer = TeamsSummaryWriter()
+
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="fallback"),
+        title="Fallback Meeting",
+        summary="This summary uses the fallback renderer",
+        key_decisions=["Use vLLM for inference"],
+        action_items=["Deploy by Friday"],
+        risks=["GPU budget exceeded"],
+    )
+
+    result = writer._render_summary_html(payload)
+
+    # Should use hardcoded renderer (no pre-rendered HTML)
+    assert "<h2>Fallback Meeting</h2>" in result
+    assert "This summary uses the fallback renderer" in result
+    assert "Use vLLM for inference" in result
+    assert "Deploy by Friday" in result
+    assert "GPU budget exceeded" in result
+    # Should NOT have template-driven elements (emoji, tables, etc.)
+    assert "📋" not in result
+    assert "<table>" not in result
+
+
+# ─── Notion/Linear Sink Preservation Tests (Group 9) ────────
+
+
+def test_render_markdown_includes_extended_fields():
+    """9.1: Markdown renderer includes speakers and strategic_discussions."""
+    from plugins.teams_pipeline.pipeline import _render_summary_markdown
+
+    payload = _make_full_payload()
+    result = _render_summary_markdown(payload)
+
+    # Status updates section with per-speaker entries
+    assert "## Status Updates & Code Exploration" in result
+    assert "**Phuong — Database Modeling**" in result
+    assert "**Markus — Frontend Updates**" in result
+    assert "Refactored schema.py" in result
+    assert "Completed TaskList" in result
+
+    # Key decision with headline
+    assert "## Key Decision: Adopt tiered visibility" in result
+    assert "Three-tier model" in result
+    assert "*Rejected:" in result
+
+    # Strategic discussions
+    assert "## Strategic Discussions" in result
+    assert "### Q3 Roadmap" in result
+    assert "Expanding AI features" in result
+
+    # Action items with structured format
+    assert "## Action Items" in result
+    assert "**Phuong**: Finalize schema PR" in result
+    assert "**Markus**: Write unit tests" in result
+    assert "**Shadi**: Review proposal" in result
+    assert "**Team**: Schedule review meeting" in result
+
+    # Risks with impact
+    assert "## Risks" in result
+    assert "**OAuth token expiry**: Summaries fail silently" in result
+
+
+def test_render_markdown_no_html_tags():
+    """9.2 & 9.3: Markdown output contains no HTML tags (safe for Notion/Linear)."""
+    from plugins.teams_pipeline.pipeline import _render_summary_markdown
+
+    payload = _make_full_payload()
+    result = _render_summary_markdown(payload)
+
+    # No HTML tags allowed in markdown output
+    assert "<h2>" not in result
+    assert "<h3>" not in result
+    assert "<p>" not in result
+    assert "<table>" not in result
+    assert "<code>" not in result
+    assert "<b>" not in result
+    assert "<ul>" not in result
+    assert "<li>" not in result
+    assert "<hr>" not in result
+
+    # Markdown formatting is present instead
+    assert "**Phuong" in result
+    assert "- " in result
+
+
+def test_render_markdown_backward_compat_legacy_payload():
+    """Legacy payload (no extended fields) renders same as before, no errors."""
+    from plugins.teams_pipeline.pipeline import _render_summary_markdown
+
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="legacy-md"),
+        title="Legacy Markdown Meeting",
+        summary="This is a summary",
+        key_decisions=["Decision A", "Decision B"],
+        action_items=["Fix bug", "Deploy to prod"],
+        risks=["Budget risk"],
+        confidence="high",
+        confidence_notes="Based on 2-hour call",
+    )
+    result = _render_summary_markdown(payload)
+
+    # Basic sections present
+    assert "# Legacy Markdown Meeting" in result
+    assert "## Summary" in result
+    assert "This is a summary" in result
+    assert "## Key Decisions" in result
+    assert "- Decision A" in result
+    assert "- Fix bug" in result
+    assert "- Deploy to prod" in result
+    assert "## Risks" in result
+    assert "- Budget risk" in result
+    assert "Confidence: high" in result
+    assert "Based on 2-hour call" in result
+
+    # No extended sections (not populated)
+    assert "## Status Updates" not in result
+    assert "## Strategic Discussions" not in result
+
+
+# ─── E2E Verification Tests (Group 10) ─────────────────────
+
+
+def test_fallback_to_hardcoded_summary_when_template_missing():
+    """10.2: When template file is missing, pipeline uses fallback behavior with no errors."""
+    from plugins.teams_pipeline.pipeline import _load_summary_template, _render_summary_markdown
+
+    # Missing template returns None
+    template = _load_summary_template("/nonexistent/path/to/template.yaml")
+    assert template is None
+
+    # Markdown renderer works fine with legacy payload (no extended fields)
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="fallback-test"),
+        title="Fallback Summary",
+        summary="Generated without template",
+        key_decisions=["Fallback decision"],
+        action_items=["Fix something"],
+    )
+    result = _render_summary_markdown(payload)
+    assert "# Fallback Summary" in result
+    assert "Generated without template" in result
+
+
+def test_rendered_html_not_used_without_template():
+    """10.2: payload.rendered_html stays None when template is not loaded."""
+    payload = TeamsMeetingSummaryPayload(
+        meeting_ref=TeamsMeetingRef(meeting_id="no-template"),
+        title="No Template",
+    )
+    assert payload.rendered_html is None
+
+
+# ─── Stage 2 Two-Stage Pipeline Tests (Group 11) ──────────
+
+
+def test_stage2_system_prompt_contains_only_structured_schema():
+    """11.7: Stage 2 prompt contains ONLY structured extraction schema — no overview fields."""
+    from plugins.teams_pipeline.pipeline import _build_stage2_system_prompt, _build_system_prompt_from_template, _load_summary_template
+
+    template = _load_summary_template()
+    assert template is not None
+
+    stage2_prompt = _build_stage2_system_prompt(template)
+    stage1_prompt = _build_system_prompt_from_template(template)
+
+    # Stage 2 MUST contain structured extraction schema
+    assert "speakers" in stage2_prompt
+    assert "structured_action_items" in stage2_prompt
+    assert "decision_headline" in stage2_prompt
+    assert "strategic_discussions" in stage2_prompt
+    assert "topic_label" in stage2_prompt
+    assert "bullets" in stage2_prompt
+
+    # Stage 2 MUST NOT contain overview fields (those are Stage 1's job)
+    assert '"summary": str' not in stage2_prompt
+    assert '"key_decisions": [str]' not in stage2_prompt
+    assert '"confidence": str' not in stage2_prompt
+
+    # Stage 1 SHOULD contain overview fields
+    assert '"summary": str' in stage1_prompt
+    assert '"key_decisions": [str]' in stage1_prompt
+    assert '"confidence": str' in stage1_prompt
+
+    # Stage 2 is narrower than Stage 1
+    assert len(stage2_prompt) < len(stage1_prompt)
+
+
+def test_stage2_parse_failure_returns_empty_dict():
+    """11.8: Stage 2 parse failure returns empty dict — Stage 1 output preserved."""
+    from plugins.teams_pipeline.pipeline import _parse_stage2_json
+
+    # Empty input
+    assert _parse_stage2_json("") == {}
+    assert _parse_stage2_json(None) == {}  # type: ignore
+
+    # Invalid JSON
+    assert _parse_stage2_json("not valid json {{{") == {}
+
+    # Non-object JSON
+    assert _parse_stage2_json('"just a string"') == {}
+    assert _parse_stage2_json("[1, 2, 3]") == {}
+
+    # Valid but empty object — returns dict with empty lists (not empty dict)
+    result = _parse_stage2_json("{}")
+    assert result == {
+        "speakers": [],
+        "structured_action_items": [],
+        "decision_headline": None,
+        "decision_chosen": None,
+        "decision_rejected": None,
+        "strategic_discussions": [],
+    }
+
+
+def test_stage2_parse_success_extracts_structured_data():
+    """11.9: Stage 2 success → speakers have detailed bullets, action items have proper who/action split."""
+    from plugins.teams_pipeline.pipeline import _parse_stage2_json
+    from plugins.teams_pipeline.models import SpeakerUpdate, StructuredActionItem, StrategicDiscussion
+
+    stage2_json = '''{
+        "speakers": [
+            {
+                "name": "Phuong",
+                "topic_label": "Database Schema Refactor",
+                "bullets": [
+                    "Refactored models.py with 4 new dataclasses",
+                    "Added rendered_html field to TeamsMeetingSummaryPayload",
+                    "Fixed compile errors in pipeline.py"
+                ]
+            },
+            {
+                "name": "Sebastian",
+                "topic_label": "Deliverable Deduplication",
+                "bullets": [
+                    "Deduplication logic complete for deliverables",
+                    "Fixed edge case connecting new nodes to existing ones",
+                    "Deployment failure resolved in test environment"
+                ]
+            }
+        ],
+        "structured_action_items": [
+            {"who": "Phuong", "action": "Finalize user chat architecture"},
+            {"who": "Sebastian", "action": "Fix deployment for deduplication"},
+            {"who": "Cali", "action": "Test deliverable deduplication"}
+        ],
+        "decision_headline": "Adopt left-menu UI for Optimizers",
+        "decision_chosen": "Left-menu layout to handle expanding optimizer list",
+        "decision_rejected": "Simple card/table view was too limited",
+        "strategic_discussions": [
+            {"topic": "AI Impact on Jobs", "content": "Discussed NVIDIA CEO Jensen Huang views on AI creating new roles"}
+        ]
+    }'''
+
+    result = _parse_stage2_json(stage2_json)
+
+    # Speakers with detailed bullets
+    assert len(result["speakers"]) == 2
+    assert isinstance(result["speakers"][0], SpeakerUpdate)
+    assert result["speakers"][0].name == "Phuong"
+    assert result["speakers"][0].topic_label == "Database Schema Refactor"
+    assert len(result["speakers"][0].bullets) == 3
+    assert "models.py" in result["speakers"][0].bullets[0]
+
+    # Action items with proper who/action split
+    assert len(result["structured_action_items"]) == 3
+    assert isinstance(result["structured_action_items"][0], StructuredActionItem)
+    assert result["structured_action_items"][0].who == "Phuong"
+    assert result["structured_action_items"][0].action == "Finalize user chat architecture"
+    # No name embedded in action text
+    assert "Phuong" not in result["structured_action_items"][0].action
+
+    # Decision fields
+    assert result["decision_headline"] == "Adopt left-menu UI for Optimizers"
+    assert result["decision_chosen"] == "Left-menu layout to handle expanding optimizer list"
+    assert result["decision_rejected"] == "Simple card/table view was too limited"
+
+    # Strategic discussions
+    assert len(result["strategic_discussions"]) == 1
+    assert isinstance(result["strategic_discussions"][0], StrategicDiscussion)
+    assert result["strategic_discussions"][0].topic == "AI Impact on Jobs"
+
+
+def test_stage2_parse_handles_code_fences():
+    """Stage 2 parser strips markdown code fences from LLM output."""
+    from plugins.teams_pipeline.pipeline import _parse_stage2_json
+
+    fenced = '```json\n{"speakers": [{"name": "Cali", "topic_label": "Testing", "bullets": ["Test item"]}]}\n```'
+    result = _parse_stage2_json(fenced)
+    assert len(result["speakers"]) == 1
+    assert result["speakers"][0].name == "Cali"
+
+
+def test_stage2_user_prompt_contains_required_sections():
+    """Stage 2 user prompt includes Stage 1 summary, transcript excerpt, and speaker list."""
+    from plugins.teams_pipeline.pipeline import _build_stage2_user_prompt
+
+    prompt = _build_stage2_user_prompt(
+        stage1_summary="The meeting discussed database refactoring and UI improvements.",
+        transcript_excerpt="<v Phuong Lambert>Hello team, let's discuss the schema changes.</v>",
+        speaker_list=["phuong@optimalitypro.com", "cali@optimalitypro.com", "sebastian@optimalitypro.com"],
+    )
+
+    assert "Stage 1 Summary" in prompt
+    assert "database refactoring" in prompt
+    assert "Transcript Excerpt" in prompt
+    assert "Phuong Lambert" in prompt
+    assert "Speaker List" in prompt
+    assert "phuong@optimalitypro.com" in prompt
+    assert "Extract structured data" in prompt

@@ -195,6 +195,102 @@ class MeetingArtifact:
 
 
 @dataclass
+class SpeakerUpdate:
+    """Per-speaker status update from a meeting (template v1.0+)."""
+
+    name: str
+    topic_label: str
+    bullets: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("SpeakerUpdate.name is required.")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SpeakerUpdate":
+        return cls(
+            name=str(payload.get("name") or "").strip(),
+            topic_label=str(payload.get("topic_label") or "").strip(),
+            bullets=list(payload.get("bullets") or []),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "topic_label": self.topic_label,
+            "bullets": self.bullets,
+        }
+
+
+@dataclass
+class StrategicDiscussion:
+    """Non-status strategic topic discussed in a meeting (template v1.0+)."""
+
+    topic: str
+    content: str
+
+    def __post_init__(self) -> None:
+        if not self.topic.strip():
+            raise ValueError("StrategicDiscussion.topic is required.")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "StrategicDiscussion":
+        return cls(
+            topic=str(payload.get("topic") or "").strip(),
+            content=str(payload.get("content") or "").strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"topic": self.topic, "content": self.content}
+
+
+@dataclass
+class StructuredActionItem:
+    """Action item with explicit owner (template v1.0+)."""
+
+    who: str
+    action: str
+
+    def __post_init__(self) -> None:
+        if not self.who.strip():
+            raise ValueError("StructuredActionItem.who is required.")
+        if not self.action.strip():
+            raise ValueError("StructuredActionItem.action is required.")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "StructuredActionItem":
+        return cls(
+            who=str(payload.get("who") or "").strip(),
+            action=str(payload.get("action") or "").strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"who": self.who, "action": self.action}
+
+
+@dataclass
+class StructuredRisk:
+    """Risk with impact assessment (template v1.0+)."""
+
+    risk: str
+    impact: str
+
+    def __post_init__(self) -> None:
+        if not self.risk.strip():
+            raise ValueError("StructuredRisk.risk is required.")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "StructuredRisk":
+        return cls(
+            risk=str(payload.get("risk") or "").strip(),
+            impact=str(payload.get("impact") or "").strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"risk": self.risk, "impact": self.impact}
+
+
+@dataclass
 class TeamsMeetingSummaryPayload:
     meeting_ref: TeamsMeetingRef
     title: str | None = None
@@ -213,6 +309,16 @@ class TeamsMeetingSummaryPayload:
     notion_target: str | None = None
     linear_target: str | None = None
     teams_target: str | None = None
+    # Extended fields (template v1.0+) — all optional for backward compatibility
+    speakers: list[SpeakerUpdate] = field(default_factory=list)
+    strategic_discussions: list[StrategicDiscussion] = field(default_factory=list)
+    decision_headline: str | None = None
+    decision_chosen: str | None = None
+    decision_rejected: str | None = None
+    structured_action_items: list[StructuredActionItem] = field(default_factory=list)
+    structured_risks: list[StructuredRisk] = field(default_factory=list)
+    # Pre-rendered HTML (populated by pipeline when template is loaded)
+    rendered_html: str | None = None
 
     def __post_init__(self) -> None:
         self.start_time = _parse_datetime(self.start_time)
@@ -240,6 +346,26 @@ class TeamsMeetingSummaryPayload:
             notion_target=payload.get("notion_target") or payload.get("notionTarget"),
             linear_target=payload.get("linear_target") or payload.get("linearTarget"),
             teams_target=payload.get("teams_target") or payload.get("teamsTarget"),
+            # Extended fields (template v1.0+)
+            speakers=[
+                SpeakerUpdate.from_dict(item) for item in (payload.get("speakers") or [])
+            ],
+            strategic_discussions=[
+                StrategicDiscussion.from_dict(item)
+                for item in (payload.get("strategic_discussions") or payload.get("strategicDiscussions") or [])
+            ],
+            decision_headline=payload.get("decision_headline") or payload.get("decisionHeadline"),
+            decision_chosen=payload.get("decision_chosen") or payload.get("decisionChosen"),
+            decision_rejected=payload.get("decision_rejected") or payload.get("decisionRejected"),
+            structured_action_items=[
+                StructuredActionItem.from_dict(item)
+                for item in (payload.get("structured_action_items") or payload.get("structuredActionItems") or [])
+            ],
+            structured_risks=[
+                StructuredRisk.from_dict(item)
+                for item in (payload.get("structured_risks") or payload.get("structuredRisks") or [])
+            ],
+            rendered_html=payload.get("rendered_html") or payload.get("renderedHtml"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -263,6 +389,21 @@ class TeamsMeetingSummaryPayload:
                 "notion_target": self.notion_target,
                 "linear_target": self.linear_target,
                 "teams_target": self.teams_target,
+                # Extended fields (template v1.0+)
+                "speakers": [s.to_dict() for s in self.speakers] if self.speakers else None,
+                "strategic_discussions": [d.to_dict() for d in self.strategic_discussions]
+                if self.strategic_discussions
+                else None,
+                "decision_headline": self.decision_headline,
+                "decision_chosen": self.decision_chosen,
+                "decision_rejected": self.decision_rejected,
+                "structured_action_items": [a.to_dict() for a in self.structured_action_items]
+                if self.structured_action_items
+                else None,
+                "structured_risks": [r.to_dict() for r in self.structured_risks]
+                if self.structured_risks
+                else None,
+                "rendered_html": self.rendered_html,
             }
         )
 
@@ -344,6 +485,10 @@ __all__ = [
     "ArtifactType",
     "GraphSubscription",
     "MeetingArtifact",
+    "SpeakerUpdate",
+    "StrategicDiscussion",
+    "StructuredActionItem",
+    "StructuredRisk",
     "TeamsMeetingPipelineJob",
     "TeamsMeetingRef",
     "TeamsMeetingSummaryPayload",

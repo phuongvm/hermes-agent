@@ -110,7 +110,7 @@ hermes_cli/scripts/
 docs/superpowers/*
 # External projects (not part of hermes-agent)
 tinker-atropos/
-specs/
+!specs/
 # Working directory for the Hermes Agent's session state (~/.hermes/ at runtime;
 # also created in-repo when an agent operates in this checkout). Plans, audit
 # logs, and per-session caches are never artifacts of the codebase.

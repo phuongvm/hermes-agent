@@ -40,6 +40,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     show_p.add_argument("job_id")
     show_p.add_argument("--store-path", default="")
 
+    deliver_p = subs.add_parser("deliver", help="Deliver a pending Teams pipeline job")
+    deliver_p.add_argument("job_id")
+    deliver_p.add_argument("--store-path", default="")
+
     run_p = subs.add_parser("run", aliases=["replay"], help="Replay a stored Teams pipeline job")
     run_p.add_argument("job_id")
     run_p.add_argument("--store-path", default="")
@@ -100,7 +104,7 @@ def teams_pipeline_command(args: argparse.Namespace) -> int:
     if not action:
         print(
             "Usage: hermes teams-pipeline "
-            "{list|show|run|fetch|subscriptions|subscribe|renew-subscription|delete-subscription|maintain-subscriptions|token-health|validate}"
+            "{list|show|deliver|run|fetch|subscriptions|subscribe|renew-subscription|delete-subscription|maintain-subscriptions|token-health|validate}"
         )
         return 2
 
@@ -109,7 +113,9 @@ def teams_pipeline_command(args: argparse.Namespace) -> int:
             _cmd_list(args)
         elif action == "show":
             _cmd_show(args)
-        elif action in {"run", "replay"}:
+        elif action == "deliver":
+            _cmd_deliver(args)
+        elif action in ("run", "replay"):
             _cmd_run(args)
         elif action in {"fetch", "test"}:
             _cmd_fetch(args)
@@ -565,3 +571,59 @@ def _cmd_auth(args) -> None:
             print(f"✅ Deleted OAuth tokens: {token_path}")
         else:
             print("No tokens to delete.")
+
+
+def _cmd_deliver(args) -> None:
+    job_id = str(getattr(args, "job_id", "") or "").strip()
+    if not job_id:
+        print("job_id is required")
+        return
+    store = TeamsPipelineStore(_store_path(getattr(args, "store_path", None)))
+    job = store.get_job(job_id)
+    if not job:
+        print(f"Unknown job: {job_id}")
+        return
+
+    if job.get("status") != "pending_review":
+        print(f"Job is not in pending_review state (current status: {job.get('status')})")
+        return
+
+    from gateway.config import load_gateway_config
+    from gateway.config import Platform
+    from plugins.teams_pipeline.runtime import build_pipeline_runtime_config
+    from plugins.teams_pipeline.models import TeamsMeetingPipelineJob
+
+    gateway_config = load_gateway_config()
+    pipeline_config = build_pipeline_runtime_config(gateway_config)
+
+    # Temporarily override require_review so it doesn't pause again
+    pipeline_config["require_review"] = False
+
+    teams_sender = None
+    teams_config = gateway_config.platforms.get(Platform("teams"))
+    teams_delivery = pipeline_config.get("teams_delivery", {})
+    if teams_config and teams_config.enabled and teams_delivery.get("enabled"):
+        try:
+            from plugins.platforms.teams.adapter import TeamsSummaryWriter
+            teams_sender = TeamsSummaryWriter(platform_config=teams_config)
+        except ImportError:
+            pass
+
+    pipeline = TeamsMeetingPipeline(
+        graph_client=build_graph_client(),
+        store=store,
+        config=pipeline_config,
+        teams_sender=teams_sender,
+    )
+
+    async def _execute_delivery():
+        job_obj = TeamsMeetingPipelineJob.from_dict(job)
+        if not job_obj.summary_payload:
+            print("Job has no summary_payload. Cannot deliver.")
+            return
+
+        await pipeline._write_sinks(job_obj, job_obj.summary_payload)
+        job_obj = pipeline._persist_job(job_obj, status="completed")
+        print(json.dumps(_compact_job(job_obj.to_dict()), indent=2, sort_keys=True))
+
+    _run_async(_execute_delivery())

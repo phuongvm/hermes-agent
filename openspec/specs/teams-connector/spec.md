@@ -1,24 +1,25 @@
-# Teams Connector
+# Spec: teams-connector
 
 ## Purpose
-TBD - Manages integration with Microsoft Teams, processing incoming webhooks and dispatching responses.
+
+Microsoft Teams integration connector for Hermes Agent — handles meeting lifecycle events via Microsoft Graph webhooks, transcription retrieval, and automated meeting summary delivery through configurable sinks (Notion, Linear, Teams).
 
 ## Requirements
 
-### Requirement: Raw AAD Object ID Authorization
-The system SHALL authorize Microsoft Teams users strictly based on their raw AAD Object ID (`aad_object_id`) or Bot Framework User ID (`id`).
+### Requirement: Webhook-driven meeting pipeline
+The connector SHALL process Microsoft Graph webhook notifications for online meeting events.
 
-#### Scenario: User provides raw AAD ID in allowed_users
-- **WHEN** a user sends a message from Microsoft Teams and their AAD Object ID matches an entry in `config.yaml` `allowed_users` list
-- **THEN** the system authorizes the user and processes the message
+#### Scenario: Meeting event processing
+- **WHEN** a Graph webhook notification is received for a meeting lifecycle event
+- **THEN** the pipeline resolves the meeting, retrieves transcripts and artifacts, generates a summary, and delivers to configured sinks
 
-#### Scenario: User authorization fails for missing ID
-- **WHEN** a user's AAD Object ID is not present in the `allowed_users` list
-- **THEN** the system rejects the user as Unauthorized
+### Requirement: Review gate interception
+The connector SHALL support a `require_review` configuration flag that intercepts automated delivery.
 
-### Requirement: Raw Channel ID Policy Enforcement
-The system SHALL authorize Microsoft Teams channels based on substring matching of their raw internal thread ID (e.g., `19:xxxx@thread.v2` or `19:xxxx@thread.tacv2`). Exact matching MUST NOT be used because Microsoft Teams dynamically appends a `;messageid=...` suffix to the thread ID in some webhook payloads.
+#### Scenario: Review gate enabled
+- **WHEN** `teams_pipeline.require_review` is enabled
+- **THEN** the pipeline stores the generated summary, sets job state to `pending_review`, and notifies the Commander channel instead of delivering automatically
 
-#### Scenario: User messages bot in an allowed channel
-- **WHEN** a user mentions the bot in a channel whose raw ID is present in the `allowed_channels` list
-- **THEN** the system processes the message and responds
+#### Scenario: Review gate disabled
+- **WHEN** `teams_pipeline.require_review` is false or not set
+- **THEN** the pipeline proceeds automatically to sink delivery (legacy behavior)

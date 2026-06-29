@@ -1,0 +1,129 @@
+# teams-meeting-summary template v1.0
+# Edit this file to change summary structure/style without touching the skill.
+# Agent loads this template every time it creates a meeting summary.
+# To review: ask agent "review the meeting summary template"
+
+meta:
+  version: "1.0"
+  last_updated: "2026-05-28"
+  output_format: "html"
+  language: "en"
+
+header:
+  template: |
+    <h2>Meeting Summary: {subject}</h2>
+    <p><b>Date:</b> {date} · {start_time}-{end_time} UTC (~{duration} min)<br>
+    <b>Organizer:</b> {organizer}<br>
+    <b>Attendees:</b> {attendees}</p>
+
+  date_format: "Mon DD, YYYY"
+  time_format: "HH:MM"
+  attendees_separator: ", "
+  attendee_role_label: true
+
+sections:
+  - id: status_updates
+    title: "Status Updates & Code Exploration"
+    required: true
+    rules:
+      - "One subsection per speaker who gave a substantive update"
+      - "Speaker name in bold, followed by em-dash and topic label"
+      - "Use bullet points — each bullet is ONE concrete fact (not a paragraph)"
+      - "Include code references with <code> tags (class names, file paths, config keys)"
+      - "Include direct quotes only when they capture a philosophy or key insight"
+      - "Mention tools/demos shown during the meeting"
+    template: |
+      <p><b>{speaker_name} — {topic_label}</b></p>
+      <ul>
+        {bullet_items}
+      </ul>
+
+  - id: key_decisions
+    title: "Key Decision: {decision_headline}"
+    required: false
+    trigger: "When participants debated options and one was chosen"
+    rules:
+      - "Headline summarizes the decision in one line"
+      - "State the decision clearly in the first sentence"
+      - "Include why alternatives were rejected (brief, 1-2 sentences)"
+      - "Detail the chosen approach with bullet points"
+      - "Use tables for structured comparisons (e.g., tiered visibility)"
+    sub_sections:
+      - id: chosen_approach
+        title: null
+        rules:
+          - "Bullet points describing the approach"
+          - "Include technical specifics (file counts, class names, config values)"
+      - id: rejected_alternatives
+        title: null
+        rules:
+          - "Brief mention of what was considered and why it was rejected"
+          - "Quote the rejection reason if memorable"
+
+  - id: strategic_discussions
+    title: "{discussion_topic}"
+    required: false
+    trigger: "When meeting covers business strategy, product vision, or cross-project topics"
+    rules:
+      - "Separate heading per distinct strategic topic"
+      - "Lead with the problem/opportunity, then the proposed solution"
+      - "Attribute ideas to speakers"
+      - "Mark items as 'Deferred' if explicitly postponed"
+
+  - id: action_items
+    title: "Action Items"
+    required: true
+    rules:
+      - "Always use a table with 'Who' and 'Action' columns"
+      - "Who = specific person name in bold (never 'Team' unless explicitly discussed)"
+      - "Action = one concrete deliverable, start with verb"
+      - "Include timeline/deadline if mentioned"
+      - "Sort rows alphabetically by owner name (Who column)"
+      - "Within same owner, group related items together"
+      - "Place 'Team' or shared items last"
+      - "Mark deferred/low-priority items explicitly"
+    template: |
+      <table>
+        <tr><th>Who</th><th>Action</th></tr>
+        {action_rows}
+      </table>
+
+style:
+  bold_speaker_names: true
+  code_inline: "<code>{text}</code>"
+  italic_emphasis: "<i>{text}</i>"
+
+  tables:
+    border: false
+    header_bold: true
+    max_columns: 3
+
+  section_separator: "<hr>"
+
+  max_bullet_depth: 2
+  max_sub_sections: 4
+  quote_style: "em-dash"
+
+  target_total_length: "moderate"
+  bullets_per_speaker: 3-7
+  action_items_max: 12
+
+quality_checklist:
+  - "Every speaker who contributed substantively has a status subsection"
+  - "No vague statements — every bullet has a concrete fact (name, number, code ref, or quote)"
+  - "Action items are actionable (not 'discuss X' — instead 'finalize design doc for X')"
+  - "Code references use <code> tags (class names, file paths, APIs)"
+  - "Tables used for structured data (tiers, comparisons, action items)"
+  - "Deferred items explicitly marked as deferred"
+  - "No hallucinated details — only what was actually said in transcript"
+  - "Summary is self-contained — reader doesn't need to watch the recording"
+
+anti_patterns:
+  - "Generic summaries like 'The team discussed X' without specifics"
+  - "Missing speaker attribution — who said what"
+  - "Paragraphs instead of bullet points"
+  - "Action items without clear owners"
+  - "Mixing status updates with strategic discussions"
+  - "Skipping the 'why' behind decisions"
+  - "Including filler (greetings, small talk, tech difficulties)"
+  - "Over-summarizing — losing important technical details"

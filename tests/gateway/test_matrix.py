@@ -1714,13 +1714,40 @@ class TestMatrixPasswordLoginDeviceId:
         mock_client.crypto = None
         mock_client.login = AsyncMock(return_value=MagicMock(device_id="STABLE_PW_DEVICE", access_token="tok"))
         mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.query_keys = AsyncMock(return_value=MagicMock(device_keys={"@bot:example.org": {"STABLE_PW_DEVICE": {}}}))
         mock_client.add_event_handler = MagicMock()
         mock_client.api = MagicMock()
         mock_client.api.token = ""
         mock_client.api.session = MagicMock()
         mock_client.api.session.close = AsyncMock()
 
+        class MockCrypto(MagicMock):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.account = MagicMock()
+                self.account.shared = True
+
+            async def share_keys(self):
+                pass
+
+            async def get_own_cross_signing_public_keys(self):
+                return True
+
+        mock_client.crypto = MockCrypto()
+
         fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+        fake_mautrix_mods["mautrix.crypto"] = MagicMock()
+        class MockOlmMachine:
+            def __init__(self, *args, **kwargs):
+                self.account = MagicMock()
+                self.account.shared = True
+            async def share_keys(self):
+                pass
+            async def get_own_cross_signing_public_keys(self):
+                return True
+            async def load(self):
+                pass
+        fake_mautrix_mods["mautrix.crypto"].OlmMachine = MockOlmMachine
 
         with patch.dict("sys.modules", fake_mautrix_mods):
             with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):

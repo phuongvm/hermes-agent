@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from gateway.delivery import DeliveryTarget
 from gateway.config import Platform
 from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
+from plugins.teams_pipeline.pipeline import _build_pending_review_message
 from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipeline_store_path
 from plugins.teams_pipeline.subscriptions import build_graph_client
 
@@ -87,12 +89,58 @@ def build_pipeline_runtime(gateway: Any) -> TeamsMeetingPipeline:
         else:
             teams_sender = TeamsSummaryWriter(platform_config=teams_config)
 
+    async def _notify_pending_review(job: Any, payload: Any) -> None:
+        router = getattr(gateway, "delivery_router", None)
+        if router is None:
+            raise RuntimeError("Gateway delivery router is unavailable.")
+
+        target = _resolve_review_notification_target(gateway, pipeline_config)
+        await router.deliver(
+            _build_pending_review_message(job, payload),
+            [target],
+            metadata={
+                "teams_pipeline_job_id": job.job_id,
+                "teams_pipeline_status": "pending_review",
+                "meeting_id": payload.meeting_ref.meeting_id,
+            },
+        )
+
     return TeamsMeetingPipeline(
         graph_client=build_graph_client(),
         store=TeamsPipelineStore(resolve_teams_pipeline_store_path()),
         config=pipeline_config,
         teams_sender=teams_sender,
+        pending_review_notifier=_notify_pending_review,
     )
+
+
+def _resolve_review_notification_target(gateway: Any, pipeline_config: dict[str, Any]) -> DeliveryTarget:
+    configured = str(
+        pipeline_config.get("review_notification_target")
+        or pipeline_config.get("pending_review_notification_target")
+        or ""
+    ).strip()
+    if configured:
+        target = DeliveryTarget.parse(configured)
+        if target.chat_id or target.platform == Platform.LOCAL:
+            return target
+        home = gateway.config.get_home_channel(target.platform)
+        if home:
+            return DeliveryTarget(
+                platform=home.platform,
+                chat_id=home.chat_id,
+                thread_id=home.thread_id,
+            )
+        return target
+
+    home = gateway.config.get_home_channel(Platform.MATRIX)
+    if home:
+        return DeliveryTarget(
+            platform=home.platform,
+            chat_id=home.chat_id,
+            thread_id=home.thread_id,
+        )
+    return DeliveryTarget(platform=Platform.LOCAL)
 
 
 def bind_gateway_runtime(gateway: Any) -> bool:

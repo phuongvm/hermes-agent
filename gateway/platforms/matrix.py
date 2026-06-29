@@ -2272,6 +2272,15 @@ class MatrixAdapter(BasePlatformAdapter):
             return True
         return sender.strip().lower() == own
 
+    def _is_other_bot(self, sender: str, msgtype: str) -> bool:
+        """Check if sender is another bot to prevent endless interaction loops."""
+        sender_lower = sender.strip().lower()
+        if "bot" in sender_lower.split(":")[0]:
+            return True
+        if msgtype == "m.notice" and not self._process_notices:
+            return True
+        return False
+
     @staticmethod
     def _is_system_or_bridge_sender(sender: str) -> bool:
         """Return True if the sender looks like a system / bridge / appservice
@@ -2463,7 +2472,13 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Ignore m.notice to prevent bot-to-bot loops (m.notice is the
         # conventional msgtype for bot responses in the Matrix ecosystem).
-        if msgtype == "m.notice" and not self._process_notices:
+        if self._is_other_bot(sender, msgtype):
+            logger.debug(
+                "Matrix: ignoring other bot sender %s (msgtype %s) in %s to prevent loops",
+                sender,
+                msgtype,
+                room_id,
+            )
             return
 
         # Dispatch by msgtype.
