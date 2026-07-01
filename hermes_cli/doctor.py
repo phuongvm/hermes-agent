@@ -67,6 +67,10 @@ def _system_package_install_cmd(pkg: str) -> str:
         return f"pkg install {pkg}"
     if sys.platform == "darwin":
         return f"brew install {pkg}"
+    if sys.platform == "win32":
+        if pkg == "ripgrep":
+            return "winget install BurntSushi.ripgrep.MSVC"
+        return f"winget install {pkg}"
     return f"sudo apt install {pkg}"
 
 

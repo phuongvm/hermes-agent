@@ -9,7 +9,7 @@ Usage:
         --ref-audio samples/jo.wav --ref-text samples/jo.txt
 
 Requires: python -m pip install -U neutts[all]
-System:   apt install espeak-ng  (or brew install espeak-ng)
+System:   apt install espeak-ng (Linux) / brew install espeak-ng (macOS) / winget install espeak-ng (Windows)
 """
 
 import argparse

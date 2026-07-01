@@ -32,6 +32,12 @@ class TestDoctorPlatformHints:
         assert doctor._python_install_cmd() == "uv pip install"
         assert doctor._system_package_install_cmd("ripgrep") == "sudo apt install ripgrep"
 
+    def test_package_hint_on_win32(self, monkeypatch):
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert doctor._system_package_install_cmd("ripgrep") == "winget install BurntSushi.ripgrep.MSVC"
+        assert doctor._system_package_install_cmd("other") == "winget install other"
+
 
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):

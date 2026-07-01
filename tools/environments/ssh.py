@@ -25,11 +25,11 @@ def _ensure_ssh_available() -> None:
     """Fail fast with a clear error when the SSH client is unavailable."""
     if not shutil.which("ssh"):
         raise RuntimeError(
-            "SSH is not installed or not in PATH. Install OpenSSH client: apt install openssh-client"
+            "SSH is not installed or not in PATH. Install OpenSSH client (e.g., `apt install openssh-client` or `winget install Microsoft.OpenSSH.Client`)"
         )
     if not shutil.which("scp"):
         raise RuntimeError(
-            "SCP is not installed or not in PATH. Install OpenSSH client: apt install openssh-client"
+            "SCP is not installed or not in PATH. Install OpenSSH client (e.g., `apt install openssh-client` or `winget install Microsoft.OpenSSH.Client`)"
         )
 
 
