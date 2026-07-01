@@ -22,7 +22,7 @@ reviewing any change:
   that cache and multiplies the user's cost. We do not do it (the one
   exception is context compression).
 - **The core is a narrow waist; capability lives at the edges.** Every model
-  tool we add is sent on every API call, so the bar for a new *core* tool is
+  tool we add is sent on every API call, so the bar for a new _core_ tool is
   high. Most new capability should arrive as a CLI command + skill, a
   service-gated tool, or a plugin — not as core surface.
 
@@ -37,15 +37,15 @@ This is the project's intent layer. Use it two ways:
    `cannot_reproduce`, `incoherent`) and, just as important, **when NOT to
    close** one. Taste-based "we don't want this / out of scope" closes are NOT
    an automated decision — those stay with a human maintainer. The sweeper's
-   job here is to recognize design intent and *avoid wrongly closing a
-   legitimate contribution*, not to make the won't-implement call itself.
+   job here is to recognize design intent and _avoid wrongly closing a
+   legitimate contribution_, not to make the won't-implement call itself.
 
 Read the balance right: Hermes ships a **lot** — most merges are bug fixes to
 real reported behavior, and the product surface (platforms, channels,
 providers, models, desktop/TUI features) expands aggressively and on purpose.
 The restraint below is aimed squarely at the **core agent + the model tool
 schema**, the one place where every addition is paid for on every API call.
-"Smallest footprint" governs *how a capability is wired into the core*, NOT
+"Smallest footprint" governs _how a capability is wired into the core_, NOT
 whether the product is allowed to grow. We are expansive at the edges and
 conservative at the waist.
 
@@ -66,15 +66,15 @@ conservative at the waist.
   cluster out of `cli.py` / `run_agent.py` / `gateway/run.py` into a focused
   mixin or module is wanted work, even when the diff is huge and mechanical
   (large `+N/-N` refactors merge regularly). The "every line traces to the
-  request" test applies to *feature* PRs; a declared refactor's request IS the
+  request" test applies to _feature_ PRs; a declared refactor's request IS the
   extraction.
-- **Keep the core narrow.** New *model tools* are the expensive exception —
+- **Keep the core narrow.** New _model tools_ are the expensive exception —
   every tool ships on every API call. Prefer, in order: extend existing code →
   CLI command + skill → service-gated tool (`check_fn`) → plugin → MCP server
   in the catalog → new core tool (last resort). See "The Footprint Ladder."
 - **Extend, don't duplicate.** Before adding a module/manager/hook, check
   whether existing infrastructure already covers the use case. When several PRs
-  integrate the same *category*, design one shared interface instead of merging
+  integrate the same _category_, design one shared interface instead of merging
   them one at a time (see the ABC + orchestrator note under the Footprint
   Ladder).
 - **Behavior contracts over snapshots.** Tests should assert how two pieces of
@@ -156,7 +156,7 @@ doubt, leave it open for a human). They are distilled from real closes.
   justification frequently rests on a wrong mental model of an existing
   mechanism. Trace the real code/runtime before accepting the rationale. Two
   real closes: a rate-limit "re-probe during cooldown" PR (the breaker only
-  trips on a *confirmed-empty* account bucket, so re-probing just hammers a
+  trips on a _confirmed-empty_ account bucket, so re-probing just hammers a
   bucket we've already proven empty); a usage-accumulation fix whose new branch
   **never executes at runtime** because an earlier guard already popped the
   state it depended on. If you can't point to the exact line where the bug
@@ -205,7 +205,7 @@ Each rung adds more permanent surface than the one above. Choose the highest
    Examples of correct core tools: terminal, read_file, web_search,
    browser_navigate.
 
-When 3+ open PRs try to integrate the same *category* of thing (memory
+When 3+ open PRs try to integrate the same _category_ of thing (memory
 backends, providers, notifiers), don't merge them one at a time — design an
 ABC + orchestrator, wrap the existing built-in as the first provider, and turn
 the competing PRs into plugins against that interface.
@@ -395,23 +395,30 @@ All slash commands are defined in a central `COMMAND_REGISTRY` list of `CommandD
 ### Adding a Slash Command
 
 1. Add a `CommandDef` entry to `COMMAND_REGISTRY` in `hermes_cli/commands.py`:
+
 ```python
 CommandDef("mycommand", "Description of what it does", "Session",
            aliases=("mc",), args_hint="[arg]"),
 ```
+
 2. Add handler in `HermesCLI.process_command()` in `cli.py`:
+
 ```python
 elif canonical == "mycommand":
     self._handle_mycommand(cmd_original)
 ```
+
 3. If the command is available in the gateway, add a handler in `gateway/run.py`:
+
 ```python
 if canonical == "mycommand":
     return await self._handle_mycommand(event)
 ```
+
 4. For persistent settings, use `save_config_value()` in `cli.py`
 
 **CommandDef fields:**
+
 - `name` — canonical name without slash (e.g. `"background"`)
 - `description` — human-readable description
 - `category` — one of `"Session"`, `"Configuration"`, `"Tools & Skills"`, `"Info"`, `"Exit"`
@@ -478,7 +485,7 @@ npm test          # vitest
 
 ### TUI in the Dashboard (`hermes dashboard` → `/chat`)
 
-The dashboard embeds the real `hermes --tui` — **not** a rewrite.  See `hermes_cli/pty_bridge.py` + the `@app.websocket("/api/pty")` endpoint in `hermes_cli/web_server.py`.
+The dashboard embeds the real `hermes --tui` — **not** a rewrite. See `hermes_cli/pty_bridge.py` + the `@app.websocket("/api/pty")` endpoint in `hermes_cli/web_server.py`.
 
 - Browser loads `web/src/pages/ChatPage.tsx`, which mounts xterm.js's `Terminal` with the WebGL renderer, `@xterm/addon-fit` for container-driven resize, and `@xterm/addon-unicode11` for modern wide-character widths.
 - `/api/pty?token=…` upgrades to a WebSocket; auth uses the same ephemeral `_SESSION_TOKEN` as REST, via query param (browsers can't set `Authorization` on WS upgrade).
@@ -491,7 +498,7 @@ The dashboard embeds the real `hermes --tui` — **not** a rewrite.  See `hermes
 
 ### Electron Desktop Chat App (`apps/desktop/`)
 
-A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). The WebSocket/JSON-RPC transport lives in the framework-agnostic `apps/shared` package (`@hermes/shared` — `JsonRpcGatewayClient` + WS URL helpers), which the web dashboard (`web/`) also consumes; **desktop has no build/runtime dependency on the dashboard frontend** — it spawns a headless `hermes serve` backend server (the same gateway `dashboard` serves, minus the browser UI). `dashboard` and `serve` share `cmd_dashboard`/`start_server` but are independent surfaces — neither launches the other. The one exception is a backward-compat *fallback*: `serve` is newer, so the desktop spawn (`electron/backend-command.cjs` + `backendSupportsServe()` in `main.cjs`) detects whether the resolved runtime registers `serve` and, only when it does not (an older managed install / PATH `hermes` the app hasn't updated yet), rewrites the argv to the legacy `dashboard --no-open`. Without that, a new app against an un-upgraded runtime would crash on an unknown subcommand and brick every mid-upgrade user. It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not `hermes-dashboard-work`.
+A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). The WebSocket/JSON-RPC transport lives in the framework-agnostic `apps/shared` package (`@hermes/shared` — `JsonRpcGatewayClient` + WS URL helpers), which the web dashboard (`web/`) also consumes; **desktop has no build/runtime dependency on the dashboard frontend** — it spawns a headless `hermes serve` backend server (the same gateway `dashboard` serves, minus the browser UI). `dashboard` and `serve` share `cmd_dashboard`/`start_server` but are independent surfaces — neither launches the other. The one exception is a backward-compat _fallback_: `serve` is newer, so the desktop spawn (`electron/backend-command.cjs` + `backendSupportsServe()` in `main.cjs`) detects whether the resolved runtime registers `serve` and, only when it does not (an older managed install / PATH `hermes` the app hasn't updated yet), rewrites the argv to the legacy `dashboard --no-open`. Without that, a new app against an un-upgraded runtime would crash on an unknown subcommand and brick every mid-upgrade user. It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not `hermes-dashboard-work`.
 
 **Slash commands in the desktop app are curated client-side, then dispatched to the backend.** The pipeline:
 
@@ -522,6 +529,7 @@ core Hermes tool that should ship in the base system.
 Built-in/core tools require changes in **2 files**:
 
 **1. Create `tools/your_tool.py`:**
+
 ```python
 import json, os
 from tools.registry import registry
@@ -542,7 +550,7 @@ registry.register(
 )
 ```
 
-**2. Add to `toolsets.py`** — either `_HERMES_CORE_TOOLS` (all platforms) or a new toolset. **This step is required:** auto-discovery imports the tool and registers its schema, but the tool is only *exposed to an agent* if its name appears in a toolset. `_HERMES_CORE_TOOLS` is not dead code — it's the default bundle every platform's base toolset inherits from.
+**2. Add to `toolsets.py`** — either `_HERMES_CORE_TOOLS` (all platforms) or a new toolset. **This step is required:** auto-discovery imports the tool and registers its schema, but the tool is only _exposed to an agent_ if its name appears in a toolset. `_HERMES_CORE_TOOLS` is not dead code — it's the default bundle every platform's base toolset inherits from.
 
 Auto-discovery: any `tools/*.py` file with a top-level `registry.register()` call is imported automatically — no manual import list to maintain. Wiring into a toolset is still a deliberate, manual step.
 
@@ -562,14 +570,15 @@ All dependencies must have upper bounds to limit supply-chain attack surface.
 This policy was established after the litellm compromise (PR #2796, #2810) and
 reinforced after the Mini Shai-Hulud worm campaign (May 2026).
 
-| Source type | Treatment | Example |
-|---|---|---|
-| PyPI package | `>=floor,<next_major` | `"httpx>=0.28.1,<1"` |
-| Git URL | Commit SHA | `git+https://...@<40-char-sha>` |
-| GitHub Actions | Commit SHA + comment | `uses: actions/checkout@<sha>  # v4` |
-| CI-only pip | `==exact` | `pyyaml==6.0.2` |
+| Source type    | Treatment             | Example                              |
+| -------------- | --------------------- | ------------------------------------ |
+| PyPI package   | `>=floor,<next_major` | `"httpx>=0.28.1,<1"`                 |
+| Git URL        | Commit SHA            | `git+https://...@<40-char-sha>`      |
+| GitHub Actions | Commit SHA + comment  | `uses: actions/checkout@<sha>  # v4` |
+| CI-only pip    | `==exact`             | `pyyaml==6.0.2`                      |
 
 **When adding a new dependency to `pyproject.toml`:**
+
 1. Pin to `>=current_version,<next_major` for post-1.0 (e.g. `>=1.5.0,<2`).
 2. For pre-1.0 packages, use `<0.(current_minor + 2)` (e.g. `>=0.29,<0.32`).
 3. Never commit a bare `>=X.Y.Z` without a ceiling — CI and reviewers will reject it.
@@ -582,6 +591,7 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 ## Adding Configuration
 
 ### config.yaml options:
+
 1. Add to `DEFAULT_CONFIG` in `hermes_cli/config.py`
 2. Bump `_config_version` (check the current value at the top of `DEFAULT_CONFIG`)
    ONLY if you need to actively migrate/transform existing user config
@@ -606,7 +616,9 @@ its own provider/model/base_url/max_tokens/reasoning_effort. See
 `archive_after_days`, `backup` (nested).
 
 ### .env variables (SECRETS ONLY — API keys, tokens, passwords):
+
 1. Add to `OPTIONAL_ENV_VARS` in `hermes_cli/config.py` with metadata:
+
 ```python
 "NEW_API_KEY": {
     "description": "What it's for",
@@ -634,6 +646,7 @@ If you add a new key and the CLI sees it but the gateway doesn't (or vice
 versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
 
 ### Working directory:
+
 - **CLI** — uses the process's current directory (`os.getcwd()`).
 - **Messaging** — uses `terminal.cwd` from `config.yaml`. The gateway bridges this
   to the `TERMINAL_CWD` env var for child tools. **`MESSAGING_CWD` has been
@@ -822,6 +835,7 @@ discovery system** — scanned on first `get_provider_profile()` or
 `list_providers()` call, NOT by the general PluginManager.
 
 Scan order:
+
 1. Bundled: `<repo>/plugins/model-providers/<name>/`
 2. User: `$HERMES_HOME/plugins/model-providers/<name>/`
 3. Legacy: `<repo>/providers/<name>.py` (back-compat)
@@ -891,6 +905,7 @@ violate them.
    the implementation. No marketing words ("powerful",
    "comprehensive", "seamless", "advanced"). Don't repeat the skill
    name. Verify with:
+
    ```python
    import re, pathlib
    m = re.search(r'^description: (.*)$',
@@ -1031,6 +1046,7 @@ go to `~/.hermes/skills/.archive/` and are restorable.
   archived), `pinned`.
 
 Invariants:
+
 - Curator only touches skills with `created_by: "agent"` provenance —
   bundled + hub-installed skills are off-limits.
 - Never deletes; max destructive action is archive.
@@ -1056,6 +1072,7 @@ schedule jobs via the `cronjob` tool; users via `hermes cron <verb>`
 `/cron` slash command.
 
 Supported schedule formats:
+
 - Duration: `"30m"`, `"2h"`, `"1d"`
 - "every" phrase: `"every 2h"`, `"every monday 9am"`
 - 5-field cron expression: `"0 9 * * *"`
@@ -1069,6 +1086,7 @@ job B's prompt), `workdir` (run in a specific directory with its
 `AGENTS.md`/`CLAUDE.md` loaded), and multi-platform delivery.
 
 Hardening invariants:
+
 - **3-minute hard interrupt** on cron sessions — runaway agent loops
   cannot monopolize the scheduler.
 - Catchup window: half the job's period, clamped to 120s–2h.
@@ -1111,10 +1129,11 @@ kanban task.
   standalone dispatcher deployment).
 
 Isolation model:
+
 - **Board** is the hard boundary — workers are spawned with
   `HERMES_KANBAN_BOARD` pinned in their env so they can't see other
   boards.
-- **Tenant** is a soft namespace *within* a board — one specialist
+- **Tenant** is a soft namespace _within_ a board — one specialist
   fleet can serve multiple businesses with workspace-path + memory-key
   isolation.
 - After `kanban.failure_limit` consecutive non-success attempts on the
@@ -1130,6 +1149,7 @@ Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 ### Prompt Caching Must Not Break
 
 Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**
+
 - Alter past context mid-conversation
 - Change toolsets mid-conversation
 - Reload memories or rebuild system prompts mid-conversation
@@ -1168,6 +1188,7 @@ automatically scope to the active profile.
 
 1. **Use `get_hermes_home()` for all HERMES_HOME paths.** Import from `hermes_constants`.
    NEVER hardcode `~/.hermes` or `Path.home() / ".hermes"` in code that reads/writes state.
+
    ```python
    # GOOD
    from hermes_constants import get_hermes_home
@@ -1179,6 +1200,7 @@ automatically scope to the active profile.
 
 2. **Use `display_hermes_home()` for user-facing messages.** Import from `hermes_constants`.
    This returns `~/.hermes` for default or `~/.hermes/profiles/<name>` for profiles.
+
    ```python
    # GOOD
    from hermes_constants import display_hermes_home
@@ -1194,6 +1216,7 @@ automatically scope to the active profile.
 
 4. **Tests that mock `Path.home()` must also set `HERMES_HOME`** — since code now uses
    `get_hermes_home()` (reads env var), not `Path.home() / ".hermes"`:
+
    ```python
    with patch.object(Path, "home", return_value=tmp_path), \
         patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / ".hermes")}):
@@ -1214,11 +1237,13 @@ automatically scope to the active profile.
 ## Known Pitfalls
 
 ### DO NOT hardcode `~/.hermes` paths
+
 Use `get_hermes_home()` from `hermes_constants` for code paths. Use `display_hermes_home()`
 for user-facing print/log messages. Hardcoding `~/.hermes` breaks profiles — each profile
 has its own `HERMES_HOME` directory. This was the source of 5 bugs fixed in PR #3575.
 
 ### DO NOT introduce new `simple_term_menu` usage
+
 Existing call sites in `hermes_cli/main.py` remain for legacy fallback only;
 the preferred UI is curses (stdlib) because `simple_term_menu` has
 ghost-duplication rendering bugs in tmux/iTerm2 with arrow keys. New
@@ -1226,15 +1251,19 @@ interactive menus must use `hermes_cli/curses_ui.py` — see
 `hermes_cli/tools_config.py` for the canonical pattern.
 
 ### DO NOT use `\033[K` (ANSI erase-to-EOL) in spinner/display code
+
 Leaks as literal `?[K` text under `prompt_toolkit`'s `patch_stdout`. Use space-padding: `f"\r{line}{' ' * pad}"`.
 
 ### `_last_resolved_tool_names` is a process-global in `model_tools.py`
+
 `_run_single_child()` in `delegate_tool.py` saves and restores this global around subagent execution. If you add new code that reads this global, be aware it may be temporarily stale during child agent runs.
 
 ### DO NOT hardcode cross-tool references in schema descriptions
+
 Tool schema descriptions must not mention tools from other toolsets by name (e.g., `browser_navigate` saying "prefer web_search"). Those tools may be unavailable (missing API keys, disabled toolset), causing the model to hallucinate calls to non-existent tools. If a cross-reference is needed, add it dynamically in `get_tool_definitions()` in `model_tools.py` — see the `browser_navigate` / `execute_code` post-processing blocks for the pattern.
 
 ### The gateway has TWO message guards — both must bypass approval/control commands
+
 When an agent is running, messages pass through two sequential guards:
 (1) **base adapter** (`gateway/platforms/base.py`) queues messages in
 `_pending_messages` when `session_key in self._active_sessions`, and
@@ -1246,6 +1275,7 @@ guards and be dispatched inline, not via `_process_message_background()`
 (which races session lifecycle).
 
 ### Squash merges from stale branches silently revert recent fixes
+
 Before squash-merging a PR, ensure the branch is up to date with `main`
 (`git fetch origin main && git reset --hard origin/main` in the worktree,
 then re-apply the PR's commits). A stale branch's version of an unrelated
@@ -1254,16 +1284,19 @@ with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
 red flag.
 
 ### Don't wire in dead code without E2E validation
+
 Unused code that was never shipped was dead for a reason. Before wiring an
 unused module into a live code path, E2E test the real resolution chain
 with actual imports (not mocks) against a temp `HERMES_HOME`.
 
 ### Tests must not write to `~/.hermes/`
+
 The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a temp dir. Never hardcode `~/.hermes/` paths in tests.
 
 **Profile tests**: When testing profile features, also mock `Path.home()` so that
 `_get_profiles_root()` and `_get_default_hermes_home()` resolve within the temp dir.
 Use the pattern from `tests/hermes_cli/test_profiles.py`:
+
 ```python
 @pytest.fixture
 def profile_env(tmp_path, monkeypatch):
@@ -1289,10 +1322,9 @@ scripts/run_tests.sh                                  # full suite, CI-parity
 scripts/run_tests.sh tests/gateway/                   # one directory
 scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
 scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
-scripts/run_tests.sh --no-isolate tests/foo/          # disable subprocess isolation (faster, for debugging)
 ```
 
-### Subprocess-per-test isolation
+### Subprocess-per-test-file isolation
 
 Every test runs in a freshly-spawned Python subprocess via the in-tree plugin
 at `tests/_isolate_plugin.py`. This means module-level dicts/sets and
@@ -1317,14 +1349,13 @@ Implementation notes:
 
 Five real sources of local-vs-CI drift the script closes:
 
-| | Without wrapper | With wrapper |
-|---|---|---|
-| Provider API keys | Whatever is in your env (auto-detects pool) | All `*_API_KEY`/`*_TOKEN`/etc. unset |
-| HOME / `~/.hermes/` | Your real config+auth.json | Temp dir per test |
-| Timezone | Local TZ (PDT etc.) | UTC |
-| Locale | Whatever is set | C.UTF-8 |
-| xdist workers | `-n auto` = all cores | `-n auto` (safe — subprocess isolation prevents cross-worker flakes) |
-
+|                     | Without wrapper                             | With wrapper                                                         |
+| ------------------- | ------------------------------------------- | -------------------------------------------------------------------- |
+| Provider API keys   | Whatever is in your env (auto-detects pool) | All `*_API_KEY`/`*_TOKEN`/etc. unset                                 |
+| HOME / `~/.hermes/` | Your real config+auth.json                  | Temp dir per test                                                    |
+| Timezone            | Local TZ (PDT etc.)                         | UTC                                                                  |
+| Locale              | Whatever is set                             | C.UTF-8                                                              |
+| xdist workers       | `-n auto` = all cores                       | `-n auto` (safe — subprocess isolation prevents cross-worker flakes) |
 
 `tests/conftest.py` also enforces points 1-4 as an autouse fixture so ANY pytest
 invocation (including IDE integrations) gets hermetic behavior — but the wrapper
