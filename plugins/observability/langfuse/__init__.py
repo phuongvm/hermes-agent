@@ -139,6 +139,8 @@ def _validate_langfuse_key(env_name: str, value: str) -> Optional[str]:
     if not expected:
         return None
     if value.startswith(expected):
+        if "..." in value:
+            return f"{env_name}={_redact_key_preview(value)} (contains '...', looks like a redacted placeholder)"
         return None
     return (
         f"{env_name}={_redact_key_preview(value)} "
@@ -1198,6 +1200,8 @@ def register(ctx) -> None:
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
     ctx.register_hook("pre_api_request", on_pre_llm_request)
     ctx.register_hook("post_api_request", on_post_llm_call)
+    ctx.register_hook("pre_llm_request", on_pre_llm_request)
+    ctx.register_hook("post_llm_request", on_post_llm_call)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
