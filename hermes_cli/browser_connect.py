@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import posixpath
 import shlex
 import shutil
 import subprocess
@@ -121,7 +122,13 @@ def get_chrome_debug_candidates(system: str) -> list[str]:
             add(shutil.which(name))
         for path in paths:
             add(path)
-    add_windows_install_paths(("/mnt/c/Program Files", "/mnt/c/Program Files (x86)"), _WINDOWS_BROWSER_GROUPS)
+    if system == "Windows":
+        add_windows_install_paths(("/mnt/c/Program Files", "/mnt/c/Program Files (x86)"), _WINDOWS_BROWSER_GROUPS)
+    else:
+        for _, group in _WINDOWS_BROWSER_GROUPS:
+            for base in ("/mnt/c/Program Files", "/mnt/c/Program Files (x86)"):
+                for parts in group:
+                    add(posixpath.join(base, *parts))
     return candidates
 
 
@@ -347,3 +354,47 @@ def launch_chrome_debug(
 
 def try_launch_chrome_debug(port: int = DEFAULT_BROWSER_CDP_PORT, system: str | None = None) -> bool:
     return launch_chrome_debug(port, system).launched
+
+
+def request_user_session_chrome_debug(
+    port: int = DEFAULT_BROWSER_CDP_PORT,
+    broker_url: str = "http://127.0.0.1:9221",
+    timeout: float = 20.0,
+) -> bool:
+    """Request headed Chrome from a broker running in the interactive user session.
+
+    Windows services may run in Session 0, so they must not spawn headed Chrome
+    directly. The broker owns the user-session process and listens on loopback.
+    """
+    if platform.system() != "Windows":
+        return False
+    from urllib.parse import urlparse
+    broker_parsed = urlparse(broker_url)
+    if (
+        broker_parsed.scheme not in {"http", "https"}
+        or broker_parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+    ):
+        logger.warning("Refusing non-loopback interactive CDP broker URL: %s", broker_url)
+        return False
+    endpoint = f"http://127.0.0.1:{port}"
+    if is_browser_debug_ready(endpoint, timeout=0.5):
+        return True
+    try:
+        from urllib.parse import urlencode
+        import urllib.request
+
+        request_url = broker_url.rstrip("/") + "/start?" + urlencode({"port": port})
+        with urllib.request.urlopen(request_url, timeout=5) as response:
+            if response.status < 200 or response.status >= 300:
+                raise OSError(f"broker returned HTTP {response.status}")
+    except (OSError, ValueError, TimeoutError) as exc:
+        logger.warning("Could not trigger interactive CDP broker %s: %s", broker_url, exc)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_browser_debug_ready(endpoint, timeout=0.5):
+            return True
+        time.sleep(0.25)
+    logger.warning("Interactive CDP broker did not expose CDP on port %d", port)
+    return False

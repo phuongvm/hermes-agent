@@ -14,6 +14,7 @@ from hermes_cli.browser_connect import (
     is_browser_debug_ready,
     launch_chrome_debug,
     manual_chrome_debug_command,
+    request_user_session_chrome_debug,
 )
 
 
@@ -39,6 +40,38 @@ class _FakeResponse:
 
 
 class TestChromeDebugLaunch:
+    def test_user_session_broker_request_uses_loopback_http(self, monkeypatch):
+        calls = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        monkeypatch.setattr("hermes_cli.browser_connect.platform.system", lambda: "Windows")
+        monkeypatch.setattr(
+            "hermes_cli.browser_connect.is_browser_debug_ready",
+            lambda endpoint, timeout: calls.append(endpoint) or len(calls) > 1,
+        )
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda url, timeout: calls.append(url) or Response(),
+        )
+
+        assert request_user_session_chrome_debug(
+            port=9333, broker_url="http://127.0.0.1:9221", timeout=0.1
+        )
+        assert "127.0.0.1:9221/start?port=9333" in calls[1]
+
+    def test_user_session_broker_rejects_remote_url(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.browser_connect.platform.system", lambda: "Windows")
+        monkeypatch.setattr("hermes_cli.browser_connect.is_browser_debug_ready", lambda *args: False)
+        assert not request_user_session_chrome_debug(broker_url="http://192.0.2.1:9221")
+
     def test_browser_debug_ready_requires_http_cdp_endpoint(self):
         requested = []
 

@@ -407,10 +407,10 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     if "/devtools/browser/" in lowered:
         return raw
 
-    discovery_url = raw
+    discovery_url = raw.rstrip("/")
     if lowered.startswith(("ws://", "wss://")):
-        if raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]:
-            discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
+        if discovery_url.count(":") == 2 and discovery_url.rsplit(":", 1)[-1].isdigit() and "/" not in discovery_url.split(":", 2)[-1]:
+            discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + discovery_url.split("://", 1)[1]
         else:
             return raw
 
@@ -474,6 +474,38 @@ def _get_cdp_override() -> str:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _maybe_start_user_session_cdp() -> None:
+    """Request headed Chrome through the interactive user-session bridge."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(browser_cfg, dict) or not browser_cfg.get("auto_start_cdp", False):
+            return
+        cdp_url = os.environ.get("BROWSER_CDP_URL", "").strip() or str(
+            browser_cfg.get("cdp_url", "") or ""
+        ).strip()
+        if not cdp_url:
+            return
+        from urllib.parse import urlparse
+
+        parsed = urlparse(cdp_url if "://" in cdp_url else f"http://{cdp_url}")
+        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return
+        port = parsed.port or 9222
+        broker_url = str(browser_cfg.get("cdp_broker_url", "http://127.0.0.1:9221") or "").strip()
+        from hermes_cli.browser_connect import (
+            is_browser_debug_ready,
+            request_user_session_chrome_debug,
+        )
+
+        if not is_browser_debug_ready(cdp_url, timeout=0.5):
+            request_user_session_chrome_debug(port=port, broker_url=broker_url)
+    except Exception as exc:
+        logger.warning("Automatic user-session CDP startup failed: %s", exc)
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -2036,6 +2068,8 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     force_local = _is_local_sidecar_key(task_id)
 
     # Create session outside the lock (network call in cloud mode)
+    if not force_local:
+        _maybe_start_user_session_cdp()
     cdp_override = _get_cdp_override()
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
