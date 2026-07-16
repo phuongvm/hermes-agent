@@ -156,14 +156,14 @@ def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     )
 
 
-# Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
-# 1.0.1. Anything below that lets a malformed Host header desync
-# ``request.url.path`` from the dispatched ASGI path, bypassing path-based
+# Minimum non-vulnerable Starlette: CVE-2026-54283 and related advisories
+# require 1.3.1. Anything below that leaves current DoS and request parsing
+# ``request.form()`` limits and path-based request handling. Starlette's
 # authz in middleware/endpoints that gate on ``request.url``. Starlette is a
 # transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/[computer-use]/
 # [dev]) so we pin it directly in every extra that exposes a server surface and
 # enforce the floor in both pyproject and the committed lockfile.
-_STARLETTE_CVE_FLOOR = (1, 0, 1)
+_STARLETTE_CVE_FLOOR = (1, 3, 1)
 
 
 def _version_tuple(spec: str) -> tuple[int, ...]:
@@ -178,7 +178,7 @@ def _version_tuple(spec: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
+def test_starlette_pinned_above_current_security_floor_in_pyproject():
     """Every extra that declares Starlette must pin a patched (>=1.0.1) version.
 
     Regression guard for #35067 / CVE-2026-48710. A future edit that drops the
@@ -212,7 +212,7 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
         )
 
 
-def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
+def test_locked_starlette_is_not_below_current_security_floor():
     """The committed uv.lock must resolve starlette to a patched version.
 
     pyproject pins protect the declared extras, but the lockfile is what
@@ -235,10 +235,32 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
     assert versions, "starlette not found in uv.lock"
     for ver in versions:
         assert _version_tuple(ver) >= _STARLETTE_CVE_FLOOR, (
-            f"uv.lock resolves starlette=={ver}, below the CVE-2026-48710 fix "
+            f"uv.lock resolves starlette=={ver}, below the current security "
             f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))} — regenerate the "
             f"lockfile after bumping the pin"
         )
+
+
+def test_pillow_pinned_at_current_security_floor():
+    """Core and locked Pillow versions must include current security fixes."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = data["project"]["dependencies"]
+    pillow_specs = [spec for spec in dependencies if spec.lower().startswith("pillow==")]
+    assert pillow_specs == ["Pillow==12.3.0"]
+
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    versions = []
+    in_pillow = False
+    for line in lock.splitlines():
+        if line.startswith("[[package]]"):
+            in_pillow = False
+        elif line.strip() == 'name = "pillow"':
+            in_pillow = True
+        elif in_pillow and line.startswith("version = "):
+            versions.append(line.split("=", 1)[1].strip().strip('"'))
+            in_pillow = False
+
+    assert versions == ["12.3.0"], f"uv.lock resolves unexpected Pillow versions: {versions}"
 
 
 def test_locale_catalogs_ship_in_both_wheel_and_sdist():
