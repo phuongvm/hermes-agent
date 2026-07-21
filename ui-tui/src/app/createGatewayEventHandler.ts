@@ -51,8 +51,8 @@ const dropBgTask = (taskId: string) =>
 
 const pushUnique =
   (max: number) =>
-    <T>(xs: T[], x: T): T[] =>
-      xs.at(-1) === x ? xs : [...xs, x].slice(-max)
+  <T>(xs: T[], x: T): T[] =>
+    xs.at(-1) === x ? xs : [...xs, x].slice(-max)
 
 const pushThinking = pushUnique(6)
 const pushNote = pushUnique(6)
@@ -233,7 +233,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     lastDelegationFetchAt = now
     rpc<DelegationStatusResponse>('delegation.status', {})
       .then(r => applyDelegationStatus(r))
-      .catch(() => { })
+      .catch(() => {})
   }
 
   const setStatus = (status: string) => {
