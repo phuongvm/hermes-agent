@@ -104,6 +104,25 @@ class TestCredentialFingerprint:
             config = _Cfg()
         assert GatewayRunner._adapter_credential_fingerprint(_Adapter()) is None
 
+    def test_matrix_password_auth_counts_as_credential(self, monkeypatch):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import _platform_has_bot_credential
+
+        config = PlatformConfig(enabled=True, extra={
+            "user_id": "@bot:matrix.org",
+            "password": "matrix-password",
+        })
+        assert _platform_has_bot_credential(Platform.MATRIX, config) is True
+
+    def test_matrix_password_auth_requires_user_id(self, monkeypatch):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import _platform_has_bot_credential
+
+        monkeypatch.delenv("MATRIX_USER_ID", raising=False)
+        monkeypatch.delenv("MATRIX_ACCESS_TOKEN", raising=False)
+        config = PlatformConfig(enabled=True, extra={"password": "matrix-password"})
+        assert _platform_has_bot_credential(Platform.MATRIX, config) is False
+
 
 class TestProfileMessageHandler:
     @pytest.mark.asyncio

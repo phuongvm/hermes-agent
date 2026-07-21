@@ -14,6 +14,7 @@ import functools
 import hashlib
 import logging
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -1974,13 +1975,17 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
-    basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    raw_temp_dir = tempfile.gettempdir()
+    # Keep mocked/portable POSIX command paths on POSIX semantics even when
+    # the detector itself runs on Windows.
+    pathmod = posixpath if raw_temp_dir.startswith("/") and operand.startswith("/") else os.path
+    temp_dir = pathmod.realpath(raw_temp_dir)
+    basename = pathmod.basename(operand)
+    if operand != pathmod.join(temp_dir, basename):
         return False
 
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
+    target = pathmod.realpath(operand)
+    if pathmod.dirname(target) != temp_dir:
         return False
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 

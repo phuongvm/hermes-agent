@@ -1598,6 +1598,16 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     """
     from gateway.config import PLATFORM_TOKEN_ENV_NAMES
 
+    # Matrix supports password authentication in addition to access tokens.
+    # The password and user ID are stored in config.extra by load_gateway_config
+    # and therefore do not appear in PlatformConfig.token.
+    if platform is Platform.MATRIX:
+        extra = getattr(platform_config, "extra", {}) or {}
+        user_id = extra.get("user_id") or os.getenv("MATRIX_USER_ID", "")
+        password = extra.get("password") or os.getenv("MATRIX_PASSWORD", "")
+        if isinstance(user_id, str) and user_id.strip() and isinstance(password, str) and password.strip():
+            return True
+
     if platform not in PLATFORM_TOKEN_ENV_NAMES:
         return True
     token = getattr(platform_config, "token", None) or ""
