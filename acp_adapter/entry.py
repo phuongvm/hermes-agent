@@ -31,9 +31,11 @@ else:
 
 import argparse
 import asyncio
+import importlib
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
 
@@ -114,6 +116,16 @@ def _load_env() -> None:
         logging.getLogger(__name__).info(
             "No .env found at %s, using system env", hermes_home / ".env"
         )
+
+
+def _prewarm_agent_runtime() -> None:
+    """Import thread-sensitive runtime modules before ACP starts background I/O.
+
+    On Windows, importing enabled plugins can load native NumPy/OpenBLAS DLLs.
+    Completing that import while the process is still single-threaded avoids a
+    loader-lock deadlock with ACP's blocking stdin feeder thread.
+    """
+    importlib.import_module("run_agent")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -245,6 +257,14 @@ def main(argv: list[str] | None = None) -> None:
     project_root = str(Path(__file__).resolve().parent.parent)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    if sys.platform == "win32":
+        prewarm_started = time.perf_counter()
+        _prewarm_agent_runtime()
+        logger.info(
+            "Prewarmed agent runtime before ACP background threads in %.2fs",
+            time.perf_counter() - prewarm_started,
+        )
 
     import acp
     from .server import HermesACPAgent
