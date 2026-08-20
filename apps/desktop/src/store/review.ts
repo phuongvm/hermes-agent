@@ -91,6 +91,7 @@ export const $reviewCommitMsgBusy = atom(false)
 // tiles can sit in different worktrees than main, and reviewing "the diff I'm
 // looking at" must mean that tile's repo, not whatever main happens to be on.
 export const $reviewScopeCwd = atom<null | string>(null)
+export const $reviewGitRoot = atom<null | string>(null)
 // The composer target that opened the pane. The review pane is a shared
 // surface, but its "let the agent ship it" action must return to the session
 // whose worktree the user is reviewing, not broadcast to every mounted tile.

@@ -367,6 +367,15 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
             if "honcho" not in updated_available:
                 updated_available.append("honcho")
             continue
+        if name == "browser-use":
+            # browser-use tool is mutually exclusive with built-in browser backend;
+            # when browser.backend is explicitly off, browser-use is deliberately deactivated.
+            try:
+                from tools.browser_use_cli import get_browser_backend, BACKEND_DISABLED
+                if get_browser_backend() == BACKEND_DISABLED:
+                    continue
+            except Exception:
+                pass
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
 
