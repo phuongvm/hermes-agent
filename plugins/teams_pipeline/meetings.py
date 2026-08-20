@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import datetime
-import logging
-import os
+import base64
+import binascii
 import re
 import tempfile
 import urllib.request
@@ -13,247 +12,25 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
-logger = logging.getLogger(__name__)
-
-# Configurable calendar search organizers — comma-separated UUIDs via env var.
-# Avoids hardcoding tenant-specific IDs in upstream source.
-_DEFAULT_CALENDAR_ORGANIZERS = os.environ.get(
-    "HERMES_TEAMS_CALENDAR_ORGANIZERS", ""
-)
-_KNOWN_CALENDAR_ORGANIZERS = [
-    uid.strip()
-    for uid in _DEFAULT_CALENDAR_ORGANIZERS.split(",")
-    if uid.strip()
-]
-
 from plugins.teams_pipeline.models import MeetingArtifact, TeamsMeetingRef
 from tools.microsoft_graph_client import MicrosoftGraphAPIError, MicrosoftGraphClient
 
-# ---------------------------------------------------------------------------
-# Recap URL constants — parsed from Teams meeting recap URLs
-# ---------------------------------------------------------------------------
-_RECAP_URL_PATTERN = re.compile(
-    r"teams\.microsoft\.com/l/meetingrecap",
-    re.IGNORECASE,
+_USERS_MEETING_RE = re.compile(
+    r"(?i)(?:^|/)users/([^/]+)/onlineMeetings(?:\('([^']+)'\)|/([^/'?]+))"
 )
-_RECAP_PARAM_RE = re.compile(r"(threadId|callId|organizerId|tenantId|driveId|driveItemId|iCalUid|fileUrl)=([^&]*)")
-
-# UUID pattern for call record ID detection
-_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
+_COMM_MEETING_RE = re.compile(
+    r"(?i)(?:^|/)communications/onlineMeetings(?:\('([^']+)'\)|/([^/'?]+))"
 )
-
-
-def _is_uuid(value: str) -> bool:
-    """Check if a string looks like a UUID (call record ID format)."""
-    return bool(_UUID_RE.match(value))
-
-
-def _resolve_short_meet_url(short_url: str, *, follow_redirects: int = 3) -> str:
-    """Resolve a short teams.microsoft.com/meet/ URL to its full meetup-join URL.
-
-    Short meet URLs (e.g. https://teams.microsoft.com/meet/123456?p=passcode)
-    use a numeric meeting ID that the Graph API cannot resolve directly.
-    This function follows the HTTP redirect chain to obtain the full
-    meetup-join URL which contains the GUID that Graph API understands.
-
-    Args:
-        short_url: The short meet URL to resolve.
-        follow_redirects: Maximum number of redirects to follow.
-
-    Returns:
-        The resolved full meetup-join URL, or the original URL if resolution fails.
-    """
-    if '/meet/' not in short_url and '/meetup-join/' not in short_url:
-        return short_url
-
-    # Already a full URL — no need to resolve
-    if '/meetup-join/' in short_url:
-        return short_url
-
-    current_url = short_url
-    for _ in range(follow_redirects):
-        try:
-            req = urllib.request.Request(current_url, method='HEAD')
-            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
-            response = urllib.request.urlopen(req, timeout=10)
-            final_url = response.url
-            # Check if we got a meetup-join URL
-            if '/meetup-join/' in final_url:
-                return final_url
-            # If it's still a short URL or launcher page, try GET instead
-            if '/meet/' in final_url or 'launcher' in final_url:
-                req = urllib.request.Request(current_url, method='GET')
-                req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
-                response = urllib.request.urlopen(req, timeout=10)
-                final_url = response.url
-                if '/meetup-join/' in final_url:
-                    return final_url
-            return final_url
-        except urllib.error.HTTPError as exc:
-            # Some servers return 302 with Location header on HEAD
-            location = exc.headers.get('Location', '') or exc.headers.get('location', '')
-            if location and '/meetup-join/' in location:
-                return location
-            if location:
-                current_url = location
-                continue
-            break
-        except Exception:
-            break
-    return short_url
-
-
-def _is_short_meet_url(url: str) -> bool:
-    """Check if a URL is a short teams.microsoft.com/meet/ URL with numeric ID."""
-    return bool(re.search(r'teams\.(microsoft|live)\.com/meet/\d+', url))
-
-
-def _is_join_web_url(url: str) -> bool:
-    """Check if a URL is a Teams meetup-join URL."""
-    return '/meetup-join/' in url
-
-
-def _extract_numeric_meeting_id(url: str) -> str | None:
-    """Extract the numeric meeting ID from a short meet URL.
-
-    Example: https://teams.microsoft.com/meet/290295479785902?p=SA9t6Fp9 -> 290295479785902
-    Also handles: https://teams.live.com/meet/9322317401797?p=...
-    """
-    match = re.search(r'/meet/(\d+)', url)
-    return match.group(1) if match else None
-
-
-async def _resolve_short_meet_from_call_records(
-    client: MicrosoftGraphClient,
-    numeric_id: str,
-    *,
-    tenant_id: str | None = None,
-) -> TeamsMeetingRef | None:
-    """Try to resolve a short meet URL by searching call records.
-
-    Call records may store the short meet URL in their joinWebUrl field.
-    If found, we can extract the organizer and resolve through Graph API.
-    """
-    try:
-        if hasattr(client, "collect_paginated"):
-            candidates = await client.collect_paginated("/communications/callRecords")
-        else:
-            payload = await client.get_json("/communications/callRecords")
-            candidates = payload.get("value") if isinstance(payload, dict) else None
-    except MicrosoftGraphAPIError:
-        return None
-
-    if not isinstance(candidates, list):
-        return None
-
-    for call_record in candidates:
-        if not isinstance(call_record, dict):
-            continue
-        join_web_url = str(call_record.get("joinWebUrl") or "").strip()
-        if not join_web_url:
-            continue
-        decoded_join = unquote(join_web_url)
-        if numeric_id not in decoded_join and numeric_id not in join_web_url:
-            continue
-
-        organizer_user_id = _parse_organizer_user_id(call_record)
-        try:
-            return await _resolve_meeting_from_join_url(
-                client,
-                join_web_url=join_web_url,
-                organizer_user_id=organizer_user_id,
-                tenant_id=tenant_id,
-            )
-        except TeamsMeetingNotFoundError:
-            if organizer_user_id:
-                metadata = {
-                    key: call_record.get(key)
-                    for key in ("subject", "startDateTime", "endDateTime", "createdDateTime", "participants")
-                    if call_record.get(key) is not None
-                }
-                return TeamsMeetingRef(
-                    meeting_id=str(call_record.get("id") or "").strip(),
-                    organizer_user_id=organizer_user_id,
-                    join_web_url=join_web_url,
-                    tenant_id=tenant_id or call_record.get("tenantId"),
-                    metadata=metadata,
-                )
-            continue
-
-    return None
-
-
-async def _resolve_short_meet_from_calendar(
-    client: MicrosoftGraphClient,
-    numeric_id: str,
-    *,
-    organizer_user_id: str | None = None,
-    tenant_id: str | None = None,
-) -> TeamsMeetingRef | None:
-    """Try to resolve a short meet URL by searching the organizer's calendar.
-
-    Calendar events store the full meetup-join URL in onlineMeeting.joinUrl.
-    When we have a short meet URL with a numeric ID, we search the calendar
-    for events that have this numeric ID in their body or join URL.
-    """
-    # Search the last 14 days to next 7 days
-    now = datetime.datetime.now(datetime.timezone.utc)
-    start = (now - datetime.timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
-    end = (now + datetime.timedelta(days=7)).strftime("%Y-%m-%dT23:59:59Z")
-
-    # Try the provided organizer first, then fall back to searching common organizers
-    search_users = []
-    if organizer_user_id:
-        search_users.append(organizer_user_id)
-
-    # Add known organizers from environment configuration
-    for org in _KNOWN_CALENDAR_ORGANIZERS:
-        if org not in search_users:
-            search_users.append(org)
-
-    for user_id in search_users:
-        try:
-            payload = await client.get_json(
-                f"/users/{quote(user_id, safe='')}/calendarView",
-                params={
-                    "startDateTime": start,
-                    "endDateTime": end,
-                    "$top": 50,
-                },
-            )
-            events = payload.get("value", []) if isinstance(payload, dict) else []
-
-            for event in events:
-                # Check onlineMeeting joinUrl
-                online = event.get("onlineMeeting", {}) or {}
-                join_url = online.get("joinUrl", "") or ""
-
-                # Also check body/bodyPreview for the numeric ID
-                body_preview = str(event.get("bodyPreview", "") or "")
-                body_content = str(event.get("body", {}).get("content", "") or "")
-
-                # Match by numeric ID in join URL or body
-                if (
-                    numeric_id in join_url
-                    or numeric_id in body_preview
-                    or numeric_id in body_content
-                ):
-                    # Found the event — use the full joinUrl from onlineMeeting
-                    if join_url:
-                        return await _resolve_meeting_from_join_url(
-                            client,
-                            join_web_url=join_url,
-                            organizer_user_id=user_id,
-                            tenant_id=tenant_id,
-                        )
-
-        except MicrosoftGraphAPIError:
-            # User not accessible, skip
-            continue
-
-    return None
+_TRANSCRIPT_RE = re.compile(r"(?i)/transcripts(?:\('([^']+)'\)|/([^/'?]+))")
+_RECORDING_RE = re.compile(r"(?i)/recordings(?:\('([^']+)'\)|/([^/'?]+))")
+_RESOURCE_SENTINELS = frozenset(
+    {
+        "getalltranscripts",
+        "getallrecordings",
+        "transcripts",
+        "recordings",
+    }
+)
 
 
 class TeamsMeetingError(RuntimeError):
@@ -272,8 +49,75 @@ class TeamsMeetingPermissionError(TeamsMeetingError):
     """Raised when Graph access is denied for the requested resource."""
 
 
-def _meeting_vtc_id(meeting_id: str) -> str:
-    return re.sub(r"\s+", "", meeting_id).strip()
+def parse_graph_meeting_resource(resource: str) -> dict[str, str | None]:
+    """Parse organizer, meeting, and artifact ids from a Graph resource or @odata.id."""
+
+    text = str(resource or "").strip()
+    organizer_user_id: str | None = None
+    meeting_id: str | None = None
+    transcript_id: str | None = None
+    recording_id: str | None = None
+
+    users_match = _USERS_MEETING_RE.search(text)
+    if users_match:
+        organizer_user_id = unquote(users_match.group(1) or "").strip() or None
+        meeting_id = unquote(users_match.group(2) or users_match.group(3) or "").strip() or None
+
+    if not meeting_id:
+        comm_match = _COMM_MEETING_RE.search(text)
+        if comm_match:
+            meeting_id = unquote(comm_match.group(1) or comm_match.group(2) or "").strip() or None
+
+    if meeting_id and meeting_id.lower() in _RESOURCE_SENTINELS:
+        meeting_id = None
+
+    transcript_match = _TRANSCRIPT_RE.search(text)
+    if transcript_match:
+        transcript_id = unquote(transcript_match.group(1) or transcript_match.group(2) or "").strip() or None
+
+    recording_match = _RECORDING_RE.search(text)
+    if recording_match:
+        recording_id = unquote(recording_match.group(1) or recording_match.group(2) or "").strip() or None
+
+    return {
+        "organizer_user_id": organizer_user_id,
+        "meeting_id": meeting_id,
+        "transcript_id": transcript_id,
+        "recording_id": recording_id,
+    }
+
+
+def looks_like_transcript_id(value: str, *, odata_type: str | None = None) -> bool:
+    """True when a Graph id is a callTranscript artifact rather than an onlineMeeting."""
+
+    if "calltranscript" in str(odata_type or "").lower():
+        return True
+    text = str(value or "")
+    if "transcript" in text.lower():
+        return True
+    return "transcript" in _decoded_id_hint(text)
+
+
+def _decoded_id_hint(value: str) -> str:
+    """Best-effort base64 decode of a Graph id for artifact-marker sniffing.
+
+    Graph transcript ids are base64url blobs whose *decoded* payload carries a
+    ``...-TranscriptV2`` suffix while the encoded form contains no readable
+    marker (this is exactly the id shape from getAllTranscripts
+    ``resourceData.id``). Returns lowercase decoded text, or "" when the value
+    does not decode.
+    """
+
+    stripped = value.strip()
+    if len(stripped) < 16:
+        return ""
+    padded = stripped + "=" * (-len(stripped) % 4)
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            return decoder(padded).decode("utf-8", "ignore").lower()
+        except (binascii.Error, ValueError):
+            continue
+    return ""
 
 
 def _meeting_path(meeting_ref: TeamsMeetingRef | str) -> str:
@@ -283,10 +127,12 @@ def _meeting_path(meeting_ref: TeamsMeetingRef | str) -> str:
     else:
         meeting_id = str(meeting_ref)
         organizer_user_id = None
-
+    encoded_meeting_id = quote(meeting_id, safe="")
     if organizer_user_id:
-        return f"/users/{quote(organizer_user_id, safe='')}/onlineMeetings/{quote(meeting_id, safe='')}"
-    return f"/communications/onlineMeetings/{quote(meeting_id, safe='')}"
+        return (
+            f"/users/{quote(organizer_user_id, safe='')}/onlineMeetings/{encoded_meeting_id}"
+        )
+    return f"/communications/onlineMeetings/{encoded_meeting_id}"
 
 
 def _organizer_drive_recordings_path(organizer_user_id: str) -> str:
@@ -440,7 +286,12 @@ def _parse_thread_id(payload: dict[str, Any]) -> str | None:
     return payload.get("threadId")
 
 
-def _normalize_meeting_ref(payload: dict[str, Any], *, tenant_id: str | None = None) -> TeamsMeetingRef:
+def _normalize_meeting_ref(
+    payload: dict[str, Any],
+    *,
+    tenant_id: str | None = None,
+    organizer_user_id: str | None = None,
+) -> TeamsMeetingRef:
     metadata = {
         key: payload.get(key)
         for key in ("subject", "startDateTime", "endDateTime", "createdDateTime")
@@ -451,7 +302,7 @@ def _normalize_meeting_ref(payload: dict[str, Any], *, tenant_id: str | None = N
         metadata["participants"] = participants
     return TeamsMeetingRef(
         meeting_id=str(payload.get("id") or "").strip(),
-        organizer_user_id=_parse_organizer_user_id(payload),
+        organizer_user_id=organizer_user_id or _parse_organizer_user_id(payload),
         join_web_url=payload.get("joinWebUrl"),
         calendar_event_id=payload.get("calendarEventId"),
         thread_id=_parse_thread_id(payload),
@@ -881,188 +732,57 @@ async def resolve_meeting_reference(
     meeting_id: str | None = None,
     join_web_url: str | None = None,
     tenant_id: str | None = None,
-    recap_url: str | None = None,
+    organizer_user_id: str | None = None,
 ) -> TeamsMeetingRef:
-    # ENHANCEMENT (RCA-20260518): Recap URL resolution.
-    # When a recap URL is provided, extract all identifiers and use them
-    # to resolve the meeting directly via call record ID.
-    if recap_url:
-        recap_data = parse_recap_url(recap_url)
-        if recap_data:
-            logger.info("Parsed recap URL: callId=%s organizerId=%s", recap_data.get("callId"), recap_data.get("organizerId"))
-            call_id = recap_data.get("callId")
-            if call_id:
-                direct_ref = await _resolve_meeting_from_call_record_id(
-                    client, call_id,
-                    tenant_id=recap_data.get("tenantId") or tenant_id,
-                )
-                if direct_ref is not None:
-                    logger.info("Resolved meeting from recap URL: %s", call_id)
-                    return direct_ref
-            # Fallback: use VTC GUID from recap URL
-            vtc_guid = recap_data.get("vtcGuid")
-            if vtc_guid:
-                try:
-                    payload = await client.get_json(
-                        "/communications/onlineMeetings",
-                        params={"$filter": f"VideoTeleconferenceId eq '{vtc_guid}'"},
-                    )
-                    candidates = payload.get("value") if isinstance(payload, dict) else None
-                    if isinstance(candidates, list) and candidates:
-                        return _normalize_meeting_ref(candidates[0], tenant_id=tenant_id)
-                except MicrosoftGraphAPIError:
-                    pass
-            # Last resort: build pending ref from recap data
-            organizer_id = recap_data.get("organizerId")
-            thread_id = recap_data.get("threadId")
-            return TeamsMeetingRef(
-                meeting_id=call_id or recap_url,
-                organizer_user_id=organizer_id,
-                join_web_url=recap_data.get("fileUrl") or recap_url,
-                tenant_id=recap_data.get("tenantId") or tenant_id,
-                metadata={
-                    "source": "recap_url",
-                    "pending_resolution": True,
-                    "recap_data": recap_data,
-                    "thread_id": thread_id,
-                },
-            )
-        # recap_url did not match recap format — check if it is a short meet URL
-        # or join URL and delegate to the join_web_url resolution path below.
-        if _is_short_meet_url(recap_url) or _is_join_web_url(recap_url):
-            logger.info("recap_url is a meet/join URL, routing to join_web_url path: %s", recap_url)
-            join_web_url = recap_url
+    if meeting_id and looks_like_transcript_id(meeting_id):
+        if join_web_url:
+            meeting_id = None
         else:
-            logger.info("recap_url did not parse as recap or meet URL: %s", recap_url)
-
+            raise TeamsMeetingError(
+                "Refusing to GET /communications/onlineMeetings/{id} with a transcript id. "
+                "Graph v1.0 does not support that id format; use the organizer-scoped meeting "
+                "id from the notification @odata.id, or a join URL."
+            )
     if meeting_id:
         try:
-            payload = await client.get_json(_meeting_path(meeting_id))
-            if isinstance(payload, dict) and payload.get("id"):
-                return _normalize_meeting_ref(payload, tenant_id=tenant_id)
+            payload = await client.get_json(
+                _meeting_path(
+                    TeamsMeetingRef(meeting_id=meeting_id, organizer_user_id=organizer_user_id)
+                )
+            )
         except MicrosoftGraphAPIError as exc:
-            if exc.status_code in (401, 403):
-                # CsApplicationAccessPolicy 403: the organizer's meetings are
-                # not accessible to this app.  Fall through to call-record /
-                # OneDrive fallbacks instead of failing immediately.
-                if "No application access policy" in str(exc):
-                    logger.debug(
-                        "Skipping onlineMeetings lookup — CsApplicationAccessPolicy "
-                        "not granted for meeting %s", meeting_id,
-                    )
-                else:
-                    raise _wrap_graph_error(
-                        exc, missing_message=f"Teams meeting not found: {meeting_id}",
-                    ) from exc
-            elif exc.status_code not in (400, 404):
-                raise
-
-        # ENHANCEMENT (RCA-20260518): Direct call record resolution.
-        # When meeting_id is a UUID (call record ID), not a base64-encoded
-        # meeting token, try fetching the call record directly.  This is the
-        # PRIMARY fix for short-meet-URL meetings where the webhook fires
-        # with a call record ID that the onlineMeetings endpoint can't resolve.
-        import uuid as _uuid
-        if _is_uuid(meeting_id):
-            logger.debug(
-                "Meeting ID looks like a call record UUID — trying direct resolution: %s",
-                meeting_id,
-            )
-            direct_ref = await _resolve_meeting_from_call_record_id(
-                client, meeting_id, tenant_id=tenant_id,
-            )
-            if direct_ref is not None:
-                logger.info(
-                    "Resolved meeting via direct call record lookup: %s → %s",
-                    meeting_id, direct_ref.meeting_id,
-                )
-                return direct_ref
-
-        vtc_id = _meeting_vtc_id(meeting_id)
-        if vtc_id and vtc_id != meeting_id:
-            try:
-                payload = await client.get_json(
-                    "/communications/onlineMeetings",
-                    params={"$filter": f"VideoTeleconferenceId eq '{vtc_id}'"},
-                )
-                candidates = payload.get("value") if isinstance(payload, dict) else None
-                if isinstance(candidates, list) and candidates:
-                    return _normalize_meeting_ref(candidates[0], tenant_id=tenant_id)
-            except MicrosoftGraphAPIError as exc:
-                if exc.status_code in (401, 403):
-                    if "No application access policy" in str(exc):
-                        logger.debug(
-                            "Skipping VTC filter — CsApplicationAccessPolicy "
-                            "not granted for meeting %s", meeting_id,
-                        )
-                    else:
-                        raise _wrap_graph_error(
-                            exc, missing_message=f"Teams meeting not found: {meeting_id}",
-                        ) from exc
-                elif exc.status_code not in (400, 404):
-                    raise
-
-        call_record_artifact = await fetch_call_record_artifact(
-            client,
-            call_record_id=meeting_id,
-            allow_permission_errors=False,
-        )
-        call_record = (call_record_artifact.metadata or {}).get("call_record") if call_record_artifact else None
-        if isinstance(call_record, dict):
-            join_from_call_record = str(call_record.get("joinWebUrl") or "").strip() or None
-            organizer_user_id = _parse_organizer_user_id(call_record)
-            if join_from_call_record:
-                try:
-                    return await _resolve_meeting_from_join_url(
-                        client,
-                        join_web_url=join_from_call_record,
-                        organizer_user_id=organizer_user_id,
-                        tenant_id=tenant_id,
-                    )
-                except TeamsMeetingNotFoundError:
-                    # OnlineMeeting record may be deleted after meeting ends.
-                    # Return a ref with organizer_user_id so OneDrive fallback works.
-                    if organizer_user_id:
-                        metadata = {
-                            key: call_record.get(key)
-                            for key in ("subject", "startDateTime", "endDateTime", "createdDateTime", "participants")
-                            if call_record.get(key) is not None
-                        }
-                        return TeamsMeetingRef(
-                            meeting_id=meeting_id,
-                            organizer_user_id=organizer_user_id,
-                            join_web_url=join_from_call_record,
-                            tenant_id=tenant_id or call_record.get("tenantId"),
-                            metadata=metadata,
-                        )
-
-        bridged_ref = await _resolve_meeting_from_call_records(
-            client,
-            meeting_token=meeting_id,
+            raise _wrap_graph_error(exc, missing_message=f"Teams meeting not found: {meeting_id}") from exc
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise TeamsMeetingNotFoundError(f"Teams meeting not found: {meeting_id}")
+        return _normalize_meeting_ref(
+            payload,
             tenant_id=tenant_id,
+            organizer_user_id=organizer_user_id,
         )
-        if bridged_ref is not None:
-            return bridged_ref
-
-        # Last resort: if we have organizer from call record, return pending ref
-        if isinstance(call_record, dict):
-            organizer_user_id = _parse_organizer_user_id(call_record)
-            if organizer_user_id:
-                return TeamsMeetingRef(
-                    meeting_id=meeting_id,
-                    organizer_user_id=organizer_user_id,
-                    join_web_url=str(call_record.get("joinWebUrl") or "").strip() or None,
-                    tenant_id=tenant_id,
-                    metadata={"pending_resolution": True, "source": "call_record"},
-                )
-
-        raise TeamsMeetingNotFoundError(f"Teams meeting not found: {meeting_id}")
 
     if join_web_url:
-        # Save original URL for short meet URL detection (before any transformation)
-        original_url = join_web_url
-        is_short = _is_short_meet_url(join_web_url)
-        numeric_id = _extract_numeric_meeting_id(join_web_url) if is_short else None
+        escaped_join_url = join_web_url.replace("'", "''")
+        lookup_path = "/communications/onlineMeetings"
+        if organizer_user_id:
+            lookup_path = f"/users/{quote(organizer_user_id, safe='')}/onlineMeetings"
+        try:
+            payload = await client.get_json(
+                lookup_path,
+                params={"$filter": f"JoinWebUrl eq '{escaped_join_url}'"},
+            )
+        except MicrosoftGraphAPIError as exc:
+            raise _wrap_graph_error(
+                exc,
+                missing_message=f"Teams meeting not found for join URL: {join_web_url}",
+            ) from exc
+        candidates = payload.get("value") if isinstance(payload, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            raise TeamsMeetingNotFoundError(f"Teams meeting not found for join URL: {join_web_url}")
+        return _normalize_meeting_ref(
+            candidates[0],
+            tenant_id=tenant_id,
+            organizer_user_id=organizer_user_id,
+        )
 
         # For short meet URLs, skip HTTP redirect resolution (goes to launcher page)
         # and go straight to Graph API resolution + calendar/call records fallback
