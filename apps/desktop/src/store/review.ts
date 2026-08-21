@@ -91,11 +91,15 @@ export const $reviewCommitMsgBusy = atom(false)
 // tiles can sit in different worktrees than main, and reviewing "the diff I'm
 // looking at" must mean that tile's repo, not whatever main happens to be on.
 export const $reviewScopeCwd = atom<null | string>(null)
-export const $reviewGitRoot = atom<null | string>(null)
 // The composer target that opened the pane. The review pane is a shared
 // surface, but its "let the agent ship it" action must return to the session
 // whose worktree the user is reviewing, not broadcast to every mounted tile.
 export const $reviewScopeTarget = atom('main')
+
+// The top-level Git repository root directory. When CWD is inside a subdirectory
+// of a Git repo, Git operations, diffs, and file open targets must resolve against
+// the top-level repository root.
+export const $reviewGitRoot = atom<null | string>(null)
 
 /** The repo the pane is reading right now: its pinned scope, else the active
  *  session's cwd. Exported for pane helpers that join repo-relative paths. */
@@ -305,6 +309,7 @@ export function closeReview(): void {
   $reviewOpen.set(false)
   $reviewScopeCwd.set(null)
   $reviewScopeTarget.set('main')
+  $reviewGitRoot.set(null)
   clearReviewSelection()
 }
 
