@@ -144,6 +144,68 @@ describe('desktop filesystem facade', () => {
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
   })
 
+  it('attaches active registry connectionId and profile onto remote filesystem requests', async () => {
+    $connection.set({ connectionId: 'gw-remote-1', mode: 'remote', profile: 'researcher' } as never)
+
+    await readDesktopDir('/srv/project')
+    await readDesktopFileText('/srv/project/file.txt')
+    await readDesktopFileDataUrl('/srv/project/img.png')
+    await desktopGitRoot('/srv/project')
+    await desktopDefaultCwd()
+    await desktopFileDiff('/srv/project', 'file.txt')
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-remote-1',
+      path: '/api/fs/list?path=%2Fsrv%2Fproject',
+      profile: 'researcher'
+    })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-remote-1',
+      path: '/api/fs/read-text?path=%2Fsrv%2Fproject%2Ffile.txt',
+      profile: 'researcher'
+    })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-remote-1',
+      path: '/api/fs/read-data-url?path=%2Fsrv%2Fproject%2Fimg.png',
+      profile: 'researcher'
+    })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-remote-1',
+      path: '/api/fs/git-root?path=%2Fsrv%2Fproject',
+      profile: 'researcher'
+    })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-remote-1',
+      path: '/api/fs/default-cwd',
+      profile: 'researcher'
+    })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-remote-1',
+      path: '/api/git/file-diff?path=%2Fsrv%2Fproject&file=file.txt',
+      profile: 'researcher'
+    })
+  })
+
+  it('differentiates remote gateways that share default profile via connectionId', async () => {
+    $connection.set({ connectionId: 'gw-alpha', mode: 'remote', profile: 'default' } as never)
+    await readDesktopDir('/srv/alpha')
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-alpha',
+      path: '/api/fs/list?path=%2Fsrv%2Falpha',
+      profile: 'default'
+    })
+
+    $connection.set({ connectionId: 'gw-beta', mode: 'remote', profile: 'default' } as never)
+    await readDesktopDir('/srv/beta')
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gw-beta',
+      path: '/api/fs/list?path=%2Fsrv%2Fbeta',
+      profile: 'default'
+    })
+  })
+
   it('keys SSH filesystem caches by stable host identity instead of the forwarded port', () => {
     $connection.set({
       mode: 'remote',

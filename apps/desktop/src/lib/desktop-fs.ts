@@ -43,6 +43,17 @@ export function desktopFsProfile(): string | undefined {
   return $connection.get()?.profile || undefined
 }
 
+export function desktopConnectionScope(): { connectionId?: string; profile?: string } {
+  const conn = $connection.get()
+  const connectionId = conn?.connectionId?.trim() || undefined
+  const profile = conn?.profile?.trim() || undefined
+
+  return {
+    ...(connectionId ? { connectionId } : {}),
+    ...(profile ? { profile } : {})
+  }
+}
+
 function fsPath(endpoint: string, filePath: string) {
   return `/api/fs/${endpoint}?path=${encodeURIComponent(filePath)}`
 }
@@ -58,8 +69,9 @@ function bridge() {
 }
 
 function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+  const scope = desktopConnectionScope()
   return bridge().api<T>(
-    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
+    body ? { ...scope, body, method: 'POST', path } : { ...scope, path }
   )
 }
 

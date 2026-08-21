@@ -72,6 +72,7 @@ import {
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  dispatchApiRequestRoute,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
@@ -13405,136 +13406,129 @@ async function pooledRegistrySessionSources(): Promise<RegistrySessionSource[]> 
   return sources
 }
 
-async function handleHermesApiRequest(request) {
-  // Registry-pinned request (request.connectionId): the renderer is working
-  // against a REGISTERED gateway connection, so the data — cron jobs and their
-  // run sessions included — lives in THAT host's state.db, not any local
-  // profile's. Resolve the backend through the registry (same pool the job
-  // list and WS traffic use) instead of the legacy profile route; a shared
-  // remote/cloud host serves every profile via ?profile=, so scope the path.
-  // An absent/empty id falls through to the byte-identical v1 route below.
-  // Explicit `local` stays registry-pinned so it cannot inherit a v1 remote.
-  const registryConnectionId = apiRequestRegistryConnectionId(request)
+async function handleHermesApiRequest(request: unknown): Promise<unknown> {
+  return dispatchApiRequestRoute(request, {
+    resolveRegistry: async (registryConnectionId, req) => {
+      const connection: any = await ensureRegistryBackend(registryConnectionId, req.profile || undefined)
 
-  if (registryConnectionId) {
-    const connection: any = await ensureRegistryBackend(registryConnectionId, request?.profile)
+      // A shared remote host serves every profile via ?profile=; an SSH-scoped
+      // backend instead runs AS one remote profile, so an explicit self-profile
+      // filter must be translated from the desktop routing label into that
+      // backend namespace (same contract as the v1 profileRouteOptions path).
+      const requestPath = connection.sharedRemote
+        ? pathWithProfileScope(req.path || '', req.profile || undefined)
+        : translateSelfProfileQuery(req.path || '', req.profile || undefined, connection.remoteProfile)
 
-    // A shared remote host serves every profile via ?profile=; an SSH-scoped
-    // backend instead runs AS one remote profile, so an explicit self-profile
-    // filter must be translated from the desktop routing label into that
-    // backend namespace (same contract as the v1 profileRouteOptions path).
-    const requestPath = connection.sharedRemote
-      ? pathWithProfileScope(request.path, request?.profile)
-      : translateSelfProfileQuery(request.path, request?.profile, connection.remoteProfile)
-
-    return fetchJsonForBackend(connection, requestPath, {
-      method: request?.method,
-      body: request?.body,
-      upload: request?.upload,
-      timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-    })
-  }
-
-  // Remote-profile session requests would otherwise hit the local primary off
-  // each profile's on-disk state.db — fine for local profiles, but a remote
-  // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
-  // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request)
-
-  if (rerouted !== undefined) {
-    return rerouted
-  }
-
-  const profileRename = await prepareProfileRenameRequest(request)
-  const tornDownProfile = await prepareProfileDeleteRequest(request)
-
-  const profile = request?.profile
-  // After tearing down a backend for profile deletion, route to the primary
-  // backend instead of spawning a fresh pool backend.  A freshly spawned
-  // backend calls ensure_hermes_home() which recreates the profile directory,
-  // defeating the deletion and leaving a zombie process.
-  //
-  // Safe local-profile REST calls also stay on the primary dashboard and carry
-  // ?profile=. Endpoints that cannot honor that scope retain their pooled
-  // backend so a destructive call can never fall through to the primary home.
-  //
-  // A profile rename tears down the old-name backend the same way; for a
-  // primary rename the lifecycle has already made `default` the temporary
-  // primary until the PATCH settles, so the request routes there.
-  const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
-
-  const routeProfile = profileRename
-    ? profileRename.routeProfile
-    : resolveRouteProfile(tornDownProfile, apiRoute.backendProfile)
-
-  let response
-
-  try {
-    const connection = await ensureBackend(routeProfile)
-    const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    const url = `${connection.baseUrl}${apiRoute.requestPath}`
-
-    // OAuth gateways authenticate REST via EITHER a native bearer token
-    // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
-    // partition. Prefer the native bearer when present (mirroring
-    // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
-    // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
-    // though a valid bearer is held. Cookie mode rides Electron's net stack bound
-    // to the OAuth partition so the cookie attaches automatically. Token/local
-    // modes keep using the static session-token header.
-    if (connection.authMode === 'oauth') {
-      // The OAuth path rides electron.net with JSON headers; multipart isn't
-      // wired there. Fail loudly rather than corrupting the upload.
-      if (request?.upload) {
-        throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
-      }
-
-      // Native bearer first (cookieless). ensureNativeAccessToken transparently
-      // refreshes a near-expiry AT via /auth/native/refresh; a null return means
-      // no native session (resolveOauthRestAuth then selects the cookie path).
-      const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
-      const restAuth = resolveOauthRestAuth(nativeAt)
-
-      if (restAuth.kind === 'bearer') {
-        response = await fetchJson(url, null, {
-          method: request?.method,
-          body: request?.body,
-          timeoutMs,
-          bearer: restAuth.token
-        })
-      } else {
-        response = await fetchJsonViaOauthSession(url, {
-          method: request?.method,
-          body: request?.body,
-          timeoutMs
-        })
-      }
-    } else {
-      response = await fetchJson(url, connection.token, {
-        method: request?.method,
-        body: request?.body,
-        upload: request?.upload,
-        timeoutMs
+      return fetchJsonForBackend(connection, requestPath, {
+        method: req.method,
+        body: req.body,
+        upload: req.upload,
+        timeoutMs: resolveTimeoutMs(req.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
       })
-    }
-  } catch (error) {
-    // A failed rename PATCH must not strand the app on the temporary primary:
-    // restore the original active profile and restart its backend.
-    if (profileRename) {
-      try {
-        await profileRename.rollback()
-      } catch (rollbackError) {
-        rememberLog(`Failed to restore primary profile after rename error: ${String(rollbackError)}`)
+    },
+    resolveLegacy: async req => {
+      // Remote-profile session requests would otherwise hit the local primary off
+      // each profile's on-disk state.db — fine for local profiles, but a remote
+      // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
+      // no-op) the moment they run there. Route reads + mutations to the remote.
+      const rerouted = await interceptSessionRequestForRemote(req)
+
+      if (rerouted !== undefined) {
+        return rerouted
       }
+
+      const profileRename = await prepareProfileRenameRequest(req)
+      const tornDownProfile = await prepareProfileDeleteRequest(req)
+
+      const profile = req.profile || undefined
+      // After tearing down a backend for profile deletion, route to the primary
+      // backend instead of spawning a fresh pool backend.  A freshly spawned
+      // backend calls ensure_hermes_home() which recreates the profile directory,
+      // defeating the deletion and leaving a zombie process.
+      //
+      // Safe local-profile REST calls also stay on the primary dashboard and carry
+      // ?profile=. Endpoints that cannot honor that scope retain their pooled
+      // backend so a destructive call can never fall through to the primary home.
+      //
+      // A profile rename tears down the old-name backend the same way; for a
+      // primary rename the lifecycle has already made `default` the temporary
+      // primary until the PATCH settles, so the request routes there.
+      const apiRoute = resolveProfileApiRequest(profile, req.path || '', profileRouteOptions(profile, req))
+
+      const routeProfile = profileRename
+        ? profileRename.routeProfile
+        : resolveRouteProfile(tornDownProfile, apiRoute.backendProfile)
+
+      let response: unknown
+
+      try {
+        const connection = await ensureBackend(routeProfile)
+        const timeoutMs = resolveTimeoutMs(req.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+        const url = `${connection.baseUrl}${apiRoute.requestPath}`
+
+        // OAuth gateways authenticate REST via EITHER a native bearer token
+        // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
+        // partition. Prefer the native bearer when present (mirroring
+        // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
+        // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
+        // though a valid bearer is held. Cookie mode rides Electron's net stack bound
+        // to the OAuth partition so the cookie attaches automatically. Token/local
+        // modes keep using the static session-token header.
+        if (connection.authMode === 'oauth') {
+          // The OAuth path rides electron.net with JSON headers; multipart isn't
+          // wired there. Fail loudly rather than corrupting the upload.
+          if (req.upload) {
+            throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+          }
+
+          // Native bearer first (cookieless). ensureNativeAccessToken transparently
+          // refreshes a near-expiry AT via /auth/native/refresh; a null return means
+          // no native session (resolveOauthRestAuth then selects the cookie path).
+          const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+          const restAuth = resolveOauthRestAuth(nativeAt)
+
+          if (restAuth.kind === 'bearer') {
+            response = await fetchJson(url, null, {
+              method: req.method,
+              body: req.body,
+              timeoutMs,
+              bearer: restAuth.token
+            })
+          } else {
+            response = await fetchJsonViaOauthSession(url, {
+              method: req.method,
+              body: req.body,
+              timeoutMs
+            })
+          }
+        } else {
+          response = await fetchJson(url, connection.token, {
+            method: req.method,
+            body: req.body,
+            upload: req.upload,
+            timeoutMs
+          })
+        }
+      } catch (error) {
+        // A failed rename PATCH must not strand the app on the temporary primary:
+        // restore the original active profile and restart its backend.
+        if (profileRename) {
+          try {
+            await profileRename.rollback()
+          } catch (rollbackError) {
+            rememberLog(`Failed to restore primary profile after rename error: ${String(rollbackError)}`)
+          }
+        }
+
+        throw error
+      }
+
+      await profileRename?.complete()
+
+      return response
     }
-
-    throw error
-  }
-
-  await profileRename?.complete()
-
-  return response
+  })
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {

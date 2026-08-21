@@ -780,6 +780,36 @@ function apiRequestRegistryConnectionId(request): null | string {
   return id
 }
 
+export interface HermesApiRequestPayload {
+  connectionId?: string | null
+  profile?: string | null
+  path?: string
+  method?: string
+  body?: unknown
+  upload?: unknown
+  timeoutMs?: number
+  [key: string]: unknown
+}
+
+export interface ApiRequestDispatchDeps<T> {
+  resolveRegistry: (connectionId: string, request: HermesApiRequestPayload) => Promise<T>
+  resolveLegacy: (request: HermesApiRequestPayload) => Promise<T>
+}
+
+export async function dispatchApiRequestRoute<T>(
+  request: unknown,
+  deps: ApiRequestDispatchDeps<T>
+): Promise<T> {
+  const payload = (request && typeof request === 'object' ? request : {}) as HermesApiRequestPayload
+  const connectionId = apiRequestRegistryConnectionId(payload)
+
+  if (connectionId) {
+    return deps.resolveRegistry(connectionId, payload)
+  }
+
+  return deps.resolveLegacy(payload)
+}
+
 export interface ProfileApiRequestRoute {
   /** Profile passed to ensureBackend; null selects the primary backend. */
   backendProfile: null | string

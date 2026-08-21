@@ -25,6 +25,7 @@ import {
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  dispatchApiRequestRoute,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   isGatewayAuthRejection,
@@ -50,6 +51,82 @@ import {
   tokenPreview,
   translateSelfProfileQuery
 } from './connection-config'
+
+test('dispatchApiRequestRoute branches to resolveRegistry when connectionId is present', async () => {
+  const calls: string[] = []
+  const result = await dispatchApiRequestRoute(
+    { connectionId: 'gw-remote-1', path: '/api/fs/list', profile: 'researcher' },
+    {
+      resolveLegacy: async () => {
+        calls.push('legacy')
+        return 'legacy-res'
+      },
+      resolveRegistry: async (connectionId, req) => {
+        calls.push(`registry:${connectionId}:${req.path}`)
+        return 'registry-res'
+      }
+    }
+  )
+
+  assert.equal(result, 'registry-res')
+  assert.deepEqual(calls, ['registry:gw-remote-1:/api/fs/list'])
+})
+
+test('dispatchApiRequestRoute branches to resolveLegacy when connectionId is absent or empty', async () => {
+  const calls: string[] = []
+  const result = await dispatchApiRequestRoute(
+    { path: '/api/fs/list', profile: 'default' },
+    {
+      resolveLegacy: async req => {
+        calls.push(`legacy:${req.profile}:${req.path}`)
+        return 'legacy-res'
+      },
+      resolveRegistry: async () => {
+        calls.push('registry')
+        return 'registry-res'
+      }
+    }
+  )
+
+  assert.equal(result, 'legacy-res')
+  assert.deepEqual(calls, ['legacy:default:/api/fs/list'])
+})
+
+test('dispatchApiRequestRoute handles null and empty connectionId via resolveLegacy', async () => {
+  const calls: string[] = []
+  await dispatchApiRequestRoute(
+    { connectionId: '', path: '/api/test' },
+    {
+      resolveLegacy: async () => {
+        calls.push('legacy-empty')
+      },
+      resolveRegistry: async () => {
+        calls.push('registry')
+      }
+    }
+  )
+  await dispatchApiRequestRoute(
+    { connectionId: null, path: '/api/test' },
+    {
+      resolveLegacy: async () => {
+        calls.push('legacy-null')
+      },
+      resolveRegistry: async () => {
+        calls.push('registry')
+      }
+    }
+  )
+  await dispatchApiRequestRoute(null, {
+    resolveLegacy: async () => {
+      calls.push('legacy-null-req')
+    },
+    resolveRegistry: async () => {
+      calls.push('registry')
+    }
+  })
+
+  assert.deepEqual(calls, ['legacy-empty', 'legacy-null', 'legacy-null-req'])
+})
 
 // --- connectionScopeKey / normAuthMode ---
 
