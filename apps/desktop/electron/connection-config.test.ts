@@ -55,15 +55,18 @@ import {
 
 test('dispatchApiRequestRoute branches to resolveRegistry when connectionId is present', async () => {
   const calls: string[] = []
+
   const result = await dispatchApiRequestRoute(
     { connectionId: 'gw-remote-1', path: '/api/fs/list', profile: 'researcher' },
     {
       resolveLegacy: async () => {
         calls.push('legacy')
+
         return 'legacy-res'
       },
       resolveRegistry: async (connectionId, req) => {
         calls.push(`registry:${connectionId}:${req.path}`)
+
         return 'registry-res'
       }
     }
@@ -75,15 +78,18 @@ test('dispatchApiRequestRoute branches to resolveRegistry when connectionId is p
 
 test('dispatchApiRequestRoute branches to resolveLegacy when connectionId is absent or empty', async () => {
   const calls: string[] = []
+
   const result = await dispatchApiRequestRoute(
     { path: '/api/fs/list', profile: 'default' },
     {
       resolveLegacy: async req => {
         calls.push(`legacy:${req.profile}:${req.path}`)
+
         return 'legacy-res'
       },
       resolveRegistry: async () => {
         calls.push('registry')
+
         return 'registry-res'
       }
     }
@@ -1250,11 +1256,7 @@ test('gatewayTicketFailure preserves a structured 503 statusCode as a transport 
   const source = new Error('upstream unavailable') as any
   source.statusCode = 503
 
-  const wrapped = gatewayTicketFailure(
-    source,
-    'auth message',
-    'transport message'
-  )
+  const wrapped = gatewayTicketFailure(source, 'auth message', 'transport message')
 
   assert.equal(wrapped.message, 'transport message')
   assert.equal((wrapped as any).statusCode, 503)
@@ -1267,11 +1269,7 @@ test('gatewayTicketFailure keeps 401 and 403 as reauth with needsOauthLogin', ()
     const source = new Error(`HTTP ${code}`) as any
     source.statusCode = code
 
-    const wrapped = gatewayTicketFailure(
-      source,
-      'auth message',
-      'transport message'
-    )
+    const wrapped = gatewayTicketFailure(source, 'auth message', 'transport message')
 
     assert.equal(wrapped.message, 'auth message')
     assert.equal((wrapped as any).needsOauthLogin, true)
@@ -1286,11 +1284,7 @@ test('gatewayTicketFailure only copies an integer statusCode, not a message pref
   // boundary. The wrapper must not invent an integer from the message.
   const source = new Error('503: Service Unavailable') as any
 
-  const wrapped = gatewayTicketFailure(
-    source,
-    'auth message',
-    'transport message'
-  )
+  const wrapped = gatewayTicketFailure(source, 'auth message', 'transport message')
 
   assert.equal((wrapped as any).statusCode, undefined)
   assert.equal((wrapped as any).needsOauthLogin, undefined)
@@ -1318,11 +1312,7 @@ test('OAuth ticket-mint 503 surfaces the Cloud-down error (startup boundary)', (
     return
   }
 
-  const wrapped = gatewayTicketFailure(
-    ticketErr,
-    'auth',
-    'transport'
-  )
+  const wrapped = gatewayTicketFailure(ticketErr, 'auth', 'transport')
 
   assert.fail(`expected Cloud-down classification, got wrapper: ${wrapped.message}`)
 })
@@ -1335,11 +1325,7 @@ test('OAuth ticket-mint 401 stays on the reauth path (never Cloud-down)', () => 
   const cloudError = makeNousCloudBackendDownError(baseUrl, ticketErr)
   assert.equal(cloudError, null, 'a 401 must not become a Cloud-down error')
 
-  const wrapped = gatewayTicketFailure(
-    ticketErr,
-    'auth message',
-    'transport message'
-  )
+  const wrapped = gatewayTicketFailure(ticketErr, 'auth message', 'transport message')
 
   assert.equal(wrapped.message, 'auth message')
   assert.equal((wrapped as any).needsOauthLogin, true)

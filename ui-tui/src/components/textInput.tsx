@@ -1179,7 +1179,7 @@ export function TextInput({
             commit(v.slice(0, cur) + fallbackText + v.slice(cur), cur + fallbackText.length)
           }
         })
-        .catch(() => { })
+        .catch(() => {})
 
       return true
     }

@@ -70,9 +70,8 @@ function bridge() {
 
 function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
   const scope = desktopConnectionScope()
-  return bridge().api<T>(
-    body ? { ...scope, body, method: 'POST', path } : { ...scope, path }
-  )
+
+  return bridge().api<T>(body ? { ...scope, body, method: 'POST', path } : { ...scope, path })
 }
 
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {

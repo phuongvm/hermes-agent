@@ -808,10 +808,7 @@ export interface ApiRequestDispatchDeps<T> {
   resolveLegacy: (request: HermesApiRequestPayload) => Promise<T>
 }
 
-export async function dispatchApiRequestRoute<T>(
-  request: unknown,
-  deps: ApiRequestDispatchDeps<T>
-): Promise<T> {
+export async function dispatchApiRequestRoute<T>(request: unknown, deps: ApiRequestDispatchDeps<T>): Promise<T> {
   const payload = (request && typeof request === 'object' ? request : {}) as HermesApiRequestPayload
   const connectionId = apiRequestRegistryConnectionId(payload)
 

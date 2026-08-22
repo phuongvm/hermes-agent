@@ -186,7 +186,9 @@ describe('refreshReview', () => {
       diff: vi.fn(async () => 'subdir diff'),
       list: vi.fn(async () => ({ files: [file('src/a.ts')] }))
     })
+
     const gitRoot = vi.fn(async () => '/top-level-repo')
+
     ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
       gitRoot,
       git: { review },
