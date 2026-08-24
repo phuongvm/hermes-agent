@@ -90,6 +90,7 @@ import {
   normAuthMode,
   pathForRegistryBackendRequest,
   pathWithGlobalRemoteProfile,
+  pathWithProfileScope,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
@@ -102,6 +103,7 @@ import {
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview,
+  translateSelfProfileQuery,
   withTransientRetries
 } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
@@ -13989,26 +13991,32 @@ async function teardownConnectionScopedProfileBackend(connectionId, profile) {
   ])
 }
 
-async function handleHermesApiRequest(request) {
-  // Registry-pinned request (request.connectionId): the renderer is working
-  // against a REGISTERED gateway connection, so the data — cron jobs and their
-  // run sessions included — lives in THAT host's state.db, not any local
-  // profile's. Resolve the backend through the registry (same pool the job
-  // list and WS traffic use) instead of the legacy profile route; a shared
-  // remote/cloud host serves every profile via ?profile=, so scope the path.
-  // An absent/empty id falls through to the byte-identical v1 route below.
-  // Explicit `local` stays registry-pinned so it cannot inherit a v1 remote.
-  const registryConnectionId = apiRequestRegistryConnectionId(request)
+async function handleHermesApiRequest(request: unknown): Promise<unknown> {
+  return dispatchApiRequestRoute(request, {
+    resolveRegistry: async (registryConnectionId, req) => {
+      const connection: any = await ensureRegistryBackend(registryConnectionId, req.profile || undefined)
 
-  if (registryConnectionId) {
-    return dispatchRegistryApiRequest(request, registryConnectionId)
-  }
+      // A shared remote host serves every profile via ?profile=; an SSH-scoped
+      // backend instead runs AS one remote profile, so an explicit self-profile
+      // filter must be translated from the desktop routing label into that
+      // backend namespace (same contract as the v1 profileRouteOptions path).
+      const requestPath = connection.sharedRemote
+        ? pathWithProfileScope(req.path || '', req.profile || undefined)
+        : translateSelfProfileQuery(req.path || '', req.profile || undefined, connection.remoteProfile)
 
-  // Remote-profile session requests would otherwise hit the local primary off
-  // each profile's on-disk state.db — fine for local profiles, but a remote
-  // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
-  // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request)
+      return fetchJsonForBackend(connection, requestPath, {
+        method: req.method,
+        body: req.body,
+        upload: req.upload,
+        timeoutMs: resolveTimeoutMs(req.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+      })
+    },
+    resolveLegacy: async req => {
+      // Remote-profile session requests would otherwise hit the local primary off
+      // each profile's on-disk state.db — fine for local profiles, but a remote
+      // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
+      // no-op) the moment they run there. Route reads + mutations to the remote.
+      const rerouted = await interceptSessionRequestForRemote(req)
 
       if (rerouted !== undefined) {
         return rerouted
