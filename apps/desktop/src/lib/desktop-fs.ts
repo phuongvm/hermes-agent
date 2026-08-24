@@ -1,3 +1,4 @@
+import { hermesApi } from '@/api/client'
 import type {
   HermesConnection,
   HermesReadDirResult,
@@ -69,9 +70,8 @@ function bridge() {
 }
 
 function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  const scope = desktopConnectionScope()
-  return bridge().api<T>(
-    body ? { ...scope, body, method: 'POST', path } : { ...scope, path }
+  return hermesApi<T>(
+    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
   )
 }
 

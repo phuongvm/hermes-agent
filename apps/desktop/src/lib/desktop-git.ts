@@ -7,6 +7,7 @@ import type {
   HermesReviewList,
   HermesReviewShipInfo
 } from '@/global'
+import { hermesApi } from '@/hermes'
 
 import { desktopConnectionScope, desktopFsProfile, isDesktopFsRemoteMode } from './desktop-fs'
 
@@ -25,9 +26,8 @@ function desktopApi<T>(path: string, body?: Record<string, unknown>): Promise<T>
     throw new Error('Hermes Desktop bridge is unavailable')
   }
 
-  const scope = desktopConnectionScope()
-  return desktop.api<T>(
-    body ? { ...scope, body, method: 'POST', path } : { ...scope, path }
+  return hermesApi<T>(
+    body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
   )
 }
 

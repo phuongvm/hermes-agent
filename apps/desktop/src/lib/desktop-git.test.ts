@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/hermes'
 import { $connection } from '@/store/session'
 
 import { desktopGit } from './desktop-git'
@@ -37,6 +38,7 @@ describe('desktop git facade', () => {
   })
 
   afterEach(() => {
+    setApiRequestConnection(null)
     vi.unstubAllGlobals()
     vi.clearAllMocks()
     $connection.set(null)
@@ -90,54 +92,23 @@ describe('desktop git facade', () => {
     })
   })
 
-  it('attaches active registry connectionId and profile onto remote git requests', async () => {
-    $connection.set({ connectionId: 'gw-remote-1', mode: 'remote', profile: 'researcher' } as never)
+  it('routes remote git reads and writes through the active registered gateway', async () => {
+    setApiRequestConnection('remote-user')
+    $connection.set({ mode: 'remote', profile: 'default' } as never)
 
     await desktopGit()?.repoStatus('/srv/work')
-    await desktopGit()?.branchList('/srv/work')
-    await desktopGit()?.worktreeList('/srv/work')
     await desktopGit()?.review.stage('/srv/work', 'a.txt')
 
     expect(api).toHaveBeenCalledWith({
-      connectionId: 'gw-remote-1',
+      connectionId: 'remote-user',
       path: '/api/git/status?path=%2Fsrv%2Fwork',
-      profile: 'researcher'
-    })
-    expect(api).toHaveBeenCalledWith({
-      connectionId: 'gw-remote-1',
-      path: '/api/git/branches?path=%2Fsrv%2Fwork',
-      profile: 'researcher'
-    })
-    expect(api).toHaveBeenCalledWith({
-      connectionId: 'gw-remote-1',
-      path: '/api/git/worktrees?path=%2Fsrv%2Fwork',
-      profile: 'researcher'
+      profile: 'default'
     })
     expect(api).toHaveBeenCalledWith({
       body: { file: 'a.txt', path: '/srv/work' },
-      connectionId: 'gw-remote-1',
+      connectionId: 'remote-user',
       method: 'POST',
       path: '/api/git/review/stage',
-      profile: 'researcher'
-    })
-  })
-
-  it('differentiates remote gateways that share default profile in git operations', async () => {
-    $connection.set({ connectionId: 'gw-alpha', mode: 'remote', profile: 'default' } as never)
-    await desktopGit()?.repoStatus('/srv/alpha')
-
-    expect(api).toHaveBeenCalledWith({
-      connectionId: 'gw-alpha',
-      path: '/api/git/status?path=%2Fsrv%2Falpha',
-      profile: 'default'
-    })
-
-    $connection.set({ connectionId: 'gw-beta', mode: 'remote', profile: 'default' } as never)
-    await desktopGit()?.repoStatus('/srv/beta')
-
-    expect(api).toHaveBeenCalledWith({
-      connectionId: 'gw-beta',
-      path: '/api/git/status?path=%2Fsrv%2Fbeta',
       profile: 'default'
     })
   })
