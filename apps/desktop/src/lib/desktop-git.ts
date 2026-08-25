@@ -9,7 +9,7 @@ import type {
 } from '@/global'
 import { hermesApi } from '@/hermes'
 
-import { desktopConnectionScope, desktopFsProfile, isDesktopFsRemoteMode } from './desktop-fs'
+import { desktopFsProfile, isDesktopFsRemoteMode } from './desktop-fs'
 
 // Remote-aware git facade. Locally the desktop runs git through Electron
 // (window.hermesDesktop.git); on a remote gateway that's the wrong filesystem,

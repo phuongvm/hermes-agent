@@ -5,8 +5,8 @@ import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/store'
 import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
 import { matchesQuery } from '@/hooks/use-media-query'
-import { desktopGit } from '@/lib/desktop-git'
 import { desktopGitRoot } from '@/lib/desktop-fs'
+import { desktopGit } from '@/lib/desktop-git'
 import { isExcludedPath } from '@/lib/excluded-paths'
 import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
@@ -144,6 +144,7 @@ export async function refreshReview(): Promise<void> {
 
   try {
     const resolvedRoot = await desktopGitRoot(initialCwd).catch(() => null)
+
     if (seq === reviewRefreshSeq && repoCwd() === initialCwd) {
       $reviewGitRoot.set(resolvedRoot?.trim() || null)
     }
