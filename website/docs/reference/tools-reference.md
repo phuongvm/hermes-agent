@@ -265,20 +265,20 @@ discovery is one call for both, and the durable `data-tour` handles above name
 targets for either. One tip is on screen at a time; a new one replaces the last.
 
 The app can also show its own, walking a built-in catalog of app features in
-order. That half is off until switched on in Settings → Appearance, since it
-talks unprompted, and it is paced like a game's loading-screen tips rather than
-a notification: a few minutes into a launch at the earliest, then at most one
-every six hours, and only at a genuinely idle moment. Closing one of its tips
-with the ✕ retires that tip for good, and the same settings row brings them
-back. The tool is not behind that switch — like `tour`, it runs in answer to the
-conversation rather than at idle. It does share the cooldown, so a tip from
-Hermes also buys the user six hours of quiet from the rotation.
+order. That half is on by default and switched off in Settings → Appearance,
+and it is paced like a game's loading-screen tips rather than a notification: a
+few minutes into a launch at the earliest, then at most one every six hours, and
+only at a genuinely idle moment. Closing one of its tips with the ✕ retires that
+tip for good, and the same settings row brings them back. The tool is not behind
+that switch — like `tour`, it runs in answer to the conversation rather than at
+idle. It does share the cooldown, so a tip from Hermes also buys the user six
+hours of quiet from the rotation.
 
 ## `todo` toolset
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `todo` | Manage your task list for the current session. Use for complex tasks with 3+ steps or when the user provides multiple tasks. Call with no parameters to read the current list. Writing: - Provide 'todos' array to create/update items - merge=… | — |
+| `todo` | Manage your task list for the current session. Use for complex tasks with 3+ steps or when the user provides multiple tasks. Call with no parameters to read the current list. Items may nest: an item's optional `parent` field points at another item's id, making it a subtask — surfaces render the tree indented. | — |
 
 ## `vision` toolset
 
