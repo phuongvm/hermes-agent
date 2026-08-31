@@ -74,3 +74,27 @@ test('regression: a successful icon is still cached', async () => {
   assert.equal(n, 1)
   assert.equal(a, b)
 })
+
+test('unit: local pet without spriteUrl resolves via pet.thumb RPC', async () => {
+  const requests = []
+  const { context } = load(async () => {
+    throw new Error('should not fetch url')
+  })
+  context.host.request = async (method, params) => {
+    requests.push({ method, params })
+    if (method === 'pet.thumb' && params.slug === 'minh-triet-1' && params.profile === 'lambert') {
+      return { ok: true, dataUri: 'data:image/png;base64,minhtriet_thumb' }
+    }
+    return { ok: false }
+  }
+
+  const icon1 = await context.__api.petFrameIcon('', 'minh-triet-1', 'lambert')
+  const icon2 = await context.__api.petFrameIcon('', 'minh-triet-1', 'lambert')
+
+  assert.equal(icon1, 'data:image/png;base64,minhtriet_thumb')
+  assert.equal(icon2, 'data:image/png;base64,minhtriet_thumb')
+  assert.equal(requests.length, 1, 'second call should hit memory cache')
+  assert.equal(requests[0].method, 'pet.thumb')
+  assert.equal(requests[0].params.slug, 'minh-triet-1')
+  assert.equal(requests[0].params.profile, 'lambert')
+})

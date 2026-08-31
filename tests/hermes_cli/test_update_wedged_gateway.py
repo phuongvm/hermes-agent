@@ -473,6 +473,10 @@ class TestLaunchdRestartWedgedIntegration:
         assert ("drain", 4242, 195.0) in events
 
 
+@pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX") or getattr(asyncio, "start_unix_server", None) is None,
+    reason="AF_UNIX socket / asyncio.start_unix_server not supported on Windows",
+)
 class TestLoopTickWitness:
     """Two-witness liveness (#90502 review).
 

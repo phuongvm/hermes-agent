@@ -232,6 +232,22 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _OTelContextNoiseFilter(logging.Filter):
+    """Filter out benign cross-context detach exceptions logged by opentelemetry.context.
+
+    When async/generator lifecycles unwind across execution contexts, OTel's
+    detach() catches ValueError and logs it as an ERROR exception. This is harmless
+    at shutdown/interrupt boundaries and pollutes errors.log.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "opentelemetry.context":
+            msg = record.getMessage()
+            if "Failed to detach context" in msg or "different Context" in msg:
+                return False
+        return True
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -336,6 +352,7 @@ def setup_logging(
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
+        log_filter=_OTelContextNoiseFilter(),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------

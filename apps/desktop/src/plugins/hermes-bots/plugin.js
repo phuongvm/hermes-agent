@@ -4437,7 +4437,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
           })
         : null,
 
-      tab === 'pet' ? jsx(PetTab, { image, onImage }) : null
+      tab === 'pet' ? jsx(PetTab, { image, onImage, botName: generateSeed?.name }) : null
     ]
   })
 }
@@ -4466,17 +4466,27 @@ function pumpPetQueue() {
   }
 }
 
-function petFrameIcon(spriteUrl) {
-  if (!spriteUrl) {
+function petFrameIcon(spriteUrl, slug = '', botName = '') {
+  const cacheKey = spriteUrl || (slug ? `pet-slug:${botName || ''}:${slug}` : '')
+  if (!cacheKey) {
     return Promise.resolve(null)
   }
 
-  if (!petFrameCache.has(spriteUrl)) {
+  if (!petFrameCache.has(cacheKey)) {
     petFrameCache.set(
-      spriteUrl,
+      cacheKey,
       new Promise(resolve => {
         petFetchQueue.push(async () => {
           try {
+            if (!spriteUrl && slug) {
+              const res = await host.request('pet.thumb', { slug, profile: botName || undefined })
+              if (res?.ok && res.dataUri) {
+                resolve(res.dataUri)
+                return
+              }
+              resolve(null)
+              return
+            }
             const resp = await fetch(spriteUrl, { signal: AbortSignal.timeout(15000) })
             const blob = await resp.blob()
             // Crop frame 0 during decode — never materialize the full sheet.
@@ -4488,7 +4498,7 @@ function petFrameIcon(spriteUrl) {
             bitmap.close()
             resolve(canvas.toDataURL('image/png'))
           } catch {
-            petFrameCache.delete(spriteUrl)
+            petFrameCache.delete(cacheKey)
             resolve(null)
           }
         })
@@ -4497,16 +4507,16 @@ function petFrameIcon(spriteUrl) {
     )
   }
 
-  return petFrameCache.get(spriteUrl)
+  return petFrameCache.get(cacheKey)
 }
 
 /** One pet tile image: frame 0 only, resolved lazily through the cache. */
-function PetThumb({ spriteUrl, size = 40 }) {
+function PetThumb({ spriteUrl, slug, botName, size = 40 }) {
   const [icon, setIcon] = useState(null)
 
   useEffect(() => {
     let alive = true
-    petFrameIcon(spriteUrl).then(url => {
+    petFrameIcon(spriteUrl, slug, botName).then(url => {
       if (alive) {
         setIcon(url)
       }
@@ -4514,7 +4524,7 @@ function PetThumb({ spriteUrl, size = 40 }) {
     return () => {
       alive = false
     }
-  }, [spriteUrl])
+  }, [spriteUrl, slug, botName])
 
   if (!icon) {
     return jsx('div', {
@@ -4529,14 +4539,14 @@ function PetThumb({ spriteUrl, size = 40 }) {
   })
 }
 
-function PetTab({ image, onImage }) {
+function PetTab({ image, onImage, botName }) {
   // Selection is dialog-local: committed by the dialog's Save like any
   // uploaded/generated image (a direct meta write here gets clobbered by
   // Save's own image state).
   const [selectedSlug, setSelectedSlug] = useState(null)
   const { data, isLoading } = useQuery({
-    queryKey: [ID, 'pet-gallery'],
-    queryFn: () => host.request('pet.gallery', {}),
+    queryKey: [ID, 'pet-gallery', botName || ''],
+    queryFn: () => host.request('pet.gallery', { profile: botName || undefined }),
     staleTime: 300000
   })
   const [query, setQuery] = useState('')
@@ -4636,7 +4646,7 @@ function PetTab({ image, onImage }) {
                         // and hand it to the dialog as the avatar image.
                         // Persisted when the user hits Save.
                         setSelectedSlug(pet.slug)
-                        void petFrameIcon(pet.spritesheetUrl).then(icon => {
+                        void petFrameIcon(pet.spritesheetUrl, pet.slug, botName).then(icon => {
                           if (icon) {
                             onImage(icon)
                           } else {
@@ -4646,7 +4656,7 @@ function PetTab({ image, onImage }) {
                         })
                       },
                       children: [
-                        jsx(PetThumb, { spriteUrl: pet.spritesheetUrl, size: 40 }),
+                        jsx(PetThumb, { spriteUrl: pet.spritesheetUrl, slug: pet.slug, botName, size: 40 }),
                         jsx('span', {
                           className: 'w-full truncate text-center text-[0.6rem] text-(--ui-text-tertiary)',
                           children: pet.displayName

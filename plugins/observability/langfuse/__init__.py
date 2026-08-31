@@ -902,33 +902,18 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     if session_id:
         trace_ctx["session_id"] = session_id
 
-    if propagate_attributes is not None:
-        try:
-            with propagate_attributes(
-                session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
-            ):
-                root_ctx = client.start_as_current_observation(
-                    trace_context=trace_ctx,
-                    name="Hermes turn",
-                    as_type="chain",
-                    input=trace_input,
-                    metadata=metadata,
-                    end_on_exit=False,
-                )
-                root_span = root_ctx.__enter__()
-        except Exception:
-            root_ctx = client.start_as_current_observation(
-                trace_context=trace_ctx,
-                name="Hermes turn",
-                as_type="chain",
-                input=trace_input,
-                metadata=metadata,
-                end_on_exit=False,
-            )
-            root_span = root_ctx.__enter__()
-    else:
+    # Prefer start_observation() (returns span directly, no OTel generator attachment)
+    # to eliminate cross-context detach failures in async/generator lifecycles.
+    if hasattr(client, "start_observation"):
+        root_span = client.start_observation(
+            trace_context=trace_ctx,
+            name="Hermes turn",
+            as_type="chain",
+            input=trace_input,
+            metadata=metadata,
+        )
+        root_ctx = None
+    elif hasattr(client, "start_as_current_observation"):
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
             name="Hermes turn",
@@ -938,6 +923,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             end_on_exit=False,
         )
         root_span = root_ctx.__enter__()
+    else:
+        root_span = None
+        root_ctx = None
 
     # SDK v3 uses update_trace() (not set_trace_io). Failures must never block
     # the rest of the turn — the observation still carries input from start.

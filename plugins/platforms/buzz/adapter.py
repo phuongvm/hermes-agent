@@ -534,8 +534,10 @@ class BuzzAdapter(BasePlatformAdapter):
 
         # Seed high-water marks from the newest events so a (re)start never
         # replays channel history into the agent.
-        for channel_id in watch:
-            await self._seed_channel(channel_id, chat_type="group")
+        if watch:
+            await asyncio.gather(
+                *(self._seed_channel(channel_id, chat_type="group") for channel_id in watch)
+            )
         await self._discover_dms(seed=True)
 
         # Inbound transport: prefer the NIP-42-authenticated WebSocket
@@ -960,6 +962,7 @@ class BuzzAdapter(BasePlatformAdapter):
         detection (_is_direct_message_event) rather than trusting the name
         alone to unlock the mention-free DM path.
         """
+        seed_dm_tasks = []
         code, out, _err = await self._run_cli(["dms", "list"])
         if code == 0:
             for dm in _parse_json_list(out):
@@ -967,14 +970,17 @@ class BuzzAdapter(BasePlatformAdapter):
                 if not dm_id or dm_id in self._channel_state:
                     continue
                 if seed:
-                    await self._seed_channel(dm_id, chat_type="dm")
+                    seed_dm_tasks.append(self._seed_channel(dm_id, chat_type="dm"))
                 else:
                     self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
                 self._channel_names.setdefault(dm_id, "DM")
 
         code, out, _err = await self._run_cli(["channels", "list"])
         if code != 0:
+            if seed_dm_tasks:
+                await asyncio.gather(*seed_dm_tasks)
             return
+        seed_group_tasks = []
         for ch in _parse_json_list(out):
             ch_id = str(ch.get("channel_id") or "")
             if not ch_id:
@@ -984,9 +990,13 @@ class BuzzAdapter(BasePlatformAdapter):
             if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
-                await self._seed_channel(ch_id, chat_type="group")
+                seed_group_tasks.append(self._seed_channel(ch_id, chat_type="group"))
             else:
                 self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+
+        all_seed_tasks = seed_dm_tasks + seed_group_tasks
+        if all_seed_tasks:
+            await asyncio.gather(*all_seed_tasks)
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
