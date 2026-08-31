@@ -2302,6 +2302,8 @@ def _fs_path(raw_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Path is required")
     if "\0" in raw:
         raise HTTPException(status_code=400, detail="Invalid path")
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:[\\/]", raw):
+        raise HTTPException(status_code=400, detail="Invalid path")
     try:
         if raw.lower().startswith("file:"):
             parsed = urllib.parse.urlparse(raw)

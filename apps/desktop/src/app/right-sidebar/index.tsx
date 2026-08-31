@@ -61,7 +61,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
 
   const previewFile = async (path: string) => {
     try {
-      const preview = await normalizeOrLocalPreviewTarget(path, effectiveCwd || undefined)
+      const preview = await normalizeOrLocalPreviewTarget(path, effectiveCwd || undefined, { authority: 'gateway' })
 
       if (!preview) {
         throw new Error(r.couldNotPreview(path))

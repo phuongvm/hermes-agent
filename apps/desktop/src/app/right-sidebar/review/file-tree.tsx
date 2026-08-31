@@ -359,7 +359,7 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
   const openInPreview = () => {
     void (async () => {
       try {
-        const preview = await normalizeOrLocalPreviewTarget(dragPath)
+        const preview = await normalizeOrLocalPreviewTarget(dragPath, undefined, { authority: 'gateway' })
 
         if (preview) {
           openPreview(preview, 'file-browser')

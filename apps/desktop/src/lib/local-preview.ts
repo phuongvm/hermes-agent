@@ -64,6 +64,10 @@ function joinPath(base: string, rel: string) {
   return `${base.replace(/\/+$/, '')}/${rel.replace(/^\.?\//, '')}`
 }
 
+function isCrossPlatformAbsolutePath(path: string) {
+  return path.startsWith('/') || /^[a-z]:[\\/]/i.test(path) || path.startsWith('\\\\')
+}
+
 function pathToFileUrl(path: string) {
   const isWindowsUnc = path.startsWith('\\\\')
   const normalized = isWindowsUnc || /^[a-z]:[\\/]/i.test(path) ? path.replace(/\\/g, '/') : path
@@ -197,7 +201,7 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
     } catch {
       path = raw.replace(/^file:\/\//i, '')
     }
-  } else if (!raw.startsWith('/') && cwd) {
+  } else if (!isCrossPlatformAbsolutePath(raw) && cwd) {
     path = joinPath(cwd, raw)
   }
 
@@ -259,17 +263,22 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
 
 export async function normalizeOrLocalPreviewTarget(
   rawTarget: string,
-  cwd?: string | null
+  cwd?: string | null,
+  options: { authority?: 'gateway' | 'local-first' } = {}
 ): Promise<PreviewTarget | null> {
-  try {
-    const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
+  const gatewayOwned = options.authority === 'gateway' && isDesktopFsRemoteMode()
 
-    if (normalized) {
-      return enrichPreviewTarget(normalized)
+  if (!gatewayOwned) {
+    try {
+      const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
+
+      if (normalized) {
+        return enrichPreviewTarget(normalized)
+      }
+    } catch {
+      // Running Electron may still have the old HTML-only preview IPC. Fall
+      // through to renderer-side local classification so text/images still open.
     }
-  } catch {
-    // Running Electron may still have the old HTML-only preview IPC. Fall
-    // through to renderer-side local classification so text/images still open.
   }
 
   return enrichPreviewTarget(localPreviewTarget(rawTarget, cwd))
