@@ -71,7 +71,7 @@ export const $restartPreviewServer = atom<((url: string, context?: string) => Pr
 
 /** Open a file from the tree in the real preview pipeline. */
 function previewFile(path: string) {
-  void normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined)
+  void normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined, { authority: 'gateway' })
     .then(target => {
       if (target) {
         openPreview(target, 'file-browser')

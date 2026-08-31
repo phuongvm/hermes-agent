@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection } from '@/api/client'
@@ -15,6 +17,7 @@ import {
   selectDesktopPaths,
   setDesktopFsRemotePicker
 } from './desktop-fs'
+import { normalizeOrLocalPreviewTarget } from './local-preview'
 
 const readDir = vi.fn(async () => ({ entries: [{ name: 'local', path: '/local', isDirectory: true }] }))
 const readFileText = vi.fn(async () => ({ path: '/local/file.txt', text: 'local', byteSize: 5 }))
@@ -163,6 +166,68 @@ describe('desktop filesystem facade', () => {
       path: '/api/fs/read-data-url?path=%2Fsrv%2Fproject%2Fimage.png',
       profile: 'default'
     })
+  })
+
+  it('preserves a listed Windows path through the scoped remote read request', async () => {
+    $connection.set({ connectionId: 'windows-gateway', mode: 'remote', profile: 'reviewer' } as never)
+    setApiRequestConnection('windows-gateway')
+
+    await readDesktopFileText('O:\\workspace\\project\\README.md')
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'windows-gateway',
+      path: '/api/fs/read-text?path=O%3A%5Cworkspace%5Cproject%5CREADME.md',
+      profile: 'reviewer'
+    })
+  })
+
+  it('round-trips a listed remote-only Windows file through preview normalization and content checksum', async () => {
+    const listedPath = 'O:\\remote-only\\preview-check.txt'
+    const fixtureText = 'remote-preview-checksum-fixture'
+    const expectedChecksum = createHash('sha256').update(fixtureText).digest('hex')
+    const normalizePreviewTarget = vi.fn(async () => null)
+
+    api.mockImplementationOnce(async request => {
+      expect(request).toEqual({
+        connectionId: 'windows-gateway',
+        path: '/api/fs/list?path=O%3A%5Cremote-only',
+        profile: 'reviewer'
+      })
+
+      return { entries: [{ isDirectory: false, name: 'preview-check.txt', path: listedPath }] }
+    })
+
+    for (let read = 0; read < 2; read += 1) {
+      api.mockImplementationOnce(async request => {
+        expect(request).toEqual({
+          connectionId: 'windows-gateway',
+          path: '/api/fs/read-text?path=O%3A%5Cremote-only%5Cpreview-check.txt',
+          profile: 'reviewer'
+        })
+
+        return { byteSize: fixtureText.length, path: listedPath, text: fixtureText }
+      })
+    }
+
+    window.hermesDesktop.normalizePreviewTarget = normalizePreviewTarget
+    $connection.set({ connectionId: 'windows-gateway', mode: 'remote', profile: 'reviewer' } as never)
+    setApiRequestConnection('windows-gateway')
+
+    const listing = await readDesktopDir('O:\\remote-only')
+    const entry = listing.entries[0]
+
+    expect(entry?.path).toBe(listedPath)
+
+    const target = await normalizeOrLocalPreviewTarget(entry!.path, 'O:\\remote-only', { authority: 'gateway' })
+    const result = await readDesktopFileText(target!.path!)
+
+    expect(target?.path).toBe(listedPath)
+    expect(result.path).toBe(listedPath)
+    expect(createHash('sha256').update(result.text).digest('hex')).toBe(expectedChecksum)
+    expect(normalizePreviewTarget).not.toHaveBeenCalled()
+    expect(api).toHaveBeenCalledTimes(3)
+    expect(readDir).not.toHaveBeenCalled()
+    expect(readFileText).not.toHaveBeenCalled()
   })
 
   it('pins remote filesystem requests to the active registry connection', async () => {

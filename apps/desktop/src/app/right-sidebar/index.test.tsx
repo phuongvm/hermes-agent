@@ -6,6 +6,15 @@ import { $connection, $selectedStoredSessionId, $workspaceCwdOwner, setCurrentCw
 
 import { resetProjectTreeState } from './files/use-project-tree'
 
+const { normalizeOrLocalPreviewTarget } = vi.hoisted(() => ({ normalizeOrLocalPreviewTarget: vi.fn() }))
+
+vi.mock('@/lib/local-preview', () => ({ normalizeOrLocalPreviewTarget }))
+vi.mock('./files/tree', () => ({
+  ProjectTree: ({ onPreviewFile }: { onPreviewFile?: (path: string) => void }) => (
+    <button onClick={() => onPreviewFile?.('O:\\repo\\README.md')}>Preview listed file</button>
+  )
+}))
+
 import { RightSidebarPane } from './index'
 
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
@@ -22,6 +31,8 @@ describe('RightSidebarPane', () => {
     resetProjectTreeState()
     readDir.mockReset()
     readDir.mockResolvedValue({ entries: [{ isDirectory: false, name: 'README.md', path: '/repo/README.md' }] })
+    normalizeOrLocalPreviewTarget.mockReset()
+    normalizeOrLocalPreviewTarget.mockResolvedValue(null)
     installBridge()
   })
 
@@ -68,5 +79,18 @@ describe('RightSidebarPane', () => {
 
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Refresh tree' })).toBeNull())
     expect(readDir).not.toHaveBeenCalled()
+  })
+
+  it('marks listed file previews as Gateway-owned while preserving the listed Windows path', async () => {
+    setCurrentCwd('O:\\repo')
+
+    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Preview listed file' }))
+
+    await waitFor(() =>
+      expect(normalizeOrLocalPreviewTarget).toHaveBeenCalledWith('O:\\repo\\README.md', 'O:\\repo', {
+        authority: 'gateway'
+      })
+    )
   })
 })

@@ -1,10 +1,14 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesReviewFile } from '@/global'
 import { I18nProvider } from '@/i18n'
 import { $sidebarWorkspaceNodeOpen } from '@/store/layout'
 import { $reviewFiles, $reviewGitRoot, $reviewOpen } from '@/store/review'
+
+const { normalizeOrLocalPreviewTarget } = vi.hoisted(() => ({ normalizeOrLocalPreviewTarget: vi.fn() }))
+
+vi.mock('@/lib/local-preview', () => ({ normalizeOrLocalPreviewTarget }))
 
 import { ReviewFileTree } from './file-tree'
 
@@ -43,6 +47,8 @@ describe('ReviewFileTree', () => {
     $reviewFiles.set([])
     $reviewGitRoot.set(null)
     $sidebarWorkspaceNodeOpen.set({})
+    normalizeOrLocalPreviewTarget.mockReset()
+    normalizeOrLocalPreviewTarget.mockResolvedValue(null)
 
     // jsdom has no layout: report the real row height for virtualized rows and
     // a viewport for the scroller so the virtualizer mounts a deterministic
@@ -137,5 +143,19 @@ describe('ReviewFileTree', () => {
     const row = container.querySelector('[draggable="true"]')
     expect(row).toBeTruthy()
     expect(row?.getAttribute('title')).toBe('/top-level-repo/src/c.ts')
+  })
+
+  it('marks remote review previews as Gateway-owned while preserving the absolute Windows path', async () => {
+    $reviewGitRoot.set('O:\\repo')
+    $reviewFiles.set([file('src/c.ts')])
+
+    renderTree()
+    fireEvent.doubleClick(screen.getByText('c.ts'))
+
+    await waitFor(() =>
+      expect(normalizeOrLocalPreviewTarget).toHaveBeenCalledWith('O:\\repo/src/c.ts', undefined, {
+        authority: 'gateway'
+      })
+    )
   })
 })

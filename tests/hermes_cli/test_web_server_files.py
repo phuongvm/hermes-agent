@@ -88,6 +88,20 @@ def _seed_file(client, root, name="out/hello.txt"):
     return file_path
 
 
+@pytest.mark.skipif(web_server.os.name != "nt", reason="Windows drive-path admission")
+def test_fs_endpoints_reject_leading_slash_windows_drive_paths(local_files_client):
+    client, _home = local_files_client
+
+    for endpoint in (
+        "/api/fs/read-text",
+        "/api/fs/read-data-url",
+        "/api/fs/download",
+    ):
+        response = client.get(endpoint, params={"path": "/O:/workspace/report.md"})
+        assert response.status_code == 400, endpoint
+        assert response.json()["detail"] == "Invalid path"
+
+
 
 
 def test_download_authenticates_via_query_token(forced_files_client):

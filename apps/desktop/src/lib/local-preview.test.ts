@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { readDesktopFileDataUrl } = vi.hoisted(() => ({ readDesktopFileDataUrl: vi.fn() }))
+const { remoteMode, readDesktopFileDataUrl, readDesktopFileText } = vi.hoisted(() => ({
+  remoteMode: { value: true },
+  readDesktopFileDataUrl: vi.fn(),
+  readDesktopFileText: vi.fn()
+}))
 
 vi.mock('@/lib/desktop-fs', () => ({
-  isDesktopFsRemoteMode: () => true,
+  isDesktopFsRemoteMode: () => remoteMode.value,
   readDesktopFileDataUrl,
-  readDesktopFileText: vi.fn()
+  readDesktopFileText
 }))
 
 import {
@@ -166,6 +170,60 @@ describe('remote HTML previews', () => {
       openPreviewTargetInBrowser({ ...remoteTarget, renderMode: 'source', transient: true })
     ).rejects.toThrow('Remote HTML preview could not be loaded')
     expect(openPreviewInBrowser).not.toHaveBeenCalled()
+  })
+})
+
+describe('cross-platform local preview paths', () => {
+  it.each([
+    ['/srv/workspace/a.md', '/srv/workspace/a.md'],
+    ['O:\\workspace\\a.md', 'O:\\workspace\\a.md'],
+    ['O:/workspace/a.md', 'O:/workspace/a.md'],
+    ['\\\\server\\share\\a.md', '\\\\server\\share\\a.md'],
+    ['O:relative.md', 'O:/base/O:relative.md'],
+    ['relative/a.md', 'O:/base/relative/a.md'],
+    ['../a.md', 'O:/base/../a.md'],
+    ['folder with spaces/café.md', 'O:/base/folder with spaces/café.md']
+  ])('normalizes %s without changing its path category', (raw, expected) => {
+    expect(localPreviewTarget(raw, 'O:/base')?.path).toBe(expected)
+  })
+})
+
+describe('preview filesystem authority', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    remoteMode.value = true
+    readDesktopFileText.mockResolvedValue({ content: 'remote', binary: false, byteSize: 6 })
+  })
+
+  it('bypasses Desktop-local normalization for a Gateway-owned remote path', async () => {
+    const normalizePreviewTarget = vi.fn(async () => null)
+    window.hermesDesktop = { normalizePreviewTarget } as never
+
+    await expect(
+      normalizeOrLocalPreviewTarget('O:\\workspace\\a.md', 'O:/workspace', { authority: 'gateway' })
+    ).resolves.toMatchObject({ path: 'O:\\workspace\\a.md' })
+    expect(normalizePreviewTarget).not.toHaveBeenCalled()
+    expect(readDesktopFileText).toHaveBeenCalledWith('O:\\workspace\\a.md')
+  })
+
+  it('keeps local-first normalization as the default even in remote mode', async () => {
+    const normalized = { ...remoteTarget, path: '/desktop/local.md', source: '/desktop/local.md' }
+    const normalizePreviewTarget = vi.fn(async () => normalized)
+    window.hermesDesktop = { normalizePreviewTarget } as never
+
+    await normalizeOrLocalPreviewTarget('/desktop/local.md')
+
+    expect(normalizePreviewTarget).toHaveBeenCalledWith('/desktop/local.md', undefined)
+  })
+
+  it('does not bypass Desktop-local normalization outside remote mode', async () => {
+    remoteMode.value = false
+    const normalizePreviewTarget = vi.fn(async () => null)
+    window.hermesDesktop = { normalizePreviewTarget } as never
+
+    await normalizeOrLocalPreviewTarget('O:\\workspace\\a.md', 'O:/workspace', { authority: 'gateway' })
+
+    expect(normalizePreviewTarget).toHaveBeenCalledWith('O:\\workspace\\a.md', 'O:/workspace')
   })
 })
 
