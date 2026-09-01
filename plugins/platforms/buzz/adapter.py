@@ -3055,7 +3055,7 @@ def _profile_buzz_extra() -> dict:
         return {}
     if not isinstance(cfg, dict):
         return {}
-    buzz = ((cfg.get("gateway") or {}).get("platforms") or {}).get("buzz")
+    buzz = ((cfg.get("gateway") or {}).get("platforms") or {}).get("buzz") or (cfg.get("platforms") or {}).get("buzz")
     if not isinstance(buzz, dict):
         return {}
     extra = buzz.get("extra", buzz)
