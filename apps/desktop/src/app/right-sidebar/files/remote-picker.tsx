@@ -9,17 +9,33 @@ import { displayPath, pathLeaf } from '@/lib/display-path'
 import { cn } from '@/lib/utils'
 
 function clean(path: string) {
-  return path.replace(/\/+$/, '') || '/'
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '')
+
+  if (/^[A-Za-z]:$/.test(normalized)) {
+    return `${normalized}/`
+  }
+
+  return normalized || '/'
 }
 
 function parentDir(path: string) {
   const value = clean(path)
 
-  if (value === '/') {
+  if (value === '/' || /^[A-Za-z]:\/$/.test(value)) {
     return '/'
   }
 
-  const parent = value.slice(0, value.lastIndexOf('/'))
+  const lastSlash = value.lastIndexOf('/')
+
+  if (lastSlash === -1) {
+    return '/'
+  }
+
+  const parent = value.slice(0, lastSlash)
+
+  if (/^[A-Za-z]:$/.test(parent)) {
+    return `${parent}/`
+  }
 
   return parent || '/'
 }
@@ -100,7 +116,36 @@ export function RemoteFolderPicker() {
   }, [currentPath, pending])
 
   const crumbs = useMemo(() => {
-    const parts = clean(currentPath).split('/').filter(Boolean)
+    const value = clean(currentPath)
+
+    if (value === '/') {
+      return [{ label: '/', path: '/' }]
+    }
+
+    const driveMatch = value.match(/^([A-Za-z]:)(\/.*)?$/)
+
+    if (driveMatch) {
+      const drive = `${driveMatch[1]}/`
+      const rest = (driveMatch[2] || '').replace(/^\/+/, '')
+      const out = [
+        { label: '/', path: '/' },
+        { label: driveMatch[1], path: drive }
+      ]
+
+      if (rest) {
+        const parts = rest.split('/').filter(Boolean)
+        let acc = drive
+
+        for (const part of parts) {
+          acc = acc.endsWith('/') ? `${acc}${part}` : `${acc}/${part}`
+          out.push({ label: part, path: acc })
+        }
+      }
+
+      return out
+    }
+
+    const parts = value.split('/').filter(Boolean)
     const out = [{ label: '/', path: '/' }]
     let acc = ''
 
