@@ -57,15 +57,18 @@ import {
 
 test('dispatchApiRequestRoute branches to resolveRegistry when connectionId is present', async () => {
   const calls: string[] = []
+
   const result = await dispatchApiRequestRoute(
     { connectionId: 'gw-remote-1', path: '/api/fs/list', profile: 'researcher' },
     {
       resolveLegacy: async () => {
         calls.push('legacy')
+
         return 'legacy-res'
       },
       resolveRegistry: async (connectionId, req) => {
         calls.push(`registry:${connectionId}:${req.path}`)
+
         return 'registry-res'
       }
     }
@@ -77,15 +80,18 @@ test('dispatchApiRequestRoute branches to resolveRegistry when connectionId is p
 
 test('dispatchApiRequestRoute branches to resolveLegacy when connectionId is absent or empty', async () => {
   const calls: string[] = []
+
   const result = await dispatchApiRequestRoute(
     { path: '/api/fs/list', profile: 'default' },
     {
       resolveLegacy: async req => {
         calls.push(`legacy:${req.profile}:${req.path}`)
+
         return 'legacy-res'
       },
       resolveRegistry: async () => {
         calls.push('registry')
+
         return 'registry-res'
       }
     }

@@ -127,6 +127,7 @@ export function RemoteFolderPicker() {
     if (driveMatch) {
       const drive = `${driveMatch[1]}/`
       const rest = (driveMatch[2] || '').replace(/^\/+/, '')
+
       const out = [
         { label: '/', path: '/' },
         { label: driveMatch[1], path: drive }
