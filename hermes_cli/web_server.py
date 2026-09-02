@@ -2215,7 +2215,7 @@ class ManagedFilesPolicy:
     can_change_path: bool
 
 
-_FS_READDIR_HIDDEN = {
+_DEFAULT_FS_READDIR_HIDDEN = frozenset({
     ".git",
     ".hg",
     ".svn",
@@ -2229,7 +2229,40 @@ _FS_READDIR_HIDDEN = {
     "node_modules",
     "target",
     "venv",
-}
+})
+_FS_READDIR_HIDDEN = set(_DEFAULT_FS_READDIR_HIDDEN)
+
+
+def _get_fs_readdir_hidden() -> set[str]:
+    """Return the set of directory names to hide from fs list/read endpoints.
+
+    Combines built-in defaults (_DEFAULT_FS_READDIR_HIDDEN) with user-configured
+    entries from config.yaml under `fs.hidden_dirs` (or `fs.hidden`).
+    """
+    out = set(_DEFAULT_FS_READDIR_HIDDEN)
+    try:
+        cfg = load_config() or {}
+        fs_cfg = cfg.get("fs") or {}
+        configured = fs_cfg.get("hidden_dirs") or fs_cfg.get("hidden") or []
+        if isinstance(configured, str):
+            configured = [configured]
+        for item in configured:
+            if item and isinstance(item, str):
+                out.add(item.strip())
+    except Exception:
+        pass
+    return out
+
+
+
+def _is_hidden_path(path: Path) -> bool:
+    """Return True if any component of path matches the active hidden directory set."""
+    hidden = _get_fs_readdir_hidden()
+    if os.name == "nt" or sys.platform == "darwin":
+        hidden_lowered = {h.lower() for h in hidden}
+        return any(part.lower() in hidden_lowered for part in path.parts)
+    return any(part in hidden for part in path.parts)
+
 
 # Filenames that must never be listed, read, or downloaded through the
 # managed-files API.  These typically contain credentials (API keys, tokens)
@@ -2392,12 +2425,24 @@ def _fs_path(raw_path: str) -> Path:
             if parsed.netloc and parsed.netloc not in {"", "localhost"}:
                 raise ValueError
             raw = urllib.request.url2pathname(parsed.path)
-        candidate = Path(raw).expanduser()
-        if not candidate.is_absolute():
-            candidate = Path.cwd() / candidate
-        return candidate.resolve(strict=False)
+
+        if os.name == "nt" and raw in {"/", "\\", "\\\\", "//"}:
+            candidate = Path(_fs_default_cwd()).resolve()
+        else:
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path.cwd() / candidate
+            candidate = candidate.resolve(strict=False)
+
+        if _is_hidden_path(candidate):
+            raise HTTPException(status_code=403, detail="Access to hidden path is forbidden")
+
+        return candidate
+    except HTTPException:
+        raise
     except (OSError, RuntimeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid path")
+
 
 
 def _fs_mime_type(path: Path) -> str:
@@ -3127,9 +3172,14 @@ async def fs_list(path: str):
     target = _fs_path(path)
     try:
         entries = []
+        hidden_dirs = _get_fs_readdir_hidden()
+        is_case_insensitive = os.name == "nt" or sys.platform == "darwin"
+        hidden_lowered = {h.lower() for h in hidden_dirs} if is_case_insensitive else hidden_dirs
+
         with os.scandir(target) as scan:
             for entry in scan:
-                if entry.name in _FS_READDIR_HIDDEN:
+                check_name = entry.name.lower() if is_case_insensitive else entry.name
+                if check_name in hidden_lowered:
                     continue
                 entries.append({
                     "name": entry.name,
@@ -3138,6 +3188,7 @@ async def fs_list(path: str):
                 })
         entries.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
         return {"entries": entries}
+
     except FileNotFoundError:
         return {"entries": [], "error": "ENOENT"}
     except NotADirectoryError:

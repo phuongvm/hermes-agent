@@ -89,3 +89,69 @@ def test_fs_endpoints_require_auth(tmp_path):
     assert list_response.status_code == 401
     assert read_response.status_code == 401
     assert default_response.status_code == 401
+
+
+def test_fs_list_filters_configured_hidden_dirs(client, tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "src").mkdir()
+    (root / "src" / "index.ts").write_text("console.log('ok')")
+    (root / "_config").mkdir()
+    (root / "_config" / "secret.yaml").write_text("key: secret")
+    (root / "$RECYCLE.BIN").mkdir()
+
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {"fs": {"hidden_dirs": ["_config", "$RECYCLE.BIN"]}},
+    )
+
+    response = client.get("/api/fs/list", params={"path": str(root)})
+    assert response.status_code == 200
+    entries = response.json()["entries"]
+    names = [e["name"] for e in entries]
+    assert names == ["src"]
+    assert "_config" not in names
+    assert "$RECYCLE.BIN" not in names
+
+
+def test_fs_direct_access_to_hidden_dirs_returns_403(client, tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    hidden_dir = root / "_config"
+    hidden_dir.mkdir()
+    secret_file = hidden_dir / "secret.yaml"
+    secret_file.write_text("key: secret")
+
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {"fs": {"hidden_dirs": ["_config"]}},
+    )
+
+    # Direct list of hidden directory
+    list_res = client.get("/api/fs/list", params={"path": str(hidden_dir)})
+    assert list_res.status_code == 403
+    assert "hidden path" in list_res.json()["detail"].lower()
+
+    # Direct read-text of file inside hidden directory
+    read_res = client.get("/api/fs/read-text", params={"path": str(secret_file)})
+    assert read_res.status_code == 403
+    assert "hidden path" in read_res.json()["detail"].lower()
+
+
+
+def test_fs_windows_root_normalizes_to_default_cwd(client, tmp_path, monkeypatch):
+    default_dir = tmp_path / "default_workspace"
+    default_dir.mkdir()
+    (default_dir / "app.py").write_text("print('hello')")
+
+    monkeypatch.setattr(web_server, "_fs_default_cwd", lambda: str(default_dir))
+    monkeypatch.setattr(web_server.os, "name", "nt")
+
+    response = client.get("/api/fs/list", params={"path": "/"})
+    assert response.status_code == 200
+    entries = response.json()["entries"]
+    names = [e["name"] for e in entries]
+    assert "app.py" in names
+
