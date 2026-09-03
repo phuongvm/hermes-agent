@@ -549,6 +549,13 @@ DEFAULT_CONFIG = {
         "persistent_shell": True,
     },
 
+    "fs": {
+        # Configurable hidden directories excluded from remote filesystem
+        # browsing (/api/fs/list) and protected against direct traversal access.
+        # Merged dynamically with default build/cache exclusions (_DEFAULT_FS_READDIR_HIDDEN).
+        "hidden_dirs": [],
+    },
+
     "web": {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")

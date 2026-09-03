@@ -71,6 +71,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_process_hermes_home,
     load_config,
+    load_config_readonly,
     load_env,
     read_raw_config,
     resolve_cron_model_drift_defaults,
@@ -2241,7 +2242,7 @@ def _get_fs_readdir_hidden() -> set[str]:
     """
     out = set(_DEFAULT_FS_READDIR_HIDDEN)
     try:
-        cfg = load_config() or {}
+        cfg = load_config_readonly() or {}
         fs_cfg = cfg.get("fs") or {}
         configured = fs_cfg.get("hidden_dirs") or fs_cfg.get("hidden") or []
         if isinstance(configured, str):

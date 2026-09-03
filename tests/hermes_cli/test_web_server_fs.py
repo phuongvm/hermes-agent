@@ -30,9 +30,9 @@ def client(monkeypatch):
 def test_fs_list_sorts_and_hides_noise(client, tmp_path):
     root = tmp_path / "project"
     root.mkdir()
-    (root / "b.txt").write_text("b")
+    (root / "b.txt").write_text("b", encoding="utf-8")
     (root / "a_dir").mkdir()
-    (root / "a.txt").write_text("a")
+    (root / "a.txt").write_text("a", encoding="utf-8")
     (root / "node_modules").mkdir()
     (root / ".git").mkdir()
 
@@ -70,7 +70,7 @@ def test_fs_download_streams_file_without_data_url_cap(client, tmp_path, monkeyp
 
 def test_fs_download_rejects_sensitive_files(client, tmp_path):
     target = tmp_path / ".env"
-    target.write_text("SECRET=1")
+    target.write_text("SECRET=1", encoding="utf-8")
 
     response = client.get("/api/fs/download", params={"path": str(target)})
 
@@ -80,7 +80,7 @@ def test_fs_download_rejects_sensitive_files(client, tmp_path):
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"
-    target.write_text("secret")
+    target.write_text("secret", encoding="utf-8")
 
     list_response = client.get("/api/fs/list", params={"path": str(tmp_path)})
     read_response = client.get("/api/fs/read-text", params={"path": str(target)})
@@ -95,14 +95,14 @@ def test_fs_list_filters_configured_hidden_dirs(client, tmp_path, monkeypatch):
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "src").mkdir()
-    (root / "src" / "index.ts").write_text("console.log('ok')")
+    (root / "src" / "index.ts").write_text("console.log('ok')", encoding="utf-8")
     (root / "_config").mkdir()
-    (root / "_config" / "secret.yaml").write_text("key: secret")
+    (root / "_config" / "secret.yaml").write_text("key: secret", encoding="utf-8")
     (root / "$RECYCLE.BIN").mkdir()
 
     monkeypatch.setattr(
         web_server,
-        "load_config",
+        "load_config_readonly",
         lambda: {"fs": {"hidden_dirs": ["_config", "$RECYCLE.BIN"]}},
     )
 
@@ -121,11 +121,11 @@ def test_fs_direct_access_to_hidden_dirs_returns_403(client, tmp_path, monkeypat
     hidden_dir = root / "_config"
     hidden_dir.mkdir()
     secret_file = hidden_dir / "secret.yaml"
-    secret_file.write_text("key: secret")
+    secret_file.write_text("key: secret", encoding="utf-8")
 
     monkeypatch.setattr(
         web_server,
-        "load_config",
+        "load_config_readonly",
         lambda: {"fs": {"hidden_dirs": ["_config"]}},
     )
 
@@ -144,7 +144,7 @@ def test_fs_direct_access_to_hidden_dirs_returns_403(client, tmp_path, monkeypat
 def test_fs_windows_root_normalizes_to_default_cwd(client, tmp_path, monkeypatch):
     default_dir = tmp_path / "default_workspace"
     default_dir.mkdir()
-    (default_dir / "app.py").write_text("print('hello')")
+    (default_dir / "app.py").write_text("print('hello')", encoding="utf-8")
 
     monkeypatch.setattr(web_server, "_fs_default_cwd", lambda: str(default_dir))
     monkeypatch.setattr(web_server.os, "name", "nt")
@@ -154,4 +154,28 @@ def test_fs_windows_root_normalizes_to_default_cwd(client, tmp_path, monkeypatch
     entries = response.json()["entries"]
     names = [e["name"] for e in entries]
     assert "app.py" in names
+
+
+def test_fs_reads_from_live_config_defaults(client, tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "src").mkdir()
+    (root / "_config").mkdir()
+
+    # When config has fs.hidden_dirs: ["_config"]
+    monkeypatch.setattr(
+        web_server,
+        "load_config_readonly",
+        lambda: {"fs": {"hidden_dirs": ["_config"]}},
+    )
+    res = client.get("/api/fs/list", params={"path": str(root)})
+    assert res.status_code == 200
+    names = [e["name"] for e in res.json()["entries"]]
+    assert "_config" not in names
+    assert names == ["src"]
+
+    # Direct access returns 403
+    forbidden_res = client.get("/api/fs/list", params={"path": str(root / "_config")})
+    assert forbidden_res.status_code == 403
+
 
