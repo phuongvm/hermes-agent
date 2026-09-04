@@ -4759,7 +4759,8 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
-        from urllib.parse import unquote as _unquote
+        from urllib.parse import unquote as _unquote, urlparse as _urlparse
+        from urllib.request import url2pathname as _url2pathname
 
         for image_url, alt_text in images:
             if human_delay > 0:
@@ -4772,9 +4773,17 @@ class BasePlatformAdapter(ABC):
                     alt_text[:30] if alt_text else "",
                 )
                 if image_url.startswith("file://"):
+                    parsed = _urlparse(image_url)
+                    if parsed.netloc and parsed.netloc != "localhost":
+                        if len(parsed.netloc) == 2 and parsed.netloc[1] == ":":
+                            img_path = _url2pathname(f"{parsed.netloc}{parsed.path}")
+                        else:
+                            img_path = _url2pathname(f"//{parsed.netloc}{parsed.path}")
+                    else:
+                        img_path = _url2pathname(parsed.path)
                     img_result = await self.send_image_file(
                         chat_id=chat_id,
-                        image_path=_unquote(image_url[7:]),
+                        image_path=img_path,
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )

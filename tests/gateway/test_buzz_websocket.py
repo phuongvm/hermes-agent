@@ -116,10 +116,12 @@ class _ScriptedWebSocket(_FakeWebSocket):
     a clean close.
     """
 
-    def __init__(self, anext_behavior):
+    def __init__(self, anext_behavior, ping_behavior=None):
         super().__init__()
         self._anext_behavior = anext_behavior
+        self._ping_behavior = ping_behavior
         self.exited = False
+        self.ping_count = 0
 
     async def __aenter__(self):
         return self
@@ -132,6 +134,31 @@ class _ScriptedWebSocket(_FakeWebSocket):
 
     async def __anext__(self):
         return await self._anext_behavior()
+
+    async def ping(self, *args, **kwargs):
+        self.ping_count += 1
+        behavior = self._ping_behavior
+        if callable(behavior):
+            res = behavior()
+            if asyncio.iscoroutine(res):
+                res = await res
+        else:
+            res = behavior
+
+        if isinstance(res, Exception):
+            raise res
+        if isinstance(res, type) and issubclass(res, Exception):
+            raise res()
+        if res == "timeout":
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_exception(asyncio.TimeoutError("ping timed out"))
+            return fut
+        if res is not None:
+            return res
+
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result(b"")
+        return fut
 
 
 @pytest.mark.asyncio
@@ -154,7 +181,7 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
         await asyncio.Event().wait()  # never yields, never raises
 
     def fake_connect(*args, **kwargs):
-        ws = _ScriptedWebSocket(dead_anext)
+        ws = _ScriptedWebSocket(dead_anext, ping_behavior=ConnectionResetError("CLOSE_WAIT"))
         sockets.append(ws)
         return ws
 
@@ -177,6 +204,100 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
     assert len(sockets) >= 2, "idle read watchdog did not force a reconnect"
     assert sockets[0].exited, "the silent connection was not closed before reconnecting"
     assert any("went silent" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_idle_silent_channel_keeps_connection_alive_when_ping_succeeds(monkeypatch, caplog):
+    """A silent channel with responsive keepalive ping remains connected without warnings."""
+    import logging
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    caplog.set_level(logging.DEBUG)
+
+    sockets = []
+
+    async def silent_channel():
+        await asyncio.Event().wait()  # no data frames
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(silent_channel)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        for _ in range(20):
+            if sockets and sockets[0].ping_count >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert len(sockets) == 1, f"expected 1 persistent connection, got {len(sockets)}"
+        assert not sockets[0].exited, "connection should still be open while loop is running"
+        assert sockets[0].ping_count >= 2, f"expected at least 2 ping probes, got {sockets[0].ping_count}"
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    assert sockets[0].exited, "connection should be closed cleanly after cancellation"
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no WARNING logs, got: {[w.message for w in warnings]}"
+    assert any("keepalive probe succeeded" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ping_behavior",
+    [
+        ConnectionResetError("transport closed during ping"),
+        RuntimeError("ping failure"),
+        "timeout",
+    ],
+)
+async def test_websocket_loop_reconnects_when_ping_fails_or_times_out(monkeypatch, caplog, ping_behavior):
+    """When ping() fails or times out during read idle, ConnectionError triggers reconnect."""
+    import logging
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    caplog.set_level(logging.WARNING)
+
+    sockets = []
+
+    async def dead_anext():
+        await asyncio.Event().wait()
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(dead_anext, ping_behavior=ping_behavior)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(sockets) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    assert len(sockets) >= 2, "failed/timed-out ping probe did not force a reconnect"
+    assert sockets[0].exited, "the failed connection was not closed before reconnecting"
+    assert any("keepalive probe failed" in r.message for r in caplog.records)
+    assert any("went silent" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
