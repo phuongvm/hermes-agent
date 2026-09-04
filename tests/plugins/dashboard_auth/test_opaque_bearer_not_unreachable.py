@@ -14,10 +14,13 @@ and the real gated web_server app for the HTTP-level assertion.
 """
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 import pytest
 from starlette.testclient import TestClient
@@ -59,6 +62,43 @@ def empty_jwks_server():
     srv.shutdown()
 
 
+@pytest.fixture(scope="module")
+def populated_jwks_server():
+    """A reachable JWKS endpoint that returns populated signing keys (non-empty)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_numbers = key.public_key().public_numbers()
+
+    def _b64url_uint(n: int) -> str:
+        length = (n.bit_length() + 7) // 8
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
+
+    jwk = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "portal-signing-key-1",
+        "n": _b64url_uint(public_numbers.n),
+        "e": _b64url_uint(public_numbers.e),
+    }
+    body = json.dumps({"keys": [jwk]}).encode()
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # silence
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
 def _nous(portal_url: str) -> nous_plugin.NousDashboardAuthProvider:
     return nous_plugin.NousDashboardAuthProvider(client_id="agent:test-instance", portal_url=portal_url)
 
@@ -75,6 +115,7 @@ def test_classifier_maps_transport_failure_to_provider_error():
     [
         jwt.DecodeError("Not enough segments"),
         jwt.PyJWKSetError("The JWK Set did not contain any keys"),
+        jwt.PyJWKClientError('Unable to find a signing key that matches: "foreign-kid"'),
         jwt.InvalidTokenError("bad"),
     ],
 )
@@ -95,6 +136,11 @@ def test_opaque_bearer_with_healthy_portal_is_not_unreachable(empty_jwks_server)
 
 def test_foreign_kid_jwt_with_healthy_portal_is_not_unreachable(empty_jwks_server):
     provider = _nous(empty_jwks_server)
+    assert provider.verify_session(access_token=FOREIGN_KID_JWT) is None
+
+
+def test_foreign_kid_jwt_with_populated_jwks_is_not_unreachable(populated_jwks_server):
+    provider = _nous(populated_jwks_server)
     assert provider.verify_session(access_token=FOREIGN_KID_JWT) is None
 
 
@@ -154,3 +200,39 @@ def test_gated_api_rejects_opaque_cookie_with_401_not_503(_gated_nous):
     r = _gated_nous.get("/api/auth/me")
     assert r.status_code != 503, r.text
     assert "unreachable" not in r.text.lower()
+
+
+@pytest.fixture
+def _gated_nous_populated(populated_jwks_server):
+    clear_providers()
+    prev = {k: getattr(web_server.app.state, k, None) for k in ("bound_host", "bound_port", "auth_required")}
+    web_server.app.state.bound_host = "agent.example.test"
+    web_server.app.state.bound_port = 443
+    web_server.app.state.auth_required = True
+    register_provider(_nous(populated_jwks_server))
+    yield TestClient(web_server.app, base_url="https://agent.example.test")
+    clear_providers()
+    for k, v in prev.items():
+        setattr(web_server.app.state, k, v)
+
+
+def test_gated_api_rejects_foreign_kid_bearer_with_401_not_503(_gated_nous_populated, caplog):
+    with caplog.at_level(logging.WARNING):
+        r = _gated_nous_populated.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {FOREIGN_KID_JWT}"},
+        )
+    assert r.status_code != 503, r.text
+    assert r.status_code == 401
+    assert "unreachable" not in r.text.lower()
+    assert not any("unreachable" in record.message.lower() for record in caplog.records)
+
+
+def test_gated_api_rejects_foreign_kid_cookie_with_401_not_503(_gated_nous_populated, caplog):
+    _gated_nous_populated.cookies.set(SESSION_AT_COOKIE, FOREIGN_KID_JWT)
+    with caplog.at_level(logging.WARNING):
+        r = _gated_nous_populated.get("/api/auth/me")
+    assert r.status_code != 503, r.text
+    assert r.status_code == 401
+    assert "unreachable" not in r.text.lower()
+    assert not any("unreachable" in record.message.lower() for record in caplog.records)

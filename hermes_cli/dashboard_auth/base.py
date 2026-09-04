@@ -143,6 +143,8 @@ def classify_jwks_lookup_error(exc: BaseException) -> Exception:
     if isinstance(exc, (jwt.DecodeError, jwt.PyJWKSetError)):
         return InvalidCodeError(f"token not verifiable by this provider: {exc}")
     if isinstance(exc, jwt.PyJWKClientError):
+        if "Unable to find a signing key that matches" in str(exc):
+            return InvalidCodeError(f"token not verifiable by this provider: {exc}")
         return ProviderError(f"JWKS lookup failed: {exc}")
     if isinstance(exc, jwt.InvalidTokenError):
         return InvalidCodeError(f"token not verifiable by this provider: {exc}")
