@@ -90,6 +90,12 @@ import {
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap } from './bundle-swap'
+import {
+  InstallStamp,
+  loadInstallStamp as loadInstallStampInternal,
+  resolveHermesVersionLadder,
+  formatClientVersion
+} from './runtime-version'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -694,10 +700,10 @@ const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 // build hasn't been invoked, or schema mismatch). Callers must handle null.
 //
 // Schema:
-//   { schemaVersion: 1, commit, branch, builtAt, dirty, source }
+//   { schemaVersion: 1, version, commit, shortCommit, buildNumber, branch, builtAt, dirty, source }
 const INSTALL_STAMP_SCHEMA_VERSION = 1
 
-function loadInstallStamp() {
+function loadInstallStamp(): InstallStamp | null {
   // Try packaged location first (resources/install-stamp.json), then the
   // dev/local build output (apps/desktop/build/install-stamp.json) so
   // someone running `npm run start` after a local `npm run build` also
@@ -705,39 +711,9 @@ function loadInstallStamp() {
   const candidates = [
     process.resourcesPath ? path.join(process.resourcesPath, 'install-stamp.json') : null,
     path.join(APP_ROOT, 'build', 'install-stamp.json')
-  ].filter(Boolean)
+  ].filter((p): p is string => Boolean(p))
 
-  for (const p of candidates) {
-    try {
-      const raw = fs.readFileSync(p, 'utf8')
-      const parsed = JSON.parse(raw)
-
-      if (parsed && typeof parsed === 'object' && typeof parsed.commit === 'string' && parsed.commit.length >= 7) {
-        if (parsed.schemaVersion !== INSTALL_STAMP_SCHEMA_VERSION) {
-          console.warn(
-            `[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`
-          )
-
-          continue
-        }
-
-        return Object.freeze({
-          schemaVersion: parsed.schemaVersion,
-          commit: parsed.commit,
-          branch: parsed.branch || null,
-          builtAt: parsed.builtAt || null,
-          dirty: Boolean(parsed.dirty),
-          source: parsed.source || null,
-          path: p
-        })
-      }
-    } catch (e) {
-      console.warn(`[hermes] install-stamp.json found at ${p} , but parsing failed with ${e}`)
-      // Either ENOENT or malformed JSON; try the next candidate
-    }
-  }
-
-  return null
+  return loadInstallStampInternal(candidates, fs)
 }
 
 const INSTALL_STAMP = loadInstallStamp()
@@ -17402,29 +17378,17 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   return { branch }
 })
 
-// Resolve the canonical Hermes version (the one `release.py` bumps in
-// hermes_cli/__init__.py + pyproject.toml) so the desktop About panel shows the
-// real Hermes version instead of the Electron app's own package.json version,
-// which historically drifted (stuck at 0.0.2). Falls back to app.getVersion()
-// when the source tree can't be read (e.g. a packaged build without the repo).
-function resolveHermesVersion() {
-  try {
-    const root = resolveUpdateRoot()
-    const initPath = path.join(root, 'hermes_cli', '__init__.py')
-
-    if (fileExists(initPath)) {
-      const raw = fs.readFileSync(initPath, 'utf8')
-      const match = raw.match(/__version__\s*=\s*["']([^"']+)["']/)
-
-      if (match) {
-        return match[1]
-      }
-    }
-  } catch {
-    // Fall through to the Electron app version below.
-  }
-
-  return app.getVersion()
+// Resolve the canonical Hermes version via the 3-rung resolution ladder:
+// 1. Local Python source tree (hermes_cli/__init__.py via resolveUpdateRoot())
+// 2. Packaged client-only runtime stamp (INSTALL_STAMP: version + shortCommit + [DIRTY])
+// 3. Fallback to app.getVersion()
+function resolveHermesVersion(): string {
+  return resolveHermesVersionLadder({
+    updateRoot: resolveUpdateRoot(),
+    installStamp: INSTALL_STAMP,
+    appVersion: app.getVersion(),
+    fsModule: fs
+  })
 }
 
 // Renderer-bundle skew: `hermes update` moves the SOURCE TREE, but the UI

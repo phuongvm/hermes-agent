@@ -1,13 +1,16 @@
 /**
- * Writes apps/desktop/build/install-stamp.json with the git ref the desktop
- * .exe should pin to at first-launch bootstrap time.  This file ships inside
- * the packaged app via electron-builder's extraResources entry and is read
- * by electron/main.ts to drive the install.ps1 stage bootstrap flow.
+ * Writes apps/desktop/build/install-stamp.json with the git ref and canonical
+ * version the desktop .exe should pin to at first-launch bootstrap time and
+ * runtime version reporting. This file ships inside the packaged app via
+ * electron-builder's extraResources entry and is read by electron/main.ts.
  *
  * Schema (subject to bump via STAMP_SCHEMA_VERSION):
  *   {
  *     "schemaVersion": 1,
+ *     "version":       "<canonical SemVer>",
  *     "commit":        "<40-char SHA>",
+ *     "shortCommit":   "<8-char hex>",
+ *     "buildNumber":   <non-negative integer>,
  *     "branch":        "<branch name>",
  *     "builtAt":       "<ISO 8601 UTC timestamp>",
  *     "dirty":         true|false,
@@ -15,28 +18,35 @@
  *   }
  *
  * Source preference order:
- *   1. CI env vars ($GITHUB_SHA / $GITHUB_REF_NAME) -- avoid edge cases with
- *      shallow clones, detached HEADs, etc. in CI.
- *   2. Local `git rev-parse` against the parent repo (../..).
- *   3. Fallback stamp for local/personal builds from non-git source trees
- *      (ZIP extract, interrupted clone with no HEAD, etc.).
+ *   1. Canonical version: root `pyproject.toml` (`[project] version = "..."`),
+ *      falling back to `hermes_cli/__init__.py` (`__version__ = "..."`).
+ *      Validates that Major, Minor, and Patch are unsigned 16-bit integers
+ *      (0 <= x <= 65535).
+ *   2. Git metadata:
+ *      a. CI env vars ($GITHUB_SHA / $GITHUB_REF_NAME) -- avoid edge cases with
+ *         shallow clones, detached HEADs, etc. in CI.
+ *      b. Local `git rev-parse` against the repo root.
+ *      c. Fallback stamp for local/personal builds from non-git source trees
+ *         (ZIP extract, interrupted clone with no HEAD, etc.).
  *
- * Dev / out-of-repo builds without git produce an explicit fallback stamp
- * rather than aborting the whole build.  Bootstrap treats the all-zero
- * commit as unpinned and follows the branch instead of fetching a fake SHA.
+ * Zero-touch invariant:
+ *   Does NOT modify tracked workspace manifests (package.json, package-lock.json).
+ *   Dirty status is determined before writing build/install-stamp.json.
  */
 
-import { mkdirSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs"
 import { resolve, join, relative } from "path"
 import { execSync } from "child_process"
 
 import { isMain } from "./utils.mjs"
 
-const STAMP_SCHEMA_VERSION = 1
+export const STAMP_SCHEMA_VERSION = 1
 
 /** All-zero placeholder used when no real commit can be resolved. */
 export const FALLBACK_COMMIT = "0000000000000000000000000000000000000000"
+export const FALLBACK_SHORT_COMMIT = "00000000"
 export const FALLBACK_BRANCH = "main"
+export const FALLBACK_BUILD_NUMBER = 0
 
 const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
@@ -51,13 +61,92 @@ function tryExec(cmd, opts) {
   }
 }
 
+function tryReadFile(filePath) {
+  try {
+    if (!existsSync(filePath)) return null
+    return readFileSync(filePath, "utf8")
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Validate SemVer string and ensure major, minor, patch are within 0..65535.
+ * Throws an error if malformed, negative, or exceeding 65535.
+ */
+export function validateSemVer(versionStr) {
+  if (typeof versionStr !== "string" || !versionStr.trim()) {
+    throw new Error(`Invalid version: expected non-empty string, got ${JSON.stringify(versionStr)}`)
+  }
+  const trimmed = versionStr.trim()
+  // Match standard SemVer: major.minor.patch with optional prerelease and build metadata.
+  // Note: negative components like -1 are rejected by regex.
+  const semverRegex = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/
+  const match = trimmed.match(semverRegex)
+  if (!match) {
+    throw new Error(`Unsupported or malformed SemVer version: "${trimmed}"`)
+  }
+
+  const major = parseInt(match[1], 10)
+  const minor = parseInt(match[2], 10)
+  const patch = parseInt(match[3], 10)
+
+  if (major < 0 || major > 65535 || minor < 0 || minor > 65535 || patch < 0 || patch > 65535) {
+    throw new Error(
+      `SemVer component out of 16-bit range [0..65535]: major=${major}, minor=${minor}, patch=${patch} in "${trimmed}"`
+    )
+  }
+
+  return trimmed
+}
+
+/**
+ * Extract canonical version from pyproject.toml (fallback to hermes_cli/__init__.py).
+ */
+export function resolveCanonicalVersion({ repoRoot = REPO_ROOT, readFileFn = tryReadFile } = {}) {
+  // 1. Root pyproject.toml
+  const pyprojectPath = join(repoRoot, "pyproject.toml")
+  const pyprojectContent = readFileFn(pyprojectPath)
+  if (pyprojectContent) {
+    const match = pyprojectContent.match(/(?:^|\n)version\s*=\s*["']([^"']+)["']/)
+    if (match && match[1]) {
+      return validateSemVer(match[1])
+    }
+  }
+
+  // 2. hermes_cli/__init__.py fallback
+  const initPyPath = join(repoRoot, "hermes_cli", "__init__.py")
+  const initPyContent = readFileFn(initPyPath)
+  if (initPyContent) {
+    const match = initPyContent.match(/(?:^|\n)__version__\s*=\s*["']([^"']+)["']/)
+    if (match && match[1]) {
+      return validateSemVer(match[1])
+    }
+  }
+
+  throw new Error(
+    `Cannot resolve canonical version: neither pyproject.toml nor hermes_cli/__init__.py provided a valid version at ${repoRoot}`
+  )
+}
+
 export function fromCI(env = process.env) {
   const sha = env.GITHUB_SHA
   if (!sha) return null
   const branch = env.GITHUB_REF_NAME || env.GITHUB_HEAD_REF || null
+  const shortCommit = sha.slice(0, 8)
+  const rawBuildNum = env.HERMES_BUILD_NUMBER || env.GITHUB_RUN_NUMBER
+  let buildNumber = 0
+  if (rawBuildNum !== undefined && rawBuildNum !== null) {
+    const parsed = parseInt(String(rawBuildNum), 10)
+    if (!isNaN(parsed) && parsed >= 0) {
+      buildNumber = parsed
+    }
+  }
   return {
     commit: sha,
-    branch: branch,
+    shortCommit,
+    buildNumber,
+    branch,
     dirty: false, // CI builds from a checkout-of-ref by definition
     source: "ci"
   }
@@ -66,31 +155,49 @@ export function fromCI(env = process.env) {
 export function fromLocalGit(repoRoot = REPO_ROOT, execFn = tryExec) {
   const sha = execFn("git rev-parse HEAD", { cwd: repoRoot })
   if (!sha) return null
+
+  let shortCommit = execFn("git rev-parse --short=8 HEAD", { cwd: repoRoot })
+  if (!shortCommit || !/^[0-9a-fA-F]{8}$/.test(shortCommit)) {
+    shortCommit = sha.slice(0, 8)
+  }
+
+  const countStr = execFn("git rev-list --count HEAD", { cwd: repoRoot })
+  let buildNumber = 0
+  if (countStr) {
+    const parsed = parseInt(countStr, 10)
+    if (!isNaN(parsed) && parsed >= 0) {
+      buildNumber = parsed
+    }
+  }
+
   const branch = execFn("git rev-parse --abbrev-ref HEAD", { cwd: repoRoot })
   // `git status --porcelain -uno` is empty iff tracked files match HEAD.
   // We exclude untracked files (-uno) intentionally: a developer who's
   // checked out an installer scratch dir alongside the repo shouldn't
-  // poison every local build with a [DIRTY] stamp.  We DO care about
+  // poison every local build with a [DIRTY] stamp. We DO care about
   // tracked-but-modified files because those mean the .exe content
   // differs from the commit being pinned.
   const status = execFn("git status --porcelain -uno", { cwd: repoRoot })
   const dirty = status !== null && status.length > 0
+
   return {
     commit: sha,
+    shortCommit,
+    buildNumber,
     branch: branch === "HEAD" ? null : branch, // detached HEAD -> null
-    dirty: dirty,
+    dirty,
     source: "local"
   }
 }
 
 export function fromFallback(branch = FALLBACK_BRANCH) {
   // Non-git builds (ZIP download, bootstrap installer without a resolvable
-  // HEAD) cannot determine a real commit.  Use a placeholder so local /
-  // personal builds can still complete.  The desktop bootstrap treats the
-  // all-zero commit as "unknown" and falls back to an unpinned branch
-  // bootstrap instead of trying to fetch a non-existent GitHub commit.
+  // HEAD) cannot determine a real commit. Use a placeholder so local /
+  // personal builds can still complete.
   return {
     commit: FALLBACK_COMMIT,
+    shortCommit: FALLBACK_SHORT_COMMIT,
+    buildNumber: FALLBACK_BUILD_NUMBER,
     branch: branch || FALLBACK_BRANCH,
     dirty: false,
     source: "fallback"
@@ -98,16 +205,30 @@ export function fromFallback(branch = FALLBACK_BRANCH) {
 }
 
 /**
- * Resolve the install stamp without writing it.  Pure enough for unit tests:
- * inject env / execFn / repoRoot to simulate CI, local git, or no-git trees.
+ * Resolve the install stamp without writing it. Pure enough for unit tests:
+ * inject env / execFn / repoRoot / readFileFn to simulate CI, local git, or no-git trees.
  */
 export function resolveStamp({
   env = process.env,
   repoRoot = REPO_ROOT,
   execFn = tryExec,
+  readFileFn = tryReadFile,
   fallbackBranch = FALLBACK_BRANCH
 } = {}) {
-  return fromCI(env) || fromLocalGit(repoRoot, execFn) || fromFallback(fallbackBranch)
+  const gitMeta = fromCI(env) || fromLocalGit(repoRoot, execFn) || fromFallback(fallbackBranch)
+  let version = null
+  try {
+    version = resolveCanonicalVersion({ repoRoot, readFileFn })
+  } catch (err) {
+    // If running in a test context where repoRoot may not have pyproject.toml,
+    // allow caller to pass or let error bubble if required.
+    throw err
+  }
+
+  return {
+    version,
+    ...gitMeta
+  }
 }
 
 export function isFallbackCommit(commit) {
@@ -117,7 +238,6 @@ export function isFallbackCommit(commit) {
 function main() {
   const stamp = resolveStamp()
   if (!stamp || !stamp.commit) {
-    // Should not happen — fromFallback() always provides a commit.
     console.error(
       "[write-build-stamp] ERROR: could not determine git commit.\n" +
         "  - $GITHUB_SHA not set\n" +
@@ -134,7 +254,7 @@ function main() {
     console.warn(
       "[write-build-stamp] WARNING: no git commit found (non-git checkout?).\n" +
         "  Using placeholder commit — the packaged app will fall back to the\n" +
-        "  default branch for first-launch bootstrap.  For production builds,\n" +
+        "  default branch for first-launch bootstrap. For production builds,\n" +
         "  run from a git checkout or set $GITHUB_SHA."
     )
   }
@@ -151,7 +271,10 @@ function main() {
 
   const payload = {
     schemaVersion: STAMP_SCHEMA_VERSION,
+    version: stamp.version,
     commit: stamp.commit,
+    shortCommit: stamp.shortCommit,
+    buildNumber: stamp.buildNumber,
     branch: stamp.branch,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
@@ -164,7 +287,12 @@ function main() {
     "[write-build-stamp] wrote " +
       relative(REPO_ROOT, OUT_FILE) +
       " -> " +
-      stamp.commit.slice(0, 12) +
+      stamp.version +
+      " (" +
+      stamp.shortCommit +
+      ")" +
+      " #" +
+      stamp.buildNumber +
       (stamp.branch ? " (" + stamp.branch + ")" : "") +
       (stamp.dirty ? " [DIRTY]" : "") +
       (stamp.source === "fallback" ? " [FALLBACK]" : "")
