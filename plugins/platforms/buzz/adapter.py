@@ -47,6 +47,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from collections import OrderedDict
@@ -1604,7 +1605,21 @@ class BuzzAdapter(BasePlatformAdapter):
         Missing or non-file paths retain the Base fallback so host
         filesystem paths are never echoed into chat (#74999).
         """
-        local = Path(image_path).expanduser()
+        raw_path = image_path
+        if raw_path.startswith("file://"):
+            from urllib.parse import urlparse as _urlparse
+            from urllib.request import url2pathname as _url2pathname
+            parsed = _urlparse(raw_path)
+            if parsed.netloc and parsed.netloc != "localhost":
+                if len(parsed.netloc) == 2 and parsed.netloc[1] == ":":
+                    raw_path = _url2pathname(f"{parsed.netloc}{parsed.path}")
+                else:
+                    raw_path = _url2pathname(f"//{parsed.netloc}{parsed.path}")
+            else:
+                raw_path = _url2pathname(parsed.path)
+        elif sys.platform == "win32" and len(raw_path) > 2 and raw_path[0] == "/" and raw_path[2] == ":":
+            raw_path = raw_path[1:]
+        local = Path(raw_path).expanduser()
         if local.is_file():
             return await self._send_file_attachment(
                 chat_id,
@@ -1916,10 +1931,20 @@ class BuzzAdapter(BasePlatformAdapter):
                                 except StopAsyncIteration:
                                     break
                                 except asyncio.TimeoutError:
-                                    raise ConnectionError(
-                                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; "
-                                        "assuming the connection went silent"
-                                    ) from None
+                                    try:
+                                        pong_waiter = await websocket.ping()
+                                        await asyncio.wait_for(pong_waiter, timeout=10.0)
+                                        logger.debug(
+                                            "Buzz: WebSocket idle for %.0fs; keepalive probe succeeded",
+                                            _WS_READ_IDLE_TIMEOUT,
+                                        )
+                                        continue
+                                    except Exception as ping_err:
+                                        raise ConnectionError(
+                                            f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s and "
+                                            f"keepalive probe failed ({ping_err}); "
+                                            "assuming the connection went silent"
+                                        ) from None
                                 try:
                                     message = json.loads(raw)
                                 except (ValueError, TypeError):

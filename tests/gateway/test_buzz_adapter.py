@@ -617,6 +617,7 @@ class TestCliErrorContract:
             "x" * 100_000,
             json.dumps({"error": "relay_error", "message": "x" * 100_000}),
         ],
+        ids=["raw-100k", "json-100k"],
     )
     def test_bounds_untrusted_cli_error_output(self, stderr):
         msg = _cli_error_message(stderr, 2)
@@ -2769,7 +2770,7 @@ class TestInboundMediaLocalisation:
         assert event.message_type == MessageType.DOCUMENT
         assert event.media_types == ["application/pdf"]
         assert len(event.media_urls) == 1
-        assert "/cache/documents/" in event.media_urls[0]
+        assert "/cache/documents/" in Path(event.media_urls[0]).as_posix()
 
     @pytest.mark.asyncio
     async def test_download_failure_preserves_caption_and_alt_text(
