@@ -280,7 +280,11 @@ class Parser {
   private parseAdd(): FormulaValue {
     let left = this.parseMul()
 
-    while (this.peek()?.type === 'op' && (this.peek() as { value: string }).value && '+-'.includes((this.peek() as { value: string }).value)) {
+    while (
+      this.peek()?.type === 'op' &&
+      (this.peek() as { value: string }).value &&
+      '+-'.includes((this.peek() as { value: string }).value)
+    ) {
       const op = (this.take() as { value: string }).value
       const right = this.parseMul()
       left = op === '+' ? asNumber(left) + asNumber(right) : asNumber(left) - asNumber(right)
@@ -292,7 +296,11 @@ class Parser {
   private parseMul(): FormulaValue {
     let left = this.parseUnary()
 
-    while (this.peek()?.type === 'op' && (this.peek() as { value: string }).value && '*/'.includes((this.peek() as { value: string }).value)) {
+    while (
+      this.peek()?.type === 'op' &&
+      (this.peek() as { value: string }).value &&
+      '*/'.includes((this.peek() as { value: string }).value)
+    ) {
       const op = (this.take() as { value: string }).value
       const right = this.parseUnary()
 
@@ -538,7 +546,10 @@ function matchesCriteria(value: FormulaValue | undefined, criteria: FormulaValue
       return cell === '' || cell === 0
     }
 
-    return String(cell).toLowerCase() === rule.toLowerCase() || (isNumeric(cell) && isNumeric(rule) && Number(cell) === Number(rule))
+    return (
+      String(cell).toLowerCase() === rule.toLowerCase() ||
+      (isNumeric(cell) && isNumeric(rule) && Number(cell) === Number(rule))
+    )
   }
 
   return compareValues(cell, '=', rule) === true
@@ -622,7 +633,10 @@ function primitive(value: FormulaValue): Exclude<FormulaValue, number[]> {
 function isNumeric(value: FormulaValue): boolean {
   const primitiveValue = primitive(value)
 
-  return typeof primitiveValue === 'number' || (typeof primitiveValue === 'string' && primitiveValue !== '' && Number.isFinite(Number(primitiveValue)))
+  return (
+    typeof primitiveValue === 'number' ||
+    (typeof primitiveValue === 'string' && primitiveValue !== '' && Number.isFinite(Number(primitiveValue)))
+  )
 }
 
 function asNumber(value: FormulaValue | undefined): number {

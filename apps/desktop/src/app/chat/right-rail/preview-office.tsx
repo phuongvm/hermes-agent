@@ -1,12 +1,6 @@
 import { type ReactNode, useMemo, useState } from 'react'
 
-import type {
-  OfficeBlock,
-  OfficeParagraph,
-  OfficePreview,
-  OfficeTextRun,
-  SpreadsheetSheet
-} from '@/lib/ooxml-preview'
+import type { OfficeBlock, OfficeParagraph, OfficePreview, OfficeTextRun, SpreadsheetSheet } from '@/lib/ooxml-preview'
 import { cn } from '@/lib/utils'
 
 const OFFICE_CALIBRI_STACK = 'Calibri, Carlito, "Segoe UI", "Liberation Sans", Arial, sans-serif'
@@ -65,7 +59,9 @@ function SpreadsheetGrid({ formulaBarLabel, sheets }: { formulaBarLabel: string;
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-2 py-1.5">
-        <span className="w-10 shrink-0 text-center font-mono text-[0.7rem] text-muted-foreground">{address || '—'}</span>
+        <span className="w-10 shrink-0 text-center font-mono text-[0.7rem] text-muted-foreground">
+          {address || '—'}
+        </span>
         <input
           aria-label={formulaBarLabel}
           className="h-7 min-w-0 flex-1 rounded-md border border-border/60 bg-background px-2 font-mono text-[0.75rem] text-foreground outline-none"
@@ -220,11 +216,7 @@ function renderDocumentBlocks(blocks: OfficeBlock[]) {
           style={{ listStyleType: kind === 'number' ? 'decimal' : 'disc' }}
         >
           {items.map((item, itemIndex) => (
-            <li
-              dir={item.dir}
-              key={itemIndex}
-              style={{ direction: item.dir, marginBottom: 4, textAlign: item.align }}
-            >
+            <li dir={item.dir} key={itemIndex} style={{ direction: item.dir, marginBottom: 4, textAlign: item.align }}>
               {item.runs.map((run, runIndex) => (
                 <OfficeRun key={runIndex} run={run} />
               ))}
@@ -251,10 +243,7 @@ function OfficeBlockView({ block }: { block: OfficeBlock }) {
           {block.rows.map((row, rowIndex) => (
             <tr key={rowIndex}>
               {row.map((cell, cellIndex) => (
-                <td
-                  key={cellIndex}
-                  style={{ border: '1px solid #000000', padding: '4px 8px' }}
-                >
+                <td key={cellIndex} style={{ border: '1px solid #000000', padding: '4px 8px' }}>
                   {cell}
                 </td>
               ))}
@@ -266,7 +255,8 @@ function OfficeBlockView({ block }: { block: OfficeBlock }) {
   }
 
   const Tag = block.heading === 1 ? 'h1' : block.heading === 2 ? 'h2' : block.heading === 3 ? 'h3' : 'p'
-  const headingSize = block.heading === 1 ? '16pt' : block.heading === 2 ? '13pt' : block.heading === 3 ? '12pt' : undefined
+  const headingSize =
+    block.heading === 1 ? '16pt' : block.heading === 2 ? '13pt' : block.heading === 3 ? '12pt' : undefined
 
   return (
     <Tag
@@ -307,7 +297,10 @@ function cssFont(name: string | undefined): string | undefined {
 }
 
 function cssFontFamily(name: string): string | undefined {
-  const safe = name.replace(/["';{}\\]/g, '').replace(/\s+/g, ' ').trim()
+  const safe = name
+    .replace(/["';{}\\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
 
   if (!safe || /[:()]/.test(safe)) {
     return undefined

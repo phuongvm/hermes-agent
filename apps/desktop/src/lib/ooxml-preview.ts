@@ -779,7 +779,9 @@ function draftsToRows(cells: DraftCell[], date1904: boolean): SpreadsheetCell[][
 
   const rowCount = Math.min(MAX_ROWS, Math.max(...cells.map(cell => cell.row)) + 1)
   const colCount = Math.min(MAX_COLS, Math.max(...cells.map(cell => cell.col)) + 1)
-  const rows = Array.from({ length: rowCount }, () => Array.from({ length: colCount }, (): SpreadsheetCell => ({ value: '' })))
+  const rows = Array.from({ length: rowCount }, () =>
+    Array.from({ length: colCount }, (): SpreadsheetCell => ({ value: '' }))
+  )
 
   for (const draft of cells) {
     if (draft.row < rowCount && draft.col < colCount) {
@@ -799,16 +801,27 @@ function displayCell(draft: DraftCell, date1904: boolean): SpreadsheetCell {
     cell.formula = draft.formula.replace(/^\s*=/, '')
   }
 
-  if (draft.style.bold) {cell.bold = true}
+  if (draft.style.bold) {
+    cell.bold = true
+  }
 
-  if (draft.style.italic) {cell.italic = true}
+  if (draft.style.italic) {
+    cell.italic = true
+  }
 
-  if (draft.style.color) {cell.color = draft.style.color}
+  if (draft.style.color) {
+    cell.color = draft.style.color
+  }
 
-  if (draft.style.fill) {cell.fill = draft.style.fill}
+  if (draft.style.fill) {
+    cell.fill = draft.style.fill
+  }
 
-  if (draft.style.align) {cell.align = draft.style.align}
-  else if (numeric && draft.raw !== '' && !Number.isNaN(Number(draft.raw))) {cell.align = 'right'}
+  if (draft.style.align) {
+    cell.align = draft.style.align
+  } else if (numeric && draft.raw !== '' && !Number.isNaN(Number(draft.raw))) {
+    cell.align = 'right'
+  }
 
   return cell
 }

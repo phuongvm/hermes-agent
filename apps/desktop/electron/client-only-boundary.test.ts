@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+
 import { describe, test, vi } from 'vitest'
 
 import { runPrimaryBackendStartup } from './primary-backend-startup'
@@ -19,15 +20,19 @@ describe('5.4: Client-Only Startup Boundary Integration Tests', () => {
       kind: 'bootstrap-needed',
       activeRoot: '/fake/root'
     }))
+
     const ensureLocalRuntime = vi.fn(async (backend: any) => ({
       ...backend,
       command: 'hermes'
     }))
+
     const downloadUpstreamInstaller = vi.fn(async () => {
       throw new Error('Upstream installer download should never be called for client-only seed!')
     })
+
     const waitForLocalStart = vi.fn(async () => {})
     const waitForDecision = vi.fn(async () => 'continue-local' as const)
+
     const connectRemote = vi.fn(async (remote: typeof seededRemote) => ({
       baseUrl: remote.baseUrl,
       mode: 'remote' as const,
@@ -76,23 +81,21 @@ describe('5.4: Client-Only Startup Boundary Integration Tests', () => {
 
     const prepareLocalBackend = vi.fn(async () => ({ kind: 'bootstrap-needed' }))
     const ensureLocalRuntime = vi.fn(async () => ({ command: 'hermes' }))
+
     const connectRemote = vi.fn(async () => {
       throw new Error('Connection refused (gateway unreachable: 503 Service Unavailable)')
     })
 
-    await assert.rejects(
-      async () => {
-        await runPrimaryBackendStartup({
-          resolveRemote: vi.fn(async () => unreachableRemote),
-          connectRemote,
-          prepareLocalBackend,
-          ensureLocalRuntime,
-          waitForLocalStart: vi.fn(async () => {}),
-          waitForDecision: vi.fn(async () => 'continue-local' as const)
-        })
-      },
-      /gateway unreachable/
-    )
+    await assert.rejects(async () => {
+      await runPrimaryBackendStartup({
+        resolveRemote: vi.fn(async () => unreachableRemote),
+        connectRemote,
+        prepareLocalBackend,
+        ensureLocalRuntime,
+        waitForLocalStart: vi.fn(async () => {}),
+        waitForDecision: vi.fn(async () => 'continue-local' as const)
+      })
+    }, /gateway unreachable/)
 
     // Critical: Fail-closed boundary — MUST NOT fall through to local preparation!
     assert.equal(prepareLocalBackend.mock.calls.length, 0)

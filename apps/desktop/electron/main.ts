@@ -90,12 +90,6 @@ import {
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap } from './bundle-swap'
-import {
-  InstallStamp,
-  loadInstallStamp as loadInstallStampInternal,
-  resolveHermesVersionLadder,
-  formatClientVersion
-} from './runtime-version'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -349,6 +343,8 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import type { InstallStamp } from './runtime-version'
+import { loadInstallStamp as loadInstallStampInternal, resolveHermesVersionLadder } from './runtime-version'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
