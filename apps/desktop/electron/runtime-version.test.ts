@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+
 import { describe, test } from 'vitest'
 
 import {
@@ -7,8 +8,7 @@ import {
   resolveHermesVersionLadder,
   validateInstallStamp,
   validateStampBuildNumber,
-  validateStampShortCommit,
-  validateStampVersion
+  validateStampShortCommit
 } from './runtime-version'
 
 describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', () => {
@@ -47,6 +47,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         commit: '1234567890abcdef',
         dirty: true
       }
+
       assert.equal(validateInstallStamp(stampTrue, 'path')?.dirty, true)
 
       const stampFalse = {
@@ -54,6 +55,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         commit: '1234567890abcdef',
         dirty: false
       }
+
       assert.equal(validateInstallStamp(stampFalse, 'path')?.dirty, false)
 
       // String "true" should evaluate to false (strict typeof check)
@@ -62,6 +64,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         commit: '1234567890abcdef',
         dirty: 'true'
       }
+
       assert.equal(validateInstallStamp(stampStringTrue, 'path')?.dirty, false)
 
       // String "false" should evaluate to false
@@ -70,6 +73,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         commit: '1234567890abcdef',
         dirty: 'false'
       }
+
       assert.equal(validateInstallStamp(stampStringFalse, 'path')?.dirty, false)
 
       // Numbers or objects evaluate to false
@@ -78,6 +82,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         commit: '1234567890abcdef',
         dirty: 1
       }
+
       assert.equal(validateInstallStamp(stampNumber, 'path')?.dirty, false)
     })
   })
@@ -89,12 +94,14 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         commit: '1234567890abcdef',
         version: '0.21.0'
       }
+
       assert.equal(validateInstallStamp(stampV2, 'path'), null)
 
       const stampV0 = {
         schemaVersion: 0,
         commit: '1234567890abcdef'
       }
+
       assert.equal(validateInstallStamp(stampV0, 'path'), null)
     })
 
@@ -114,6 +121,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
       const mockFs = {
         readFileSync: () => 'NOT_VALID_JSON{{{'
       }
+
       const stamp = loadInstallStamp(['/fake/install-stamp.json'], mockFs as any)
       assert.equal(stamp, null)
     })
@@ -130,6 +138,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         version: '0.21.0',
         buildNumber: -42
       }
+
       assert.equal(validateInstallStamp(stampNegative, 'path')?.buildNumber, null)
     })
 
@@ -143,6 +152,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         version: '0.21.0',
         buildNumber: 100.75
       }
+
       assert.equal(validateInstallStamp(stampFractional, 'path')?.buildNumber, null)
     })
 
@@ -152,6 +162,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
           if (p === '/unreadable/install-stamp.json') {
             throw new Error('EACCES: permission denied')
           }
+
           return JSON.stringify({
             schemaVersion: 1,
             commit: '1234567890abcdef',
@@ -162,18 +173,14 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
       }
 
       // First path unreadable, second path valid -> falls back to candidate 2
-      const stamp = loadInstallStamp(
-        ['/unreadable/install-stamp.json', '/valid/install-stamp.json'],
-        mockFs as any
-      )
+      const stamp = loadInstallStamp(['/unreadable/install-stamp.json', '/valid/install-stamp.json'], mockFs as any)
+
       assert.ok(stamp)
       assert.equal(stamp.version, '0.21.0')
 
       // All paths unreadable -> returns null
-      const failedStamp = loadInstallStamp(
-        ['/unreadable/install-stamp.json'],
-        mockFs as any
-      )
+      const failedStamp = loadInstallStamp(['/unreadable/install-stamp.json'], mockFs as any)
+
       assert.equal(failedStamp, null)
     })
 
@@ -190,6 +197,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         source: 'local' as const,
         path: '/path'
       }
+
       assert.equal(formatClientVersion(cleanStamp), '0.21.0 (28e38b39)')
     })
 
@@ -206,6 +214,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         source: 'local' as const,
         path: '/path'
       }
+
       assert.equal(formatClientVersion(dirtyStamp), '0.21.0 (28e38b39) [DIRTY]')
     })
   })
@@ -216,6 +225,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         existsSync: () => true,
         readFileSync: () => '__version__ = "0.21.0.dev1"\n'
       }
+
       const stamp = {
         schemaVersion: 1,
         version: '0.21.0',
@@ -235,6 +245,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         appVersion: '0.17.0',
         fsModule: mockFs as any
       })
+
       assert.equal(version, '0.21.0.dev1')
     })
 
@@ -255,7 +266,9 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
       // No local python source tree available
       const mockFs = {
         existsSync: () => false,
-        readFileSync: () => { throw new Error('File not found') }
+        readFileSync: () => {
+          throw new Error('File not found')
+        }
       }
 
       const version = resolveHermesVersionLadder({
@@ -264,6 +277,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         appVersion: '0.17.0',
         fsModule: mockFs as any
       })
+
       assert.equal(version, '0.21.0 (28e38b39)')
     })
 
@@ -286,6 +300,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         installStamp: dirtyStamp,
         appVersion: '0.17.0'
       })
+
       assert.equal(version, '0.21.0 (28e38b39) [DIRTY]')
     })
 
@@ -296,6 +311,7 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         installStamp: null,
         appVersion: '0.17.0'
       })
+
       assert.equal(vMissing, '0.17.0')
 
       // 2. Stamp with missing/invalid version
@@ -311,11 +327,13 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         source: 'local' as const,
         path: '/path'
       }
+
       const vInvalidVersion = resolveHermesVersionLadder({
         updateRoot: null,
         installStamp: invalidVersionStamp,
         appVersion: '0.17.0'
       })
+
       assert.equal(vInvalidVersion, '0.17.0')
 
       // 3. Stamp with missing/invalid shortCommit
@@ -331,11 +349,13 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
         source: 'local' as const,
         path: '/path'
       }
+
       const vInvalidSha = resolveHermesVersionLadder({
         updateRoot: null,
         installStamp: invalidShaStamp,
         appVersion: '0.17.0'
       })
+
       assert.equal(vInvalidSha, '0.17.0')
     })
   })

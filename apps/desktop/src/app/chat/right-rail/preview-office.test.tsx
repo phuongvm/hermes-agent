@@ -117,7 +117,7 @@ describe('OfficePreviewView', () => {
       <OfficePreviewView
         preview={{
           kind: 'spreadsheet',
-          sheets: [{ name: 'Revenue', rows: cells([['Ada']])}]
+          sheets: [{ name: 'Revenue', rows: cells([['Ada']]) }]
         }}
         {...labels}
       />
@@ -136,7 +136,7 @@ describe('OfficePreviewView', () => {
       <OfficePreviewView
         preview={{
           kind: 'spreadsheet',
-          sheets: [{ name: 'Revenue', rows: cells([['Ada', 'Bob', 'Cara']])}]
+          sheets: [{ name: 'Revenue', rows: cells([['Ada', 'Bob', 'Cara']]) }]
         }}
         {...labels}
       />
@@ -153,7 +153,7 @@ describe('OfficePreviewView', () => {
       <OfficePreviewView
         preview={{
           kind: 'spreadsheet',
-          sheets: [{ name: 'Revenue', rows: cells([['Ada']])}]
+          sheets: [{ name: 'Revenue', rows: cells([['Ada']]) }]
         }}
         {...labels}
       />

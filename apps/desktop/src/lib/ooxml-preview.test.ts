@@ -547,9 +547,7 @@ describe('parseOfficePreview docx', () => {
     expect(preview?.kind).toBe('document')
 
     if (preview?.kind === 'document') {
-      expect(preview.blocks).toEqual([
-        { runs: [{ text: '<img src=x onerror=alert(1)>' }], type: 'paragraph' }
-      ])
+      expect(preview.blocks).toEqual([{ runs: [{ text: '<img src=x onerror=alert(1)>' }], type: 'paragraph' }])
     }
   })
 })
@@ -565,9 +563,7 @@ describe('parseOfficePreview guards', () => {
 
   it('does not claim PowerPoint as a native office preview', async () => {
     expect(officePreviewKind('.pptx')).toBeNull()
-    await expect(
-      parseOfficePreview(zipFiles({ 'ppt/slides/slide1.xml': '<p:sld/>' }), '.pptx')
-    ).resolves.toBeNull()
+    await expect(parseOfficePreview(zipFiles({ 'ppt/slides/slide1.xml': '<p:sld/>' }), '.pptx')).resolves.toBeNull()
   })
 
   it('rejects a deflate bomb whose true size exceeds the part cap', async () => {
