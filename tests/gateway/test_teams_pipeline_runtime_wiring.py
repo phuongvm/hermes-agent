@@ -69,12 +69,10 @@ def test_build_pipeline_runtime_skips_sender_when_adapter_layer_is_unavailable(m
     )
     monkeypatch.setitem(
         sys.modules,
-        "plugins.platforms.teams.adapter",
-        ModuleType("plugins.platforms.teams.adapter"),
+        "plugins.platforms.teams.summary_writer",
+        ModuleType("plugins.platforms.teams.summary_writer"),
     )
 
     runtime = build_pipeline_runtime(gateway)
 
     assert runtime.teams_sender is None
-
-

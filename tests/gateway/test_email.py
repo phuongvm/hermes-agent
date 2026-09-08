@@ -238,7 +238,7 @@ class TestDispatchMessage(unittest.TestCase):
     def test_image_attachment_sets_photo_type(self):
         """Email with image attachment should set message type to PHOTO."""
         import asyncio
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         adapter = self._make_adapter()
         captured_events = []
 
@@ -939,6 +939,7 @@ class TestImapIdExtensionForNetEase(unittest.TestCase):
         adapter = self._make_adapter()
 
         mock_imap = MagicMock()
+        mock_imap.capabilities = ("IMAP4REV1", "ID", "UIDPLUS")
         mock_imap.uid.return_value = ("OK", [b""])
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
@@ -1124,3 +1125,15 @@ class TestSenderAuthentication(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPausedEmailDelivery(unittest.TestCase):
+    @patch.dict(os.environ, {"EMAIL_DISABLE_AUTO_REPLY": "true"})
+    def test_paused_smtp_raises_without_sending(self):
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        adapter = object.__new__(EmailAdapter)
+        adapter._connect_smtp = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "EMAIL_DISABLE_AUTO_REPLY"):
+            adapter._smtp_send(MIMEMultipart())
+        adapter._connect_smtp.assert_not_called()

@@ -8,6 +8,11 @@ import json
 import logging
 import os
 import re
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 import shutil
 import tempfile
 import uuid
@@ -343,7 +348,7 @@ class TeamsMeetingPipeline:
 
     async def run_notification(self, notification: dict[str, Any]) -> TeamsMeetingPipelineJob:
         job = self.create_job_from_notification(notification)
-        if job.status in TERMINAL_PIPELINE_STATES:
+        if job.status in TERMINAL_PIPELINE_STATES or job.status == "pending_review":
             return job
         if job.status in ACTIVE_PIPELINE_STATES - {"received"}:
             # Stale-job recovery: if the job has been stuck in an active state
@@ -754,6 +759,18 @@ class TeamsMeetingPipeline:
         return payload
 
     async def _write_sinks(self, job: TeamsMeetingPipelineJob, payload: TeamsMeetingSummaryPayload) -> None:
+        failures = []
+        for sink_name, settings, writer in (
+            ("notion", self.config.notion, self.notion_writer),
+            ("linear", self.config.linear, self.linear_writer),
+            ("teams", self.config.teams_delivery, self.teams_sender),
+        ):
+            if settings and settings.get("enabled") and writer is None:
+                failures.append(sink_name)
+                self.store.upsert_sink_record(
+                    f"error:{sink_name}:{payload.meeting_ref.meeting_id}",
+                    {"error": "Configured summary writer is unavailable"},
+                )
         if self.config.notion and self.config.notion.get("enabled") and self.notion_writer:
             try:
                 job = self._persist_job(job, status="writing_notion")
@@ -762,6 +779,7 @@ class TeamsMeetingPipeline:
                 result = await self.notion_writer.write_summary(payload, self.config.notion, existing)
                 self.store.upsert_sink_record(sink_key, result)
             except Exception as exc:
+                failures.append("notion")
                 logger.warning("Teams pipeline Notion sink failed: %s", exc)
                 self.store.upsert_sink_record(f"error:notion:{payload.meeting_ref.meeting_id}", {"error": str(exc)})
 
@@ -773,6 +791,7 @@ class TeamsMeetingPipeline:
                 result = await self.linear_writer.write_summary(payload, self.config.linear, existing)
                 self.store.upsert_sink_record(sink_key, result)
             except Exception as exc:
+                failures.append("linear")
                 logger.warning("Teams pipeline Linear sink failed: %s", exc)
                 self.store.upsert_sink_record(f"error:linear:{payload.meeting_ref.meeting_id}", {"error": str(exc)})
 
@@ -787,8 +806,12 @@ class TeamsMeetingPipeline:
                     result = await self.teams_sender(payload, self.config.teams_delivery, existing)
                 self.store.upsert_sink_record(sink_key, result)
             except Exception as exc:
+                failures.append("teams")
                 logger.warning("Teams pipeline Teams sink failed: %s", exc)
                 self.store.upsert_sink_record(f"error:teams:{payload.meeting_ref.meeting_id}", {"error": str(exc)})
+
+        if failures:
+            raise TeamsPipelineError(f"Summary delivery failed: {', '.join(failures)}")
 
     async def _notify_pending_review(self, job: TeamsMeetingPipelineJob, payload: TeamsMeetingSummaryPayload) -> None:
         logger.info("Meeting %s is pending review. Job ID: %s", payload.meeting_ref.meeting_id, job.job_id)
@@ -1117,7 +1140,7 @@ def _load_summary_template(template_path: str | None = None) -> dict[str, Any] |
         logger.warning("Teams pipeline: PyYAML not installed; cannot load template from %s", path)
         return None
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             template = yaml.safe_load(f)
     except FileNotFoundError:
         logger.warning("Teams pipeline: summary template not found at %s — falling back to hardcoded behavior", path)

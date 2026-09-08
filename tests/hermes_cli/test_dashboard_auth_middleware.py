@@ -384,3 +384,12 @@ def test_all_providers_unreachable_returns_503(_gated_state):
     assert "unreachable" in r.text.lower()
 
 
+
+
+@pytest.mark.parametrize("peer, expected_status", [("127.0.0.1", 200), ("::1", 200), ("192.0.2.1", 401), ("testclient", 401), ("", 401)])
+@pytest.mark.parametrize("header", ["Authorization", "X-Hermes-Session-Token"])
+def test_gated_process_token_requires_real_loopback_peer(gated_app, peer, expected_status, header):
+    credential = f"Bearer {web_server._SESSION_TOKEN}" if header == "Authorization" else web_server._SESSION_TOKEN
+    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev", client=(peer, 50000))
+    response = client.get("/api/auth/me", headers={header: credential, "X-Forwarded-For": "127.0.0.1"})
+    assert response.status_code == expected_status

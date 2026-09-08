@@ -99,7 +99,7 @@ def test_build_pipeline_runtime_reuses_existing_teams_adapter_surface(monkeypatc
 
     monkeypatch.setattr(runtime_module, "build_graph_client", lambda: object())
     monkeypatch.setattr(runtime_module, "resolve_teams_pipeline_store_path", lambda: tmp_path / "teams-store.json")
-    monkeypatch.setattr("plugins.platforms.teams.adapter.TeamsSummaryWriter", FakeWriter)
+    monkeypatch.setattr("plugins.platforms.teams.summary_writer.TeamsSummaryWriter", FakeWriter)
 
     gateway = SimpleNamespace(
         config=GatewayConfig(
@@ -168,7 +168,6 @@ def test_store_persists_subscription_event_and_job_state(tmp_path):
         "sub-1",
         {"client_state": "abc", "resource": "communications/onlineMeetings"},
     )
-    store.record_event_timestamp("evt-1", "2026-05-03T19:30:00Z")
     store.upsert_job("job-1", {"status": "received", "event_id": "evt-1"})
     store.upsert_sink_record("notion:meeting-1", {"page_id": "page-1"})
 
@@ -180,7 +179,6 @@ def test_store_persists_subscription_event_and_job_state(tmp_path):
     assert subscription is not None
     assert subscription["subscription_id"] == "sub-1"
     assert subscription["client_state"] == "abc"
-    assert reloaded.get_event_timestamp("evt-1") == "2026-05-03T19:30:00Z"
     assert job is not None
     assert job["status"] == "received"
     assert sink is not None
@@ -430,7 +428,7 @@ class TestTeamsMeetingPipeline:
         assert summarize_calls == 1
         assert len(store.list_jobs()) == 1
         receipt_key = TeamsPipelineStore.build_notification_receipt_key(notification)
-        assert store.has_notification_receipt(receipt_key) is True
+        assert store.record_notification_receipt(receipt_key) is False
 
 
 def test_parse_graph_meeting_resource_reads_quoted_users_transcript_path():
@@ -690,3 +688,38 @@ async def test_resolve_meeting_reference_refuses_transcript_id_without_join_url(
             BoomGraphClient(),
             meeting_id="ktVizInGAAAA-TranscriptV2=",
         )
+
+
+@pytest.mark.asyncio
+async def test_pending_review_is_not_restarted_by_stale_recovery(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import AsyncMock
+
+    pipeline = TeamsMeetingPipeline(graph_client=FakeGraphClient(), store=TeamsPipelineStore(tmp_path / "review.json"))
+    notification = {"id": "review-event", "resource": "communications/onlineMeetings/review-meeting", "resourceData": {"id": "review-meeting"}}
+    job = pipeline.create_job_from_notification(notification)
+    pipeline.store.upsert_job(job.job_id, {**job.to_dict(), "status": "pending_review", "updated_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()})
+    runner = AsyncMock()
+    monkeypatch.setattr(pipeline, "run_job", runner)
+    result = await pipeline.run_notification(notification)
+    assert result.status == "pending_review"
+    runner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_available", [True, False])
+async def test_delivery_failure_cannot_be_reported_as_success(tmp_path, writer_available):
+    from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
+    from plugins.teams_pipeline.pipeline import TeamsPipelineError
+
+    async def failed_sender(*args):
+        raise RuntimeError("delivery unavailable")
+
+    pipeline = TeamsMeetingPipeline(graph_client=FakeGraphClient(), store=TeamsPipelineStore(tmp_path / "delivery.json"), config={"teams_delivery": {"enabled": True}}, teams_sender=failed_sender if writer_available else None)
+    job = pipeline.create_job_from_notification({"id": "delivery-event", "resource": "communications/onlineMeetings/delivery-meeting", "resourceData": {"id": "delivery-meeting"}})
+    payload = TeamsMeetingSummaryPayload(meeting_ref=TeamsMeetingRef(meeting_id="delivery-meeting"), title="Summary", summary="Result")
+    with pytest.raises(TeamsPipelineError, match="Summary delivery failed: teams"):
+        await pipeline._write_sinks(job, payload)
+    assert pipeline.store.get_job(job.job_id)["status"] != "completed"
+    expected_error = "delivery unavailable" if writer_available else "Configured summary writer is unavailable"
+    assert pipeline.store.get_sink_record("error:teams:delivery-meeting")["error"] == expected_error

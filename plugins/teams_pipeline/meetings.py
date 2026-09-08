@@ -24,6 +24,8 @@ _COMM_MEETING_RE = re.compile(
 )
 _TRANSCRIPT_RE = re.compile(r"(?i)/transcripts(?:\('([^']+)'\)|/([^/'?]+))")
 _RECORDING_RE = re.compile(r"(?i)/recordings(?:\('([^']+)'\)|/([^/'?]+))")
+_RECAP_URL_PATTERN = re.compile(r"https?://teams\.microsoft\.com/l/meetingrecap(?:[/?#]|$)", re.I)
+_RECAP_PARAM_RE = re.compile(r"[?&]([A-Za-z][A-Za-z0-9]*)=([^&#]*)")
 _RESOURCE_SENTINELS = frozenset(
     {
         "getalltranscripts",
@@ -734,7 +736,20 @@ async def resolve_meeting_reference(
     join_web_url: str | None = None,
     tenant_id: str | None = None,
     organizer_user_id: str | None = None,
+    recap_url: str | None = None,
+    call_record_id: str | None = None,
 ) -> TeamsMeetingRef:
+    if recap_url:
+        recap = parse_recap_url(recap_url)
+        if not recap:
+            raise TeamsMeetingNotFoundError("Invalid Teams recap URL")
+        call_record_id = call_record_id or recap.get("callId")
+        organizer_user_id = organizer_user_id or recap.get("organizerId")
+        tenant_id = tenant_id or recap.get("tenantId")
+    if call_record_id and not meeting_id:
+        resolved = await _resolve_meeting_from_call_record_id(client, call_record_id, tenant_id=tenant_id)
+        if resolved is not None:
+            return resolved
     if meeting_id and looks_like_transcript_id(meeting_id):
         if join_web_url:
             meeting_id = None
@@ -785,48 +800,7 @@ async def resolve_meeting_reference(
             organizer_user_id=organizer_user_id,
         )
 
-        # For short meet URLs, skip HTTP redirect resolution (goes to launcher page)
-        # and go straight to Graph API resolution + calendar/call records fallback
-        if not is_short:
-            resolved_url = _resolve_short_meet_url(join_web_url)
-            if resolved_url != join_web_url:
-                join_web_url = resolved_url
-
-        try:
-            return await _resolve_meeting_from_join_url(client, join_web_url=join_web_url, tenant_id=tenant_id)
-        except TeamsMeetingNotFoundError:
-            # For short meet URLs, try multiple resolution strategies
-            if is_short and numeric_id:
-                # Strategy 1: Search call records for matching numeric ID
-                short_ref = await _resolve_short_meet_from_call_records(
-                    client, numeric_id, tenant_id=tenant_id
-                )
-                if short_ref is not None:
-                    return short_ref
-
-                # Strategy 2: Search calendar for matching numeric ID
-                calendar_ref = await _resolve_short_meet_from_calendar(
-                    client, numeric_id, tenant_id=tenant_id
-                )
-                if calendar_ref is not None:
-                    return calendar_ref
-
-            # Fallback: try token-based call record search
-            bridged_ref = await _resolve_meeting_from_call_records(
-                client,
-                meeting_token=_extract_meeting_token(original_url) or original_url,
-                tenant_id=tenant_id,
-            )
-            if bridged_ref is not None:
-                return bridged_ref
-            return _pending_join_meeting_ref(original_url, tenant_id=tenant_id)
-
-    raise ValueError(
-        f"Cannot resolve meeting reference. "
-        f"recap_url='{recap_url}' is not a recognized Teams meeting URL. "
-        f"Supported formats: recap URL (/l/meetingrecap?...&callId=), "
-        f"short meet URL (/meet/NUMERIC_ID), or join URL (/l/meetup-join/...)"
-    )
+    raise ValueError("Either meeting_id, join_web_url, recap_url, or call_record_id is required.")
 
 
 async def _resolve_artifact_meeting_ref(

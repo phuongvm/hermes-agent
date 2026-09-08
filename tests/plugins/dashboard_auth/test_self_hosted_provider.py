@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 import plugins.dashboard_auth.self_hosted as oidc_plugin
+from plugins.dashboard_auth._shared import JWKS_CACHE_SECONDS
 from hermes_cli.dashboard_auth import (
     InvalidCodeError,
     LoginStart,
@@ -306,7 +307,7 @@ class TestStartLogin:
         assert params["response_type"] == "code"
         assert params["client_id"] == _CLIENT_ID
         assert params["redirect_uri"] == "https://hermes.example/auth/callback"
-        assert params["scope"] == "openid profile email"
+        assert params["scope"] == "openid profile email offline_access"
         assert params["code_challenge_method"] == "S256"
         assert "state" in params
         assert "code_challenge" in params
@@ -584,7 +585,7 @@ class TestVerifySession:
         client_cls.assert_called_once_with(
             _DISCOVERY_DOC["jwks_uri"],
             cache_keys=True,
-            lifespan=oidc_plugin._JWKS_CACHE_SECONDS,
+            lifespan=JWKS_CACHE_SECONDS,
             headers={
                 "Accept": "application/json",
                 "User-Agent": "HermesAgent/1.0",
@@ -649,7 +650,7 @@ class TestPluginRegister:
         assert isinstance(registered, oidc_plugin.SelfHostedOIDCProvider)
         assert registered._issuer == _ISSUER
         assert registered._client_id == _CLIENT_ID
-        assert registered._scopes == "openid profile email"
+        assert registered._scopes == "openid profile email offline_access"
         assert oidc_plugin.LAST_SKIP_REASON == ""
 
 
@@ -726,4 +727,3 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
-

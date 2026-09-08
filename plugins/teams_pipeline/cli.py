@@ -333,7 +333,7 @@ def _cmd_run(args) -> None:
     teams_delivery = pipeline_config.get("teams_delivery", {})
     if teams_config and teams_config.enabled and teams_delivery.get("enabled"):
         try:
-            from plugins.platforms.teams.adapter import TeamsSummaryWriter
+            from plugins.platforms.teams.summary_writer import TeamsSummaryWriter
             teams_sender = TeamsSummaryWriter(platform_config=teams_config)
         except ImportError:
             pass
@@ -367,6 +367,8 @@ def _cmd_fetch(args) -> None:
             join_web_url=join_web_url,
             tenant_id=tenant_id,
             organizer_user_id=organizer_user_id,
+            recap_url=recap_url,
+            call_record_id=call_record_id,
         )
     )
     transcript_artifact, transcript_text = _run_async(fetch_preferred_transcript_text(client, meeting_ref))
@@ -610,7 +612,7 @@ def _cmd_deliver(args) -> None:
     teams_delivery = pipeline_config.get("teams_delivery", {})
     if teams_config and teams_config.enabled and teams_delivery.get("enabled"):
         try:
-            from plugins.platforms.teams.adapter import TeamsSummaryWriter
+            from plugins.platforms.teams.summary_writer import TeamsSummaryWriter
             teams_sender = TeamsSummaryWriter(platform_config=teams_config)
         except ImportError:
             pass

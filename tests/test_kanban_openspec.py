@@ -118,3 +118,60 @@ def test_concurrent_inserts_race_condition(tmp_path):
         cursor = db._conn.execute("SELECT COUNT(*) FROM openspec_registry")
         count = cursor.fetchone()[0]
         assert count == 10
+
+
+@pytest.fixture
+def board_conn(tmp_path):
+    from hermes_cli.kanban_db_connect import connect
+
+    connection = connect(tmp_path / "kanban.db")
+    yield connection
+    connection.close()
+
+
+def test_board_migration_and_rollback_remove_contract_trigger(board_conn):
+    from hermes_cli import kanban_db
+    from hermes_state_common import activate_openspec_enforcement, rollback_openspec_enforcement
+
+    run_openspec_migration(board_conn)
+    run_openspec_migration(board_conn)
+    task_id = kanban_db.create_task(board_conn, title="Contract task", initial_status="running")
+    board_conn.execute(
+        "UPDATE tasks SET openspec_contract=?, openspec_contract_hash=? WHERE id=?",
+        ("contract", "hash", task_id),
+    )
+    board_conn.commit()
+    activate_openspec_enforcement(board_conn, "commander")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        board_conn.execute("UPDATE tasks SET openspec_contract='changed' WHERE id=?", (task_id,))
+    board_conn.rollback()
+    rollback_openspec_enforcement(board_conn, "commander")
+    board_conn.execute("UPDATE tasks SET openspec_contract='changed' WHERE id=?", (task_id,))
+    board_conn.commit()
+    assert board_conn.execute("SELECT openspec_contract FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "changed"
+
+
+def test_board_transition_validates_inside_transaction(board_conn, monkeypatch):
+    from hermes_cli import kanban_db
+    from hermes_state_common import activate_openspec_enforcement
+
+    task_id = kanban_db.create_task(board_conn, title="Guarded task", initial_status="running")
+    board_conn.execute("UPDATE tasks SET openspec_contract='contract' WHERE id=?", (task_id,))
+    board_conn.commit()
+    activate_openspec_enforcement(board_conn, "commander")
+    original = kanban_db._validate_openspec_transition
+    transactions = []
+
+    def validate(connection, current_task_id):
+        transactions.append(connection.in_transaction)
+        return original(connection, current_task_id)
+
+    monkeypatch.setattr(kanban_db, "_validate_openspec_transition", validate)
+    before_status = board_conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    before_events = board_conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+    with pytest.raises(ValueError, match="OpenSpec.*hash"):
+        kanban_db.complete_task(board_conn, task_id)
+    assert transactions == [True]
+    assert board_conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == before_status
+    assert board_conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == before_events
+    assert not board_conn.in_transaction

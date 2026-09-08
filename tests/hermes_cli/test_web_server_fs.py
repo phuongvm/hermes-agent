@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import web_server
+from hermes_cli import web_server, web_server_files
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -101,8 +101,7 @@ def test_fs_list_filters_configured_hidden_dirs(client, tmp_path, monkeypatch):
     (root / "$RECYCLE.BIN").mkdir()
 
     monkeypatch.setattr(
-        web_server,
-        "load_config_readonly",
+        web_server_files, "load_config_readonly",
         lambda: {"fs": {"hidden_dirs": ["_config", "$RECYCLE.BIN"]}},
     )
 
@@ -124,8 +123,7 @@ def test_fs_direct_access_to_hidden_dirs_returns_403(client, tmp_path, monkeypat
     secret_file.write_text("key: secret", encoding="utf-8")
 
     monkeypatch.setattr(
-        web_server,
-        "load_config_readonly",
+        web_server_files, "load_config_readonly",
         lambda: {"fs": {"hidden_dirs": ["_config"]}},
     )
 
@@ -146,7 +144,7 @@ def test_fs_windows_root_normalizes_to_default_cwd(client, tmp_path, monkeypatch
     default_dir.mkdir()
     (default_dir / "app.py").write_text("print('hello')", encoding="utf-8")
 
-    monkeypatch.setattr(web_server, "_fs_default_cwd", lambda: str(default_dir))
+    monkeypatch.setattr(web_server_files, "_fs_default_cwd", lambda: str(default_dir))
     monkeypatch.setattr(web_server.os, "name", "nt")
 
     response = client.get("/api/fs/list", params={"path": "/"})
@@ -164,8 +162,7 @@ def test_fs_reads_from_live_config_defaults(client, tmp_path, monkeypatch):
 
     # When config has fs.hidden_dirs: ["_config"]
     monkeypatch.setattr(
-        web_server,
-        "load_config_readonly",
+        web_server_files, "load_config_readonly",
         lambda: {"fs": {"hidden_dirs": ["_config"]}},
     )
     res = client.get("/api/fs/list", params={"path": str(root)})
@@ -177,5 +174,3 @@ def test_fs_reads_from_live_config_defaults(client, tmp_path, monkeypatch):
     # Direct access returns 403
     forbidden_res = client.get("/api/fs/list", params={"path": str(root / "_config")})
     assert forbidden_res.status_code == 403
-
-
