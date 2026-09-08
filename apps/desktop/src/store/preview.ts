@@ -1,6 +1,5 @@
 import { atom, computed } from 'nanostores'
 
-import { officePreviewKind } from '@/lib/ooxml-preview'
 import { persistentAtom } from '@/lib/persisted'
 import { readKey } from '@/lib/storage'
 import { normalize } from '@/lib/text'
@@ -38,7 +37,7 @@ export interface PreviewTarget {
   language?: string
   mimeType?: string
   path?: string
-  previewKind?: 'binary' | 'document' | 'html' | 'image' | 'pdf' | 'spreadsheet' | 'text'
+  previewKind?: 'binary' | 'html' | 'image' | 'pdf' | 'text'
   renderMode?: 'preview' | 'source'
   source: string
   /** Runtime-only target that cannot be restored from persisted state. */
@@ -121,26 +120,11 @@ function isPdfFileTarget(target: PreviewTarget): boolean {
 export function decodePreviewTabs(raw: string): PreviewTab[] {
   const parsed = JSON.parse(raw) as unknown
 
-  return (Array.isArray(parsed) ? parsed.filter(isPreviewTab) : []).map(tab => {
-    if (isPdfFileTarget(tab.target) && tab.target.previewKind === 'binary') {
-      return { ...tab, target: { ...tab.target, previewKind: 'pdf' as const } }
-    }
-
-    const officeKind = officePreviewKind(officeExtensionForTarget(tab.target))
-
-    if (officeKind && (tab.target.previewKind === 'binary' || tab.target.previewKind === 'text')) {
-      return { ...tab, target: { ...tab.target, binary: false, previewKind: officeKind } }
-    }
-
-    return tab
-  })
-}
-
-function officeExtensionForTarget(target: PreviewTarget): string {
-  const raw = target.path || target.source || ''
-  const idx = raw.lastIndexOf('.')
-
-  return idx >= 0 ? raw.slice(idx).toLowerCase() : ''
+  return (Array.isArray(parsed) ? parsed.filter(isPreviewTab) : []).map(tab =>
+    isPdfFileTarget(tab.target) && tab.target.previewKind === 'binary'
+      ? { ...tab, target: { ...tab.target, previewKind: 'pdf' as const } }
+      : tab
+  )
 }
 
 export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {

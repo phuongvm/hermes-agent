@@ -2742,9 +2742,6 @@ export interface Translations {
     largeBody: (label: string, size: string) => string
     previewAnyway: string
     truncated: string
-    officeTruncated: string
-    officeParseError: string
-    formulaBarLabel: string
     noInlineTitle: string
     noInlineBody: (mimeType: string) => string
     edit: string

@@ -1,7 +1,6 @@
 import DOMPurify from 'dompurify'
 
 import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileText } from '@/lib/desktop-fs'
-import { officePreviewKind } from '@/lib/ooxml-preview'
 import type { PreviewTarget } from '@/store/preview'
 
 const HTML_EXTENSIONS = new Set(['.htm', '.html'])
@@ -210,7 +209,6 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
   const isHtml = HTML_EXTENSIONS.has(ext)
   const isImage = IMAGE_EXTENSIONS.has(ext)
   const isPdf = PDF_EXTENSIONS.has(ext)
-  const officeKind = officePreviewKind(ext)
 
   return {
     kind: 'file',
@@ -218,9 +216,9 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
     language: LANGUAGE_BY_EXT[ext] || 'text',
     path,
     // Renderer fallback can't stat/sniff without reading; assume text unless
-    // image/html/pdf/office extension says otherwise. LocalFilePreview still
-    // guards binary/large files when readFileText/readFileDataUrl returns metadata.
-    previewKind: isHtml ? 'html' : isImage ? 'image' : isPdf ? 'pdf' : officeKind || 'text',
+    // image/html/pdf extension says otherwise. LocalFilePreview still guards
+    // binary/large files when readFileText/readFileDataUrl returns metadata.
+    previewKind: isHtml ? 'html' : isImage ? 'image' : isPdf ? 'pdf' : 'text',
     source: raw,
     url: pathToFileUrl(path)
   }
@@ -232,9 +230,7 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
     !target ||
     target.kind !== 'file' ||
     target.previewKind === 'image' ||
-    target.previewKind === 'pdf' ||
-    target.previewKind === 'spreadsheet' ||
-    target.previewKind === 'document'
+    target.previewKind === 'pdf'
   ) {
     return target
   }

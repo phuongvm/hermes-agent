@@ -1258,7 +1258,7 @@ export interface HermesPreviewTarget {
   language?: string
   mimeType?: string
   path?: string
-  previewKind?: 'binary' | 'document' | 'html' | 'image' | 'pdf' | 'spreadsheet' | 'text'
+  previewKind?: 'binary' | 'html' | 'image' | 'pdf' | 'text'
   renderMode?: 'preview' | 'source'
   source: string
   url: string
