@@ -270,14 +270,9 @@ import {
   resolveOauthRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
-import {
-  nativeRefreshUrl,
-  type NativeTokenSet,
-  parseTokenResponse,
-  resolveLoginStrategy,
-  tokenNeedsRefresh
-} from './native-oauth'
+import { nativeRefreshUrl, type NativeTokenSet, parseTokenResponse, resolveLoginStrategy } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
+import { createNativeTokenRefresher } from './native-token-refresh'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
@@ -1335,7 +1330,7 @@ protocol.registerSchemesAsPrivileged([
 
 function registerMediaProtocol() {
   const handler = createMediaProtocolHandler({
-    ensureRemoteBearer: baseUrl => ensureNativeAccessToken(baseUrl).catch(() => null),
+    ensureRemoteBearer: baseUrl => ensureNativeAccessToken(baseUrl),
     fetchLocal: (resolvedPath, headers, method) =>
       electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
         bypassCustomProtocolHandlers: true,
@@ -6477,7 +6472,7 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
 // answers before the SPA catch-all). `probeIsCredentialed` tells
 // waitForHermesReady how to read a 401 — rejected session vs gated route.
 async function buildReadinessHealthProbe(baseUrl, authMode, token) {
-  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl) : null
   const probeAuth = resolveReadinessProbeAuth(authMode, nativeAt, token)
 
   if (probeAuth.kind === 'bearer') {
@@ -7934,47 +7929,17 @@ function postJsonNoAuth(url: string, body: unknown, opts: any = {}) {
 // Return a valid native access token for baseUrl, refreshing via
 // /auth/native/refresh if the stored one is at/near expiry. Returns null when
 // there are no tokens or the refresh is terminally rejected (caller re-logins).
-async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
-  const tokens = _loadNativeTokens(baseUrl)
-
-  if (!tokens) {
-    return null
-  }
-
-  if (!tokenNeedsRefresh(tokens, Math.floor(Date.now() / 1000))) {
-    return tokens.accessToken
-  }
-
-  if (!tokens.refreshToken) {
-    // Access token expired and no RT to rotate — force re-login.
-    _clearNativeTokens(baseUrl)
-
-    return null
-  }
-
-  try {
-    const body = await postJsonNoAuth(
+const ensureNativeAccessToken = createNativeTokenRefresher({
+  load: _loadNativeTokens,
+  store: _storeNativeTokens,
+  clear: _clearNativeTokens,
+  refresh: (baseUrl, tokens) =>
+    postJsonNoAuth(
       nativeRefreshUrl(baseUrl),
       { refresh_token: tokens.refreshToken, provider: tokens.provider },
       { timeoutMs: 10_000 }
     )
-
-    const rotated = parseTokenResponse(body)
-    _storeNativeTokens(baseUrl, rotated)
-
-    return rotated.accessToken
-  } catch (error: any) {
-    // A 401 means the RT is dead (session_expired) — drop tokens so the UI
-    // prompts a fresh native login. A 503/transient keeps them for a retry.
-    if (error && error.statusCode === 401) {
-      _clearNativeTokens(baseUrl)
-
-      return null
-    }
-
-    throw error
-  }
-}
+})
 
 // OAuth-session download that streams the response body straight to a
 // user-selected destination (via finalizeGatewayDownload). The connect timeout
@@ -8145,8 +8110,7 @@ interface GatewayFileSavePayload {
 }
 
 async function gatedFileAuth(connection: GatewayFileConnection) {
-  const nativeAt =
-    connection.authMode === 'oauth' ? await ensureNativeAccessToken(connection.baseUrl).catch(() => null) : null
+  const nativeAt = connection.authMode === 'oauth' ? await ensureNativeAccessToken(connection.baseUrl) : null
 
   return resolveGatedDownloadAuth(connection.authMode, nativeAt, connection.token)
 }
@@ -8268,7 +8232,7 @@ async function saveGatewayFileViaDataUrl(
 async function mintGatewayWsTicket(baseUrl, headers = {}) {
   return withTransientRetries(async () => {
     // Native flow: mint the ticket with the bearer token, no cookie involved.
-    const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(baseUrl)
 
     if (nativeAt) {
       const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
@@ -11017,7 +10981,7 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
   if (conn.authMode === 'oauth') {
     // Native RFC 8252 flow: authenticate with the bearer token (cookieless)
     // when we hold one for this gateway; otherwise use the cookie partition.
-    const nativeAt = await ensureNativeAccessToken(conn.baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(conn.baseUrl)
 
     if (nativeAt) {
       return fetchJson(url, null, { ...opts, bearer: nativeAt, headers: conn.headers })
@@ -11260,7 +11224,7 @@ async function fetchConnectionStatus(baseUrl, authMode, token, headers = {}) {
     // an authenticated request, and if neither credential works the probe
     // fails, which is the correct answer for a gateway we cannot reach with
     // the credentials we hold.
-    const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(baseUrl)
 
     if (nativeAt) {
       return fetchJson(url, null, { timeoutMs: 8_000, bearer: nativeAt, headers })
@@ -15951,7 +15915,7 @@ async function fetchJsonForBackend(
       throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
     }
 
-    const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl)
 
     if (nativeAt) {
       return fetchJson(url, null, {
@@ -16046,6 +16010,22 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
 })
 ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+  const nativeTokens = _loadNativeTokens(baseUrl)
+
+  if (nativeTokens?.refreshToken) {
+    try {
+      await postJsonNoAuth(
+        nativeRefreshUrl(baseUrl).replace(/\/refresh$/, '/logout'),
+        { refresh_token: nativeTokens.refreshToken, provider: nativeTokens.provider },
+        { timeoutMs: 10_000 }
+      )
+    } catch (error: any) {
+      if (error?.statusCode !== 404) {
+        rememberLog('[native-oauth] Server session revocation failed; clearing local credentials.')
+      }
+    }
+  }
+
   await clearOauthSession(baseUrl)
 
   // Also drop any native (RFC 8252) bearer tokens for this gateway so a
@@ -16655,7 +16635,7 @@ async function handleHermesApiRequest(request: unknown): Promise<unknown> {
           // Native bearer first (cookieless). ensureNativeAccessToken transparently
           // refreshes a near-expiry AT via /auth/native/refresh; a null return means
           // no native session (resolveOauthRestAuth then selects the cookie path).
-          const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+          const nativeAt = await ensureNativeAccessToken(connection.baseUrl)
           const restAuth = resolveOauthRestAuth(nativeAt)
 
           if (restAuth.kind === 'bearer') {

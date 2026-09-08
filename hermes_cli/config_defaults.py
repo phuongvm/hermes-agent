@@ -966,6 +966,7 @@ DEFAULT_CONFIG = {
         "oauth": {
             "client_id": "",  # agent:{instance_id} — Portal provisions this
             "portal_url": "",
+            "self_hosted": {"session_ttl_seconds": 0},
         },
         # Username/password gate (dashboard_auth/basic plugin, no OAuth IDP). Active when username
         # plus password_hash (preferred) or password (hashed in-memory) are set; empty username =

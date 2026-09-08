@@ -488,6 +488,21 @@ class _NativeRefreshBody(BaseModel):
     provider: str = ""
 
 
+@router.post("/auth/native/logout", name="auth_native_logout")
+async def auth_native_logout(request: Request, body: _NativeRefreshBody):
+    if not body.refresh_token:
+        raise _http(400, "refresh_token required")
+    provider = get_provider(body.provider)
+    if provider is None or not getattr(provider, "supports_session", True):
+        raise _http(400, "Unknown session provider")
+    try:
+        provider.revoke_session(refresh_token=body.refresh_token)
+    except ProviderError as exc:
+        raise _http(503, "Auth session revocation unavailable") from exc
+    _audit(request, AuditEvent.LOGOUT, provider=body.provider)
+    return JSONResponse({"ok": True}, headers=_NO_STORE)
+
+
 @router.post("/auth/native/refresh", name="auth_native_refresh")
 async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
     """Rotate a desktop-held refresh token (mirrors the gate's ``_attempt_refresh``): every

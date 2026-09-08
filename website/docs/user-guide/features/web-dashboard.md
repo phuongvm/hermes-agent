@@ -834,6 +834,25 @@ dashboard:
 
 In your IDP, register a **public** application/client with the authorization-code + PKCE (S256) grant and add the dashboard's callback as an allowed redirect URI. The callback is `<dashboard public URL>/auth/callback` (see [Public URL override](#public-url-override) for how the dashboard derives its public URL behind a proxy).
 
+#### Application session lifetime
+
+An identity provider's short-lived ID token does not need to limit the dashboard login to a few minutes. To give Hermes ownership of the application session lifetime, configure a positive number of seconds:
+
+```yaml
+dashboard:
+  oauth:
+    self_hosted:
+      session_ttl_seconds: 604800
+```
+
+This creates a seven-day **absolute** application session after a successful OIDC code exchange. Hermes still validates the identity token's signature, issuer, audience, and expiration at login; it never accepts an expired identity token to create or extend a session. Setting the value to `0`, or leaving it unset, retains the identity provider's token/refresh behavior.
+
+Application access tokens last up to 15 minutes and renew using a separate Hermes refresh credential, even when the identity provider does not issue refresh tokens. Renewal does not extend the absolute session deadline. Concurrent refreshes keep already-issued access tokens valid until their own expiry. Browser and desktop sign-out revoke the application session and all its access tokens; changing the issuer, client ID, or configured lifetime invalidates existing application sessions.
+
+The session database lives at `$HERMES_HOME/dashboard-auth-sessions.db` and contains identity metadata and credential hashes, not plaintext bearer tokens. Keep this file private and persistent across restarts. Independent dashboard instances need the same session store to recognize the same application session. Deleting it signs users out. Since Hermes owns this session lifetime, disabling an account at the identity provider does not immediately revoke an already-issued Hermes application session; choose a lifetime appropriate to that policy.
+
+After enabling this setting or updating from the older ID-token-only implementation, sign in once to obtain the new application credentials. Existing raw ID tokens keep their original expiration and are not silently upgraded on ordinary API requests.
+
 #### What it verifies
 
 The provider verifies the OpenID Connect **ID token** (RS256/ES256) against the discovered `jwks_uri`, with the `iss` and `aud` claims pinned to your configured `issuer` and `client_id`. Standard OIDC claims map onto the dashboard session:

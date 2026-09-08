@@ -19,7 +19,8 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from hermes_cli.dashboard_auth import LoginStart, ProviderError, Session
+from hermes_cli.dashboard_auth import LoginStart, ProviderError, RefreshExpiredError, Session
+from plugins.dashboard_auth.self_hosted.sessions import ACCESS_PREFIX, REFRESH_PREFIX, OIDCSessionStore
 from plugins.dashboard_auth._shared import (
     JSON_HEADERS,
     TOKEN_ENDPOINT_TIMEOUT_SEC as _TOKEN_ENDPOINT_TIMEOUT_SEC,
@@ -70,7 +71,10 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
     name = "self-hosted"
     display_name = "Self-Hosted OIDC"
 
-    def __init__(self, *, issuer: str, client_id: str, scopes: str = _DEFAULT_SCOPES, client_secret: str = "") -> None:
+    def __init__(
+        self, *, issuer: str, client_id: str, scopes: str = _DEFAULT_SCOPES,
+        client_secret: str = "", session_ttl_seconds: int | None = None,
+    ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
         if not client_id:
@@ -80,6 +84,16 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         self._issuer = issuer.rstrip("/")
         _require_https_or_loopback(self._issuer, field="issuer")
         self._client_id = client_id
+        if session_ttl_seconds is not None and (isinstance(session_ttl_seconds, bool) or not isinstance(session_ttl_seconds, int) or session_ttl_seconds < 0):
+            raise ValueError("session_ttl_seconds must be a non-negative integer")
+        self._session_store = None
+        if session_ttl_seconds:
+            from hermes_constants import get_hermes_home
+
+            self._session_store = OIDCSessionStore(
+                get_hermes_home() / "dashboard-auth-sessions.db",
+                issuer=self._issuer, client_id=client_id, ttl_seconds=session_ttl_seconds,
+            )
         self._scopes = (scopes or "").strip().strip("\"'") or _DEFAULT_SCOPES
         # Empty/whitespace secret ⇒ public client, so a provisioned-but-blank secret
         # can't flip us into a broken confidential mode.
@@ -98,7 +112,23 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         return pkce_login_start(
             disco["authorization_endpoint"], client_id=self._client_id, scope=self._scopes, redirect_uri=redirect_uri)
 
+    def verify_session(self, *, access_token: str) -> Optional[Session]:
+        if access_token.startswith(ACCESS_PREFIX):
+            return self._session_store.verify(access_token) if self._session_store else None
+        return super().verify_session(access_token=access_token)
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        if refresh_token.startswith(REFRESH_PREFIX):
+            if self._session_store is None:
+                raise RefreshExpiredError("OIDC application sessions are disabled")
+            return self._session_store.refresh(refresh_token)
+        return super().refresh_session(refresh_token=refresh_token)
+
     def revoke_session(self, *, refresh_token: str) -> None:
+        if refresh_token.startswith(REFRESH_PREFIX):
+            if self._session_store is not None:
+                self._session_store.revoke(refresh_token)
+            return
         # Best-effort RFC 7009 revocation when the IDP advertises an endpoint.
         # Must never raise — logout is client-side cookie clearing regardless.
         if not refresh_token:
@@ -162,7 +192,10 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
                 "ID token."))
         claims = self._verify_id_token(id_token)
         # Prefer a freshly-issued RT, else keep the previous (some IDPs don't rotate).
-        return self._session(id_token, refresh_token_from(payload, previous_refresh_token), claims)
+        session = self._session(id_token, refresh_token_from(payload, previous_refresh_token), claims)
+        if self._session_store is not None:
+            return self._session_store.issue(session)
+        return session
 
     # ---- internals: discovery ---------------------------------------------
 
@@ -279,6 +312,7 @@ def _settings() -> dict:
             % (bool(issuer), bool(client_id)))
     return {
         "issuer": issuer, "client_id": client_id,
+        "session_ttl_seconds": oidc_cfg.get("session_ttl_seconds"),
         "scopes": setting("HERMES_DASHBOARD_OIDC_SCOPES", "scopes") or _DEFAULT_SCOPES,
         # Credential: canonical home is the env var / ~/.hermes/.env. Empty ⇒ public client.
         "client_secret": setting("HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "client_secret")}
