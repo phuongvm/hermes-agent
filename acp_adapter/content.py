@@ -221,9 +221,21 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
     return []
 
 
-def _extract_text(prompt: list[PromptBlock]) -> str:
-    """Extract plain text from ACP content blocks for display/commands."""
-    return "\n".join(str(block.text) for block in prompt if hasattr(block, "text"))
+def _extract_text(prompt: Any) -> str:
+    """Extract plain text from ACP content blocks or dicts for display/commands."""
+    if isinstance(prompt, str):
+        return prompt.strip()
+    if not isinstance(prompt, list):
+        return ""
+    parts: list[str] = []
+    for block in prompt:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if text:
+                parts.append(str(text))
+        elif hasattr(block, "text"):
+            parts.append(str(block.text))
+    return "\n".join(parts).strip()
 
 
 def _image_block_to_openai_part(block: ImageContentBlock) -> dict[str, Any] | None:

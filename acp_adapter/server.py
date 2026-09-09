@@ -515,6 +515,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 ),
             ),
             auth_methods=auth_methods,
+            field_meta={"steering": {"supported": True}},
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
@@ -621,6 +622,41 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             except Exception:
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
         logger.info("Cancelled session %s", session_id)
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle custom ACP extension methods, including cross-adapter _session/steering."""
+        normalized = method.lstrip("_")
+        if normalized == "session/steering":
+            return await self._handle_session_steering(params)
+        from acp.exceptions import RequestError
+        raise RequestError.method_not_found(f"_{normalized}")
+
+    async def _handle_session_steering(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Inject steering guidance into an in-flight ACP turn without cancelling it."""
+        session_id = params.get("sessionId")
+        if not session_id or not isinstance(session_id, str):
+            return {"outcome": "failed"}
+
+        state = self.session_manager.get_session(session_id)
+        if not state:
+            return {"outcome": "failed"}
+
+        prompt = params.get("prompt")
+        text = _extract_text(prompt) if prompt else ""
+        if not text:
+            return {"outcome": "failed"}
+
+        with state.runtime_lock:
+            if state.is_running and state.agent:
+                try:
+                    if hasattr(state.agent, "steer") and state.agent.steer(text):
+                        logger.info("Successfully steered ACP session %s mid-turn (%d chars)", session_id, len(text))
+                        return {"outcome": "injected"}
+                except Exception as e:
+                    logger.warning("Failed to steer ACP session %s: %s", session_id, e)
+                    return {"outcome": "failed"}
+
+        return {"outcome": "startedNewTurn"}
 
     async def fork_session(
         self, cwd: str, session_id: str, mcp_servers: list | None = None, **kwargs: Any
