@@ -397,3 +397,49 @@ def test_prepare_agent_startup_installs_server_filter(monkeypatch, _reset_mcp_se
     monkeypatch.setattr(main_mod, "_command_has_dedicated_mcp_startup", lambda args: True)
     main_mod._prepare_agent_startup(_agent_args(toolsets="terminal,code-mcp"))
     assert mcp_startup.get_mcp_server_filter() == ["terminal", "code-mcp"]
+
+
+def test_has_configured_mcp_servers_disabled_returns_false(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(
+            read_raw_config=lambda: {
+                "mcp_servers": {
+                    "s1": {"command": "npx", "enabled": False},
+                    "s2": {"url": "http://127.0.0.1/mcp", "enabled": "false"},
+                }
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.agent_plugins",
+        types.SimpleNamespace(has_enabled_agent_plugin_mcp=lambda cfg: False),
+    )
+    assert not mcp_startup._has_configured_mcp_servers()
+
+
+def test_background_discovery_skips_when_all_servers_disabled(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(
+            read_raw_config=lambda: {
+                "mcp_servers": {
+                    "s1": {"command": "npx", "enabled": False},
+                }
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.agent_plugins",
+        types.SimpleNamespace(has_enabled_agent_plugin_mcp=lambda cfg: False),
+    )
+    logger_calls = []
+    logger = types.SimpleNamespace(warning=lambda msg, *args: logger_calls.append(msg))
+    mcp_startup.start_background_mcp_discovery(logger=logger, thread_name="test")
+    assert not mcp_startup._mcp_discovery_started
+    assert not logger_calls
+

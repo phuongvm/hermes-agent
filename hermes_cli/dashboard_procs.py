@@ -50,15 +50,34 @@ def _iter_process_table() -> list[tuple[int, str]]:
         result = bounded_probe_run(
             ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
             timeout=10, errors="ignore")
-        if result is None or result.returncode != 0 or result.stdout is None:
-            return rows
-        current_cmd = ""
-        for line in result.stdout.split("\n"):
-            line = line.strip()
-            if line.startswith("CommandLine="):
-                current_cmd = line[len("CommandLine=") :]
-            elif line.startswith("ProcessId="):
-                _append_row(rows, line[len("ProcessId=") :], current_cmd)
+        if result is not None and result.returncode == 0 and result.stdout is not None:
+            current_cmd = ""
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if line.startswith("CommandLine="):
+                    current_cmd = line[len("CommandLine=") :]
+                elif line.startswith("ProcessId="):
+                    _append_row(rows, line[len("ProcessId=") :], current_cmd)
+            if rows:
+                return rows
+
+        # Fall back to psutil on Windows (e.g. Windows 11 where wmic is deprecated/removed)
+        try:
+            import psutil
+            for proc in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    cmdline_list = proc.info.get("cmdline") or []
+                    if not cmdline_list:
+                        continue
+                    first = cmdline_list[0].lower()
+                    if any(sh in first for sh in ("bash", "sh.exe", "cmd.exe", "powershell", "pwsh")):
+                        continue
+                    cmdline = " ".join(cmdline_list)
+                    rows.append((proc.info["pid"], cmdline))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
         return rows
     # ps, not `pgrep -f "hermes.*dashboard"` (greedy regex; consistent with gateway pid scan).
     result = subprocess.run(["ps", "-A", "-o", "pid=,command="], timeout=10, **_PS_RUN_KWARGS)
@@ -83,7 +102,7 @@ def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None) -> list[t
     manages. The desktop sets the environment variable ``HERMES_DESKTOP_CHILD_PID`` on the spawned backend
     process; ``_kill_stale_dashboard_processes`` reads it and passes it here. (#37532)
     """
-    skip = {os.getpid(), *(exclude_pids or ())}
+    skip = {os.getpid(), os.getppid(), *(exclude_pids or ())}
     try:
         found = [(pid, cmd) for pid, cmd in _iter_process_table()
                  if pid not in skip and any(p in cmd for p in _DASHBOARD_PATTERNS)]

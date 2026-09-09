@@ -26,6 +26,8 @@ def _find_stale_dashboard_pids(*, exclude_pids: set[int] | None = None) -> list[
 
 def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
     """Best-effort parse of a dashboard/server cmdline into mode, host, and port."""
+    if re.search(r"(?:^|\s)(?:--status|--stop|--help|-h)(?:\s|$)", command):
+        return None
     mode = None
     for candidate in ("dashboard", "serve"):
         patterns = (f"hermes {candidate}", f"hermes_cli.main {candidate}", f"hermes_cli/main.py {candidate}")

@@ -171,3 +171,49 @@ class TestArgparseWiring:
              pytest.raises(SystemExit) as exc:
             mod.cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
+
+
+def test_parse_dashboard_runtime_flag_boundaries():
+    from hermes_cli.main_dashboard import _parse_dashboard_runtime
+
+    # --host with 0.0.0.0 must not be rejected by -h substring match
+    rt = _parse_dashboard_runtime("python -m hermes_cli.main dashboard --host 0.0.0.0 --port 9119 --no-open")
+    assert rt == ("dashboard", "0.0.0.0", 9119)
+
+    # Control flags must be rejected
+    assert _parse_dashboard_runtime("hermes dashboard --status") is None
+    assert _parse_dashboard_runtime("hermes dashboard --stop") is None
+    assert _parse_dashboard_runtime("hermes dashboard -h") is None
+    assert _parse_dashboard_runtime("hermes dashboard --help") is None
+
+
+def test_iter_process_table_windows_psutil_fallback(monkeypatch):
+    import hermes_cli.dashboard_procs as dp
+
+    monkeypatch.setattr(dp.sys, "platform", "win32")
+    # Simulate wmic failing/missing
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.bounded_probe_run",
+        lambda *args, **kwargs: None,
+    )
+
+    class FakeProc:
+        def __init__(self, pid, cmdline):
+            self.info = {"pid": pid, "cmdline": cmdline}
+
+    fake_procs = [
+        FakeProc(100, ["bash.exe", "-c", "echo hello"]),
+        FakeProc(200, ["python.exe", "-m", "hermes_cli.main", "dashboard"]),
+    ]
+
+    import types
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: fake_procs,
+        NoSuchProcess=Exception,
+        AccessDenied=Exception,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    rows = dp._iter_process_table()
+    assert rows == [(200, "python.exe -m hermes_cli.main dashboard")]
+

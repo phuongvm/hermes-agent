@@ -51,7 +51,11 @@ def _has_configured_mcp_servers() -> bool:
         from hermes_cli.config import read_raw_config
 
         raw_config = read_raw_config() or {}
-        if isinstance(raw_config.get("mcp_servers"), dict) and raw_config["mcp_servers"]:
+        mcp_servers = raw_config.get("mcp_servers")
+        if isinstance(mcp_servers, dict) and any(
+            (not isinstance(s, dict)) or s.get("enabled", True) not in (False, 0, "false", "False")
+            for s in mcp_servers.values()
+        ):
             return True
         from hermes_cli.agent_plugins import has_enabled_agent_plugin_mcp
 
@@ -75,6 +79,9 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
     global _mcp_discovery_started, _mcp_discovery_thread
 
     with _mcp_discovery_lock:
+        if not _has_configured_mcp_servers():
+            return
+
         if _mcp_discovery_started:
             thread = _mcp_discovery_thread
             if thread is not None and thread.is_alive():
@@ -92,8 +99,6 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             _mcp_discovery_thread = None
 
         _mcp_discovery_started = True
-        if not _has_configured_mcp_servers():
-            return
 
         # Re-install the caller's context-local HERMES_HOME override (multi-profile dashboard/desktop
         # backends) inside the thread: ContextVars don't propagate into bare threads, so a session
