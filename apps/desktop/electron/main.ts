@@ -5365,7 +5365,10 @@ function fetchJson(url, token, options: any = {}) {
               const text = Buffer.concat(chunks).toString('utf8')
 
               if ((res.statusCode || 500) >= 400) {
-                reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+                const statusCode = res.statusCode || 500
+                const err = new Error(`${statusCode}: ${text || res.statusMessage}`) as any
+                err.statusCode = statusCode
+                reject(err)
 
                 return
               }
@@ -5531,7 +5534,10 @@ function fetchPublicJson(url, options: any = {}) {
               const text = Buffer.concat(chunks).toString('utf8')
 
               if ((res.statusCode || 500) >= 400) {
-                reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+                const statusCode = res.statusCode || 500
+                const err = new Error(`${statusCode}: ${text || res.statusMessage}`) as any
+                err.statusCode = statusCode
+                reject(err)
 
                 return
               }

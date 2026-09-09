@@ -44,7 +44,12 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
     } catch (error) {
       if (!unchanged()) return io.load(baseUrl)?.accessToken ?? null
 
-      if (error && typeof error === 'object' && 'statusCode' in error && error.statusCode === 401) {
+      const statusCode =
+        (error && typeof error === 'object' && 'statusCode' in error && Number(error.statusCode)) ||
+        (error instanceof Error && Number((error.message.match(/^(\d{3}):/) || [])[1])) ||
+        0
+
+      if (statusCode === 401) {
         io.clear(baseUrl)
         return null
       }

@@ -87,6 +87,13 @@ describe('native token renewal', () => {
     expect(context.clear).toHaveBeenCalledTimes(1)
   })
 
+  it('clears on a terminal 401 error formatted as a standard Error without statusCode property', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(new Error('401: {"detail":"Unauthorized"}'))
+    expect(await context.ensure('gateway')).toBeNull()
+    expect(context.clear).toHaveBeenCalledTimes(1)
+  })
+
   it('does not resurrect a session logged out while refresh was in flight', async () => {
     const context = fixture()
     const pending = context.ensure('gateway')
