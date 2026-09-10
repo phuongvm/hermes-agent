@@ -388,10 +388,13 @@ class SessionManager:
             name for name, cfg in (config.get("mcp_servers") or {}).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
+        acp_cfg = config.get("acp") or {}
+        max_iter = acp_cfg.get("max_iterations") or 25
         kwargs = {
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
             "enabled_toolsets": _expand_acp_enabled_toolsets(["hermes-acp"], mcp_server_names=configured_mcp_servers),
             "model": model or default_model,
+            "max_iterations": int(max_iter),
         }
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)

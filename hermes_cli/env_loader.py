@@ -341,6 +341,15 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
+    # Preserve Buzz Desktop managed agent identity credentials injected by buzz-acp:
+    # A shared HERMES_HOME/.env must not clobber the per-agent BUZZ_* signing keys
+    # passed to this managed worker process.
+    managed_buzz_env = {}
+    if os.environ.get("BUZZ_MANAGED_AGENT"):
+        for k in ("BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL", "BUZZ_ALLOWED_USERS"):
+            if k in os.environ:
+                managed_buzz_env[k] = os.environ[k]
+
     if user_env.exists():  # normalize formatting / strip NULs before parsing
         _sanitize_env_file_if_needed(user_env)
     if project_env_path and project_env_path.exists():
@@ -389,6 +398,10 @@ def load_hermes_dotenv(
     # cron standalone runs) call load_hermes_dotenv() repeatedly and used to flip the effective backend back
     # to the stale .env value mid-session (#29186, #67323).
     _reapply_terminal_config_bridge(home_path)
+
+    # Re-apply Buzz managed agent identity keys if this process is a Buzz managed agent
+    if managed_buzz_env:
+        os.environ.update(managed_buzz_env)
 
     return loaded
 
