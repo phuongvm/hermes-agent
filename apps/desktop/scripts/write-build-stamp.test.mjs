@@ -250,12 +250,14 @@ test('buildElectronBuilderArgs generates dynamic arguments with modulo 65536 PE 
   // Normal build number under 65536
   const stamp = {
     version: '0.21.0',
-    buildNumber: 27745
+    buildNumber: 27745,
+    builtAt: '2026-09-10T08:00:00.000Z'
   }
   const args = buildElectronBuilderArgs({ stamp, extraArgs: ['--win', 'nsis'] })
   assert.ok(args.includes('-c.extraMetadata.version=0.21.0'))
   assert.ok(args.includes('-c.buildVersion=0.21.0.27745'))
   assert.ok(args.includes('-c.buildNumber=27745'))
+  assert.ok(args.includes('-c.artifactName=Hermes-${version}-${os}-${arch}-2026-09-10.${ext}'))
   assert.ok(args.includes('--win'))
   assert.ok(args.includes('nsis'))
 

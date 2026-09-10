@@ -59,10 +59,12 @@ export function buildElectronBuilderArgs({
       : 0
     // 16-bit integer boundary protection for numeric PE tuple component
     const peBuildNumber = rawBuildNum % 65536
+    const buildDate = stamp.builtAt ? stamp.builtAt.slice(0, 10) : new Date().toISOString().slice(0, 10)
 
     args.push(`-c.extraMetadata.version=${canonicalVersion}`)
     args.push(`-c.buildVersion=${canonicalVersion}.${peBuildNumber}`)
     args.push(`-c.buildNumber=${peBuildNumber}`)
+    args.push(`-c.artifactName=Hermes-\${version}-\${os}-\${arch}-${buildDate}.\${ext}`)
   }
 
   args.push(...extraArgs)
