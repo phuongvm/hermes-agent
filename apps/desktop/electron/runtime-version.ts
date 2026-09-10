@@ -28,17 +28,22 @@ export function validateStampVersion(version: unknown): string | null {
   if (typeof version !== 'string' || !version.trim()) {
     return null
   }
+
   const trimmed = version.trim()
   const match = trimmed.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/)
+
   if (!match) {
     return null
   }
+
   const major = parseInt(match[1], 10)
   const minor = parseInt(match[2], 10)
   const patch = parseInt(match[3], 10)
+
   if (major < 0 || major > 65535 || minor < 0 || minor > 65535 || patch < 0 || patch > 65535) {
     return null
   }
+
   return trimmed
 }
 
@@ -46,6 +51,7 @@ export function validateStampShortCommit(shortCommit: unknown): string | null {
   if (typeof shortCommit === 'string' && /^[0-9a-fA-F]{8}$/.test(shortCommit)) {
     return shortCommit
   }
+
   return null
 }
 
@@ -53,6 +59,7 @@ export function validateStampBuildNumber(buildNumber: unknown): number | null {
   if (typeof buildNumber === 'number' && Number.isInteger(buildNumber) && buildNumber >= 0) {
     return buildNumber
   }
+
   return null
 }
 
@@ -73,6 +80,7 @@ export function validateInstallStamp(parsed: any, filePath: string): InstallStam
     console.warn(
       `[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`
     )
+
     return null
   }
 
@@ -93,7 +101,7 @@ export function validateInstallStamp(parsed: any, filePath: string): InstallStam
     branch: typeof parsed.branch === 'string' ? parsed.branch : null,
     builtAt: typeof parsed.builtAt === 'string' ? parsed.builtAt : null,
     dirty,
-    source: (parsed.source === 'ci' || parsed.source === 'local' || parsed.source === 'fallback') ? parsed.source : null,
+    source: parsed.source === 'ci' || parsed.source === 'local' || parsed.source === 'fallback' ? parsed.source : null,
     path: filePath
   })
 }
@@ -105,16 +113,19 @@ export function loadInstallStamp(
   candidates?: string[] | null,
   fsModule: { readFileSync: (path: string, encoding: 'utf8') => string } = fs
 ): InstallStamp | null {
-  const searchPaths = candidates || [
-    process.resourcesPath ? path.join(process.resourcesPath, 'install-stamp.json') : null,
-    path.join(process.cwd(), 'build', 'install-stamp.json')
-  ].filter((p): p is string => Boolean(p))
+  const searchPaths =
+    candidates ||
+    [
+      process.resourcesPath ? path.join(process.resourcesPath, 'install-stamp.json') : null,
+      path.join(process.cwd(), 'build', 'install-stamp.json')
+    ].filter((p): p is string => Boolean(p))
 
   for (const p of searchPaths) {
     try {
       const raw = fsModule.readFileSync(p, 'utf8')
       const parsed = JSON.parse(raw)
       const validated = validateInstallStamp(parsed, p)
+
       if (validated) {
         return validated
       }
@@ -134,10 +145,13 @@ export function formatClientVersion(stamp: InstallStamp): string {
   if (!stamp || !stamp.version) {
     return ''
   }
+
   const dirtySuffix = stamp.dirty ? ' [DIRTY]' : ''
+
   if (stamp.shortCommit) {
     return `${stamp.version} (${stamp.shortCommit})${dirtySuffix}`
   }
+
   return `${stamp.version}${dirtySuffix}`
 }
 
@@ -165,9 +179,11 @@ export function resolveHermesVersionLadder(ctx: VersionResolutionContext = {}): 
     try {
       const initPath = path.join(ctx.updateRoot, 'hermes_cli', '__init__.py')
       const exists = fileSystem.existsSync ? fileSystem.existsSync(initPath) : true
+
       if (exists) {
         const raw = fileSystem.readFileSync(initPath, 'utf8')
         const match = raw.match(/__version__\s*=\s*["']([^"']+)["']/)
+
         if (match && match[1]) {
           return match[1]
         }
@@ -179,6 +195,7 @@ export function resolveHermesVersionLadder(ctx: VersionResolutionContext = {}): 
 
   // Rung 2: Packaged client-only runtime (requires both valid version and valid shortCommit)
   const stamp = ctx.installStamp
+
   if (stamp && stamp.version && stamp.shortCommit) {
     return formatClientVersion(stamp)
   }

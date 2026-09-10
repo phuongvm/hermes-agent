@@ -90,12 +90,6 @@ import {
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
 import { detectBundleSwap } from './bundle-swap'
-import {
-  InstallStamp,
-  loadInstallStamp as loadInstallStampInternal,
-  resolveHermesVersionLadder,
-  formatClientVersion
-} from './runtime-version'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -270,7 +264,7 @@ import {
   resolveOauthRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
-import { nativeRefreshUrl, type NativeTokenSet, parseTokenResponse, resolveLoginStrategy } from './native-oauth'
+import { nativeRefreshUrl, type NativeTokenSet, resolveLoginStrategy } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
 import { createNativeTokenRefresher } from './native-token-refresh'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
@@ -350,6 +344,8 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import type { InstallStamp } from './runtime-version'
+import { loadInstallStamp as loadInstallStampInternal, resolveHermesVersionLadder } from './runtime-version'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
