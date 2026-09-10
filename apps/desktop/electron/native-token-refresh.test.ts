@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
+
 import { type NativeTokenSet } from './native-oauth'
 import { createNativeTokenRefresher } from './native-token-refresh'
 
 function fixture() {
   let now = 1000
+
   let tokens: NativeTokenSet | null = {
     accessToken: 'old-at',
     refreshToken: 'stable-rt',
@@ -11,6 +13,7 @@ function fixture() {
     provider: 'self-hosted',
     userId: 'user'
   }
+
   const refresh = vi.fn(async () => ({
     access_token: 'new-at',
     refresh_token: 'new-rt',
@@ -18,13 +21,17 @@ function fixture() {
     provider: 'self-hosted',
     user_id: 'user'
   }))
+
   const clear = vi.fn(() => {
     tokens = null
   })
+
   const store = vi.fn((_baseUrl: string, next: NativeTokenSet) => {
     tokens = next
   })
+
   const ensure = createNativeTokenRefresher({ load: () => tokens, store, clear, refresh, now: () => now })
+
   return {
     ensure,
     refresh,

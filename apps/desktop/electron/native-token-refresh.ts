@@ -14,21 +14,29 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
   async function resolve(baseUrl: string): Promise<string | null> {
     const tokens = io.load(baseUrl)
 
-    if (!tokens) return null
+    if (!tokens) {
+      return null
+    }
 
     const now = io.now?.() ?? Math.floor(Date.now() / 1000)
 
-    if (!tokenNeedsRefresh(tokens, now)) return tokens.accessToken
+    if (!tokenNeedsRefresh(tokens, now)) {
+      return tokens.accessToken
+    }
 
     if (!tokens.refreshToken) {
-      if (Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) return tokens.accessToken
+      if (Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) {
+        return tokens.accessToken
+      }
 
       io.clear(baseUrl)
+
       return null
     }
 
     const unchanged = () => {
       const current = io.load(baseUrl)
+
       return current?.accessToken === tokens.accessToken && current?.refreshToken === tokens.refreshToken
     }
 
@@ -36,13 +44,20 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
       const body = await io.refresh(baseUrl, tokens)
       const rotated = parseTokenResponse(body)
 
-      if (!unchanged()) return io.load(baseUrl)?.accessToken ?? null
+      if (!unchanged()) {
+        return io.load(baseUrl)?.accessToken ?? null
+      }
 
-      if (!rotated.refreshToken) rotated.refreshToken = tokens.refreshToken
+      if (!rotated.refreshToken) {
+        rotated.refreshToken = tokens.refreshToken
+      }
       io.store(baseUrl, rotated)
+
       return rotated.accessToken
     } catch (error) {
-      if (!unchanged()) return io.load(baseUrl)?.accessToken ?? null
+      if (!unchanged()) {
+        return io.load(baseUrl)?.accessToken ?? null
+      }
 
       const statusCode =
         (error && typeof error === 'object' && 'statusCode' in error && Number(error.statusCode)) ||
@@ -51,6 +66,7 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
 
       if (statusCode === 401) {
         io.clear(baseUrl)
+
         return null
       }
 
@@ -60,12 +76,19 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
 
   return function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
     const pending = inFlight.get(baseUrl)
-    if (pending) return pending
+
+    if (pending) {
+      return pending
+    }
 
     const request = resolve(baseUrl).finally(() => {
-      if (inFlight.get(baseUrl) === request) inFlight.delete(baseUrl)
+      if (inFlight.get(baseUrl) === request) {
+        inFlight.delete(baseUrl)
+      }
     })
+
     inFlight.set(baseUrl, request)
+
     return request
   }
 }
