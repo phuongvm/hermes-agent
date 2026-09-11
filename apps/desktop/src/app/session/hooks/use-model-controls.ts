@@ -2,13 +2,13 @@ import { type QueryClient } from '@tanstack/react-query'
 import { useCallback, useRef } from 'react'
 
 import type { ModelSelection } from '@/app/shell/model-menu-panel'
-import { getGlobalModelInfo } from '@/hermes'
+import { getApiRequestConnection, getApiRequestProfile, getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
 import { notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, isGatewayOpen } from '@/store/profile'
+import { $activeGatewayProfile, getProfileFetchGeneration, isGatewayOpen, normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,
   $currentModel,
@@ -36,6 +36,12 @@ interface ModelSwitchResponse {
   deferred?: boolean
 }
 
+interface InFlightModelFetch {
+  scopeKey: string
+  epoch: number
+  promise: Promise<any>
+}
+
 export function useModelControls({
   cacheOwnerConnectionId,
   cacheProfile,
@@ -45,7 +51,19 @@ export function useModelControls({
   const { t } = useI18n()
   const copy = t.desktop
   const profileRefreshEpochRef = useRef(0)
-  const inFlightModelFetchRef = useRef<Promise<any> | null>(null)
+  const inFlightModelFetchRef = useRef<InFlightModelFetch | null>(null)
+
+  const getScopeKey = useCallback(() => {
+    const connection = (cacheOwnerConnectionId ?? getApiRequestConnection() ?? '').trim()
+    const profile = normalizeProfileKey(cacheProfile ?? getApiRequestProfile() ?? $activeGatewayProfile.get())
+    const generation = getProfileFetchGeneration()
+    return {
+      connection,
+      profile,
+      generation,
+      key: `${connection}\0${profile}\0${generation}`
+    }
+  }, [cacheOwnerConnectionId, cacheProfile])
 
   // All callbacks here read reactive session state from the store (.get())
   // rather than capturing it as a prop. The actions bag in wiring.tsx mutates
@@ -124,7 +142,7 @@ export function useModelControls({
       }
 
       const profileRefreshEpoch = profileRefreshEpochRef.current
-      const profile = $activeGatewayProfile.get()
+      const { key: scopeKey, profile } = getScopeKey()
 
       try {
         if ($activeSessionId.get()) {
@@ -157,17 +175,29 @@ export function useModelControls({
         // default — value comparisons alone miss re-selecting the same row.
         const selectionGeneration = getComposerSelectionGeneration()
 
-        let fetchPromise = inFlightModelFetchRef.current
-        if (!fetchPromise) {
+        let fetchPromise: Promise<any>
+        const currentInFlight = inFlightModelFetchRef.current
+
+        if (
+          currentInFlight &&
+          currentInFlight.scopeKey === scopeKey &&
+          (!force || currentInFlight.epoch === profileRefreshEpoch)
+        ) {
+          fetchPromise = currentInFlight.promise
+        } else {
           fetchPromise = getGlobalModelInfo(profile)
-          inFlightModelFetchRef.current = fetchPromise
+          inFlightModelFetchRef.current = {
+            scopeKey,
+            epoch: profileRefreshEpoch,
+            promise: fetchPromise
+          }
         }
 
-        let result
+        let result: any
         try {
           result = await fetchPromise
         } finally {
-          if (inFlightModelFetchRef.current === fetchPromise) {
+          if (inFlightModelFetchRef.current?.promise === fetchPromise) {
             inFlightModelFetchRef.current = null
           }
         }
@@ -175,6 +205,7 @@ export function useModelControls({
         if (
           !isGatewayOpen() ||
           profileRefreshEpochRef.current !== profileRefreshEpoch ||
+          getScopeKey().key !== scopeKey ||
           $activeSessionId.get() ||
           getComposerSelectionGeneration() !== selectionGeneration ||
           keepManualPick()
@@ -197,7 +228,7 @@ export function useModelControls({
         // The delayed session.info event still updates this once the agent is ready.
       }
     },
-    [cacheOwnerConnectionId, cacheProfile, queryClient]
+    [cacheOwnerConnectionId, cacheProfile, getScopeKey, queryClient]
   )
 
   // Returns whether the switch was applied so callers can await it before

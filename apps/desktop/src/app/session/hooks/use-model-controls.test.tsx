@@ -9,6 +9,7 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $gatewayState,
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
@@ -25,11 +26,15 @@ const notify = vi.fn()
 const notifyError = vi.fn()
 const dismissNotification = vi.fn()
 
-vi.mock('@/hermes', () => ({
-  getGlobalModelInfo: vi.fn(),
-  setApiRequestProfile: vi.fn(),
-  setGlobalModel: (...args: Parameters<typeof setGlobalModel>) => setGlobalModel(...args)
-}))
+vi.mock('@/hermes', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/hermes')>()
+
+  return {
+    ...actual,
+    getGlobalModelInfo: vi.fn(),
+    setGlobalModel: (...args: Parameters<typeof setGlobalModel>) => setGlobalModel(...args)
+  }
+})
 
 vi.mock('@/store/session-states', async importOriginal => {
   const actual = await importOriginal<typeof SessionStates>()
@@ -80,6 +85,7 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    $gatewayState.set('open')
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
@@ -91,6 +97,7 @@ describe('useModelControls', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    $gatewayState.set('idle')
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
@@ -618,7 +625,9 @@ describe('useModelControls', () => {
       })
     )
 
+    $activeGatewayProfile.set('profile-b')
     const refreshB = result.current.refreshCurrentModel(true)
+    $activeGatewayProfile.set('profile-c')
     const refreshC = result.current.refreshCurrentModel(true)
 
     profileC.resolve({ model: 'profile-c-model', provider: 'profile-c-provider' })

@@ -87,6 +87,10 @@ export function setActiveProfile(name: string): void {
 // no longer writes the shared cache ("guard against the past").
 let profileListEpoch = 0
 
+export function getProfileFetchGeneration(): number {
+  return profileListEpoch
+}
+
 export function invalidateProfileListFetches(): void {
   profileListEpoch += 1
   // Detach the single-flight slot too: a caller arriving AFTER a backend

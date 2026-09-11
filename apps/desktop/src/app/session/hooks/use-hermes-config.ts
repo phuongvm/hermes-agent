@@ -1,11 +1,11 @@
 import { type MutableRefObject, useCallback, useRef, useState } from 'react'
 
 import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
-import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
+import { getApiRequestConnection, getApiRequestProfile, getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
-import { isGatewayOpen } from '@/store/profile'
+import { $activeGatewayProfile, getProfileFetchGeneration, isGatewayOpen, normalizeProfileKey } from '@/store/profile'
 import {
   getComposerSelectionGeneration,
   getCurrentModelSource,
@@ -51,11 +51,29 @@ interface HermesConfigOptions {
   activeSessionIdRef: MutableRefObject<string | null>
 }
 
+interface InFlightConfigFetch {
+  scopeKey: string
+  epoch: number
+  promise: Promise<[any, any]>
+}
+
 export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
   const [voiceMaxRecordingSeconds, setVoiceMaxRecordingSeconds] = useState(DEFAULT_VOICE_SECONDS)
   const [sttEnabled, setSttEnabled] = useState(true)
   const profileRefreshEpochRef = useRef(0)
-  const inFlightFetchRef = useRef<Promise<[any, any]> | null>(null)
+  const inFlightFetchRef = useRef<InFlightConfigFetch | null>(null)
+
+  const getScopeKey = useCallback(() => {
+    const connection = (getApiRequestConnection() ?? '').trim()
+    const profile = normalizeProfileKey(getApiRequestProfile() ?? $activeGatewayProfile.get())
+    const generation = getProfileFetchGeneration()
+    return {
+      connection,
+      profile,
+      generation,
+      key: `${connection}\0${profile}\0${generation}`
+    }
+  }, [])
 
   const refreshHermesConfig = useCallback(
     async (force = false, shouldPublish: () => boolean = () => true) => {
@@ -69,11 +87,24 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
       const profileRefreshEpoch = profileRefreshEpochRef.current
       const selectionGeneration = getComposerSelectionGeneration()
+      const { key: scopeKey } = getScopeKey()
 
-      let fetchPromise = inFlightFetchRef.current
-      if (!fetchPromise) {
+      let fetchPromise: Promise<[any, any]>
+      const currentInFlight = inFlightFetchRef.current
+
+      if (
+        currentInFlight &&
+        currentInFlight.scopeKey === scopeKey &&
+        (!force || currentInFlight.epoch === profileRefreshEpoch)
+      ) {
+        fetchPromise = currentInFlight.promise
+      } else {
         fetchPromise = Promise.all([getHermesConfig(), getHermesConfigDefaults().catch(() => ({}))])
-        inFlightFetchRef.current = fetchPromise
+        inFlightFetchRef.current = {
+          scopeKey,
+          epoch: profileRefreshEpoch,
+          promise: fetchPromise
+        }
       }
 
       try {
@@ -83,7 +114,10 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
           return
         }
 
-        const canPublish = () => profileRefreshEpochRef.current === profileRefreshEpoch && shouldPublish()
+        const canPublish = () =>
+          profileRefreshEpochRef.current === profileRefreshEpoch &&
+          getScopeKey().key === scopeKey &&
+          shouldPublish()
 
         if (!canPublish()) {
           return
@@ -166,12 +200,12 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
       } catch {
         // Config is nice-to-have; chat still works without it.
       } finally {
-        if (inFlightFetchRef.current === fetchPromise) {
+        if (inFlightFetchRef.current?.promise === fetchPromise) {
           inFlightFetchRef.current = null
         }
       }
     },
-    [activeSessionIdRef]
+    [activeSessionIdRef, getScopeKey]
   )
 
   return { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds }

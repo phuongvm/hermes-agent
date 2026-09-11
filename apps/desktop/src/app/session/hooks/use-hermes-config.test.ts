@@ -1,15 +1,17 @@
 // @vitest-environment jsdom
 import { act, renderHook } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $terminalFontFamily, setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getHermesConfig } from '@/hermes'
 import { persistString } from '@/lib/storage'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentCwd,
   $currentFastMode,
   $currentReasoningEffort,
   $defaultReasoningEffort,
+  $gatewayState,
   markComposerSelectionManual,
   setCurrentCwd,
   setCurrentFastMode,
@@ -22,10 +24,15 @@ import { deferred } from '../../../test/deferred'
 
 import { useHermesConfig } from './use-hermes-config'
 
-vi.mock('@/hermes', () => ({
-  getHermesConfig: vi.fn(),
-  getHermesConfigDefaults: vi.fn().mockResolvedValue({})
-}))
+vi.mock('@/hermes', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/hermes')>()
+
+  return {
+    ...actual,
+    getHermesConfig: vi.fn(),
+    getHermesConfigDefaults: vi.fn().mockResolvedValue({})
+  }
+})
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 
@@ -34,6 +41,7 @@ const mockConfig = (config: Record<string, unknown>) =>
 
 describe('useHermesConfig refreshHermesConfig', () => {
   beforeEach(() => {
+    $gatewayState.set('open')
     // Reset atoms and localStorage between tests
     setCurrentCwd('')
     setCurrentFastMode(false)
