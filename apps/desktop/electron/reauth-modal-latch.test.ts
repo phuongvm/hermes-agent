@@ -225,4 +225,126 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
 
     assert.equal(latch.isModalActive(), false)
   })
+
+  it('serializes independent login work across different origins without cross-origin outcome leakage (C2)', async () => {
+    let resolveA: (val: any) => void
+    let loginBCalls = 0
+
+    const pA = latch.triggerReauth(
+      'https://a.invalid',
+      () =>
+        new Promise(resolve => {
+          resolveA = resolve
+        })
+    )
+
+    const pB = latch.triggerReauth('https://b.invalid', async () => {
+      loginBCalls += 1
+      return { ok: true, connected: true, baseUrl: 'https://b.invalid' }
+    })
+
+    assert.equal(latch.isModalActive(), true)
+    assert.equal(latch.getActiveConnection(), 'https://a.invalid')
+    assert.equal(loginBCalls, 0)
+    assert.equal(latch.getWaitingCount(), 1)
+    assert.deepEqual(latch.getQueuedConnections(), ['https://b.invalid'])
+
+    resolveA!({ ok: true, connected: true, baseUrl: 'https://a.invalid' })
+
+    const [resultA, resultB] = await Promise.all([pA, pB])
+
+    assert.equal(loginBCalls, 1)
+    assert.deepEqual(resultA, { ok: true, connected: true, baseUrl: 'https://a.invalid' })
+    assert.deepEqual(resultB, { ok: true, connected: true, baseUrl: 'https://b.invalid' })
+    assert.equal(latch.getAuthState('https://a.invalid')?.status, 'authenticated')
+    assert.equal(latch.getAuthState('https://b.invalid')?.status, 'authenticated')
+    assert.equal(latch.isModalActive(), false)
+    assert.equal(latch.getWaitingCount(), 0)
+  })
+
+  it('drains late arrivals during async resolver await without stranding (W1)', async () => {
+    let finishModal: (val: any) => void
+    let finishResolver: () => void
+    let resolverStarted: () => void
+
+    const entered = new Promise<void>(resolve => {
+      resolverStarted = resolve
+    })
+
+    latch.setAuthStateResolver(async () => {
+      resolverStarted()
+      await new Promise<void>(resolve => {
+        finishResolver = resolve
+      })
+    })
+
+    const first = latch.triggerReauth(
+      'conn:alpha::1',
+      () =>
+        new Promise(resolve => {
+          finishModal = resolve
+        })
+    )
+    const second = latch.triggerReauth('conn:alpha::2', async () => ({ ok: true, connected: true }))
+
+    finishModal!({ ok: true, connected: true })
+    await entered
+
+    let lateSettled = false
+    const late = latch.triggerReauth('conn:beta::1', async () => ({ ok: true, connected: true }))
+    late.then(
+      () => {
+        lateSettled = true
+      },
+      () => {
+        lateSettled = true
+      }
+    )
+
+    assert.equal(lateSettled, false)
+    assert.equal(latch.isModalActive(), true)
+
+    finishResolver!()
+
+    await Promise.all([first, second, late])
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    assert.equal(lateSettled, true)
+    assert.equal(latch.getWaitingCount(), 0)
+    assert.equal(latch.isModalActive(), false)
+    assert.equal(latch.getAuthState('conn:beta::1')?.status, 'authenticated')
+  })
+
+  it('handles rejected resolver cleanly: marks unauthenticated, rejects, and drains next (W1)', async () => {
+    latch.setAuthStateResolver(async connectionKey => {
+      if (connectionKey === 'conn:fail::2') {
+        throw new Error('Resolver explosion')
+      }
+    })
+
+    let resolveFirst: (val: any) => void
+    const p1 = latch.triggerReauth(
+      'conn:fail::1',
+      () =>
+        new Promise(resolve => {
+          resolveFirst = resolve
+        })
+    )
+    const p2 = latch.triggerReauth('conn:fail::2', async () => ({ ok: true, connected: true }))
+    const p3 = latch.triggerReauth('conn:other::1', async () => ({ ok: true, connected: true, other: true }))
+
+    resolveFirst!({ ok: true, connected: true })
+
+    const res1 = await p1
+    assert.deepEqual(res1, { ok: true, connected: true })
+    assert.equal(latch.getAuthState('conn:fail::1')?.status, 'authenticated')
+
+    await assert.rejects(p2, { message: 'Resolver explosion' })
+    assert.equal(latch.getAuthState('conn:fail::2')?.status, 'unauthenticated')
+    assert.equal(latch.getAuthState('conn:fail::2')?.error, 'Resolver explosion')
+
+    const res3 = await p3
+    assert.deepEqual(res3, { ok: true, connected: true, other: true })
+    assert.equal(latch.getAuthState('conn:other::1')?.status, 'authenticated')
+  })
 })

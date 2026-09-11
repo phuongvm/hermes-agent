@@ -50,9 +50,11 @@ import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
+  getEndpointConnectionState,
   isReauthRequiredError,
   makeNousCloudBackendDownError,
   makeUnsignedOauthError,
+  recordEndpointConnectionState,
   resetEndpoint401State,
   waitForHermesReady
 } from './backend-health'
@@ -6508,6 +6510,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
 
 async function waitForHermes(baseUrl, token, signal?, authMode?, headers = {}, previousGatewayState?) {
   const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
+  const resolvedPreviousGatewayState = previousGatewayState ?? getEndpointConnectionState(baseUrl)
 
   return waitForHermesReady(baseUrl, {
     token,
@@ -6518,7 +6521,7 @@ async function waitForHermes(baseUrl, token, signal?, authMode?, headers = {}, p
       : fetchJson,
     probeHealth: (url, options = {}) => probeHealth(url, requestOptionsWithHeaders(options, headers)),
     probeIsCredentialed,
-    previousGatewayState
+    previousGatewayState: resolvedPreviousGatewayState
   })
 }
 
@@ -11803,8 +11806,10 @@ async function connectRegistryBackend(
     source.headers
   )
 
-  await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode, connection.headers)
+  const previousGatewayState = getEndpointConnectionState(connection.baseUrl)
+  await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode, connection.headers, previousGatewayState)
   poolEntry.remoteBaseUrl = connection.baseUrl
+  recordEndpointConnectionState(connection.baseUrl, 'open')
 
   return {
     ...connection,
@@ -12470,11 +12475,13 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   profileDeletionGate.assertCanStart(profile)
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
+    const previousGatewayState = getEndpointConnectionState(remote.baseUrl)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, previousGatewayState)
 
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
     entry.remoteBaseUrl = remote.baseUrl
+    recordEndpointConnectionState(remote.baseUrl, 'open')
 
     return {
       ...remote,
@@ -12885,13 +12892,16 @@ async function startHermes() {
       }
 
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
+      const previousGatewayState = getEndpointConnectionState(remote.baseUrl)
+      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, previousGatewayState)
 
       // Second async boundary: the health probe itself can outlive the
       // attempt. A late success here must not publish a stale descriptor.
       if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
         throw new Error('Hermes backend start was superseded by a newer connection attempt.')
       }
+
+      recordEndpointConnectionState(remote.baseUrl, 'open')
 
       updateBootProgress({
         phase: 'backend.ready',
@@ -15948,6 +15958,17 @@ async function fetchJsonForBackend(
     headers: descriptor.headers
   })
 }
+
+reauthModalLatch.setAuthStateResolver(async (connectionKey, _outcome) => {
+  rememberLog(`[reauth] connection ${connectionKey} authenticated; revalidating pool`)
+  try {
+    await revalidatePool()
+  } catch (error) {
+    rememberLog(
+      `[reauth] pool revalidation for ${connectionKey} failed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+})
 
 ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
 ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {

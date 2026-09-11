@@ -534,6 +534,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // `default` profile, so profile alone is not a sufficient identity.
   const gatewayScope = `${activeConnectionId ?? ''}\0${activeGatewayProfile}`
   const lastGatewayScopeRef = useRef(gatewayScope)
+  const pendingGatewayScopeRefreshRef = useRef(false)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -542,6 +543,16 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastGatewayScopeRef.current = gatewayScope
+    resetProjectTreeState()
+
+    // When the gateway is not open, do not fire background requests into a
+    // disconnected backend. Mark a pending refresh to run when the gateway reconnects.
+    if (gatewayState !== 'open') {
+      pendingGatewayScopeRefreshRef.current = true
+      return
+    }
+
+    pendingGatewayScopeRefreshRef.current = false
     // Force: the new source/profile pair has its own defaults, so reseed the
     // selector even if the composer already shows values from the previous
     // backend. These refreshes carry intent tokens so an in-flight picker
@@ -549,8 +560,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void refreshCurrentModel(true)
     void refreshHermesConfig(true)
     void refreshActiveProfile()
-    resetProjectTreeState()
-  }, [gatewayScope, refreshCurrentModel, refreshHermesConfig])
+  }, [gatewayScope, gatewayState, refreshCurrentModel, refreshHermesConfig])
+
+  // Process deferred scope refresh once the gateway transitions to 'open'
+  useEffect(() => {
+    if (gatewayState === 'open' && pendingGatewayScopeRefreshRef.current) {
+      pendingGatewayScopeRefreshRef.current = false
+      void refreshCurrentModel(true)
+      void refreshHermesConfig(true)
+      void refreshActiveProfile()
+    }
+  }, [gatewayState, refreshCurrentModel, refreshHermesConfig])
 
   // New session anchored to a workspace. Seeds cwd + branch from the clicked
   // workspace; an explicit worktree path also drills the sidebar into that

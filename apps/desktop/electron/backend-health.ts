@@ -16,6 +16,26 @@ export interface Endpoint401State {
 }
 
 const endpoint401Map = new Map<string, Endpoint401State>()
+const endpointConnectionStateMap = new Map<string, 'open' | 'connecting' | 'disconnected'>()
+
+export function recordEndpointConnectionState(
+  url: string,
+  state: 'open' | 'connecting' | 'disconnected'
+): void {
+  endpointConnectionStateMap.set(normalizeEndpointKey(url), state)
+}
+
+export function getEndpointConnectionState(url: string): 'open' | 'connecting' | 'disconnected' | undefined {
+  return endpointConnectionStateMap.get(normalizeEndpointKey(url))
+}
+
+export function resetEndpointConnectionState(url?: string): void {
+  if (url) {
+    endpointConnectionStateMap.delete(normalizeEndpointKey(url))
+  } else {
+    endpointConnectionStateMap.clear()
+  }
+}
 
 export function normalizeEndpointKey(url: string): string {
   try {
@@ -357,8 +377,9 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
         await probeHealth(`${base}/api/health`, { timeoutMs: healthProbeTimeoutMs })
       }
 
-      // Success (HTTP 200) resets consecutive 401 counter
+      // Success (HTTP 200) resets consecutive 401 counter and marks connection open
       resetEndpoint401State(base)
+      recordEndpointConnectionState(base, 'open')
 
       return
     } catch (error) {
@@ -378,7 +399,8 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
         const threshold = options.reauthConsecutiveThreshold ?? DEFAULT_REAUTH_CONSECUTIVE_THRESHOLD
         const currentTime = now()
         const state = recordEndpoint401(base, currentTime, windowMs)
-        const wasPreviouslyOpen = options.previousGatewayState === 'open'
+        const authoritativePreviousState = options.previousGatewayState ?? getEndpointConnectionState(base)
+        const wasPreviouslyOpen = authoritativePreviousState === 'open'
         const isConsecutive401Met =
           state.consecutive401Count >= threshold &&
           (currentTime - state.first401Timestamp) <= windowMs

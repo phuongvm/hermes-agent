@@ -4,12 +4,11 @@
  * Process-wide singleton latch preventing multiple concurrent reauth modals
  * across pooled remote backend connections (OpenSpec desktop-reconnect-session-resilience Group 6).
  *
- * When multiple pooled connections (e.g., conn:host::profile-a and conn:host::profile-b)
- * encounter auth failures (isReauthRequired) simultaneously:
- * 1. The first connection acquires the latch and opens the re-auth modal.
- * 2. Subsequent connections are queued to wait for the outcome of the active modal.
- * 3. On successful re-auth, the auth state is resolved for all queued/waiting connections.
- * 4. On failure/cancellation, the error/unauthenticated state is surfaced once without duplicate modals.
+ * Separates process-wide UI concurrency (at most one modal displayed at a time)
+ * from per-origin authentication identity:
+ * 1. Compatible / same-origin connections coalesce onto a single modal.
+ * 2. Independent origins serialize their modal displays without cross-contaminating credentials.
+ * 3. Atomic draining ensures late arrivals and async resolvers never strand waiters.
  */
 
 export interface ConnectionAuthState {
@@ -31,20 +30,39 @@ export type AuthStateResolver = (
   outcome: any
 ) => Promise<void> | void
 
+export interface ActiveModalState {
+  connectionKey: string
+  origin: string
+  promise: Promise<any>
+  openedAt: number
+}
+
+export interface WaitingQueueItem<T = any> {
+  connectionKey: string
+  origin: string
+  openModal: () => Promise<T>
+  resolve: (value: any) => void
+  reject: (reason?: unknown) => void
+  queuedAt: number
+}
+
+export function extractAuthOrigin(connectionKey: string): string {
+  try {
+    if (connectionKey.startsWith('http://') || connectionKey.startsWith('https://')) {
+      return new URL(connectionKey).origin.toLowerCase()
+    }
+  } catch {
+    // fall through
+  }
+  if (connectionKey.includes('::')) {
+    return connectionKey.split('::')[0].trim().toLowerCase()
+  }
+  return connectionKey.trim().toLowerCase()
+}
+
 export class ReauthModalLatch {
-  #activeModal: {
-    connectionKey: string
-    promise: Promise<any>
-    openedAt: number
-  } | null = null
-
-  #waitingQueue: Array<{
-    connectionKey: string
-    resolve: (value: any) => void
-    reject: (reason?: unknown) => void
-    queuedAt: number
-  }> = []
-
+  #activeModal: ActiveModalState | null = null
+  #waitingQueue: WaitingQueueItem[] = []
   #authStates = new Map<string, ConnectionAuthState>()
   #authStateResolver?: AuthStateResolver
 
@@ -118,19 +136,23 @@ export class ReauthModalLatch {
   /**
    * Request re-authentication for a connection.
    * If no modal is active, runs openModal() and marks modal active.
-   * If a modal is already active, queues connectionKey to wait for the active modal's outcome.
+   * If a modal is already active:
+   *  - If same origin: coalesces onto the active modal's outcome.
+   *  - If different origin: queues for serialized execution after active modal finishes.
    */
-  async triggerReauth<T = any>(
+  triggerReauth<T = any>(
     connectionKey: string,
     openModal: () => Promise<T>
   ): Promise<T> {
     this.setAuthState(connectionKey, { status: 'reauth_required' })
+    const origin = extractAuthOrigin(connectionKey)
 
-    // If modal is already active, queue this connection to wait for the active modal's outcome
     if (this.#activeModal) {
       return new Promise<T>((resolve, reject) => {
         this.#waitingQueue.push({
           connectionKey,
+          origin,
+          openModal,
           resolve,
           reject,
           queuedAt: Date.now()
@@ -138,7 +160,14 @@ export class ReauthModalLatch {
       })
     }
 
-    // Modal is not active: acquire the latch
+    return this.#executeModal(connectionKey, origin, openModal)
+  }
+
+  async #executeModal<T = any>(
+    connectionKey: string,
+    origin: string,
+    openModal: () => Promise<T>
+  ): Promise<T> {
     let modalPromise: Promise<T>
     try {
       modalPromise = openModal()
@@ -148,6 +177,7 @@ export class ReauthModalLatch {
 
     this.#activeModal = {
       connectionKey,
+      origin,
       promise: modalPromise as Promise<ReauthOutcome>,
       openedAt: Date.now()
     }
@@ -157,7 +187,6 @@ export class ReauthModalLatch {
       const isSuccess = outcome?.ok !== false && outcome?.connected !== false
 
       if (isSuccess) {
-        // Resolve auth state for the active connection
         const now = Date.now()
         this.setAuthState(connectionKey, {
           status: 'authenticated',
@@ -165,41 +194,69 @@ export class ReauthModalLatch {
           error: null
         })
 
-        // Resolve auth state for all queued/waiting connections
-        const waiting = [...this.#waitingQueue]
-        this.#waitingQueue = []
+        // Drain compatible waiters sharing the same origin
+        const compatibleWaiters: WaitingQueueItem[] = []
+        const remainingQueue: WaitingQueueItem[] = []
 
-        for (const item of waiting) {
-          this.setAuthState(item.connectionKey, {
-            status: 'authenticated',
-            lastResolvedAt: now,
-            error: null
-          })
+        for (const item of this.#waitingQueue) {
+          if (item.origin === origin) {
+            compatibleWaiters.push(item)
+          } else {
+            remainingQueue.push(item)
+          }
+        }
+        this.#waitingQueue = remainingQueue
 
+        for (const item of compatibleWaiters) {
           if (this.#authStateResolver) {
             try {
               await this.#authStateResolver(item.connectionKey, outcome)
-            } catch {
-              // resolver error should not block resolving the connection
+              this.setAuthState(item.connectionKey, {
+                status: 'authenticated',
+                lastResolvedAt: now,
+                error: null
+              })
+              item.resolve(outcome)
+            } catch (resolverError) {
+              const msg = resolverError instanceof Error ? resolverError.message : String(resolverError)
+              this.setAuthState(item.connectionKey, {
+                status: 'unauthenticated',
+                error: msg
+              })
+              item.reject(resolverError)
             }
+          } else {
+            this.setAuthState(item.connectionKey, {
+              status: 'authenticated',
+              lastResolvedAt: now,
+              error: null
+            })
+            item.resolve(outcome)
           }
-
-          item.resolve(outcome)
         }
       } else {
-        // Reauth modal closed without successful connection (e.g. cancelled)
+        const errorMsg = outcome?.error ?? 'Re-authentication not completed'
         this.setAuthState(connectionKey, {
           status: 'unauthenticated',
-          error: outcome?.error ?? 'Re-authentication not completed'
+          error: errorMsg
         })
 
-        const waiting = [...this.#waitingQueue]
-        this.#waitingQueue = []
+        const compatibleWaiters: WaitingQueueItem[] = []
+        const remainingQueue: WaitingQueueItem[] = []
 
-        for (const item of waiting) {
+        for (const item of this.#waitingQueue) {
+          if (item.origin === origin) {
+            compatibleWaiters.push(item)
+          } else {
+            remainingQueue.push(item)
+          }
+        }
+        this.#waitingQueue = remainingQueue
+
+        for (const item of compatibleWaiters) {
           this.setAuthState(item.connectionKey, {
             status: 'unauthenticated',
-            error: outcome?.error ?? 'Re-authentication not completed'
+            error: errorMsg
           })
           item.resolve(outcome)
         }
@@ -207,17 +264,25 @@ export class ReauthModalLatch {
 
       return outcome
     } catch (error) {
-      // Reauth modal failed with an error
       const errorMessage = error instanceof Error ? error.message : String(error)
       this.setAuthState(connectionKey, {
         status: 'unauthenticated',
         error: errorMessage
       })
 
-      const waiting = [...this.#waitingQueue]
-      this.#waitingQueue = []
+      const compatibleWaiters: WaitingQueueItem[] = []
+      const remainingQueue: WaitingQueueItem[] = []
 
-      for (const item of waiting) {
+      for (const item of this.#waitingQueue) {
+        if (item.origin === origin) {
+          compatibleWaiters.push(item)
+        } else {
+          remainingQueue.push(item)
+        }
+      }
+      this.#waitingQueue = remainingQueue
+
+      for (const item of compatibleWaiters) {
         this.setAuthState(item.connectionKey, {
           status: 'unauthenticated',
           error: errorMessage
@@ -227,7 +292,15 @@ export class ReauthModalLatch {
 
       throw error
     } finally {
-      this.#activeModal = null
+      if (this.#waitingQueue.length > 0) {
+        const next = this.#waitingQueue.shift()!
+        void this.#executeModal(next.connectionKey, next.origin, next.openModal).then(
+          next.resolve,
+          next.reject
+        )
+      } else {
+        this.#activeModal = null
+      }
     }
   }
 
@@ -245,8 +318,12 @@ export class ReauthModalLatch {
    * Reset the latch and queues (primarily for test teardown).
    */
   reset(): void {
-    this.#activeModal = null
+    const queue = [...this.#waitingQueue]
     this.#waitingQueue = []
+    for (const item of queue) {
+      item.reject(new Error('Reauth latch reset'))
+    }
+    this.#activeModal = null
     this.#authStates.clear()
     this.#authStateResolver = undefined
   }

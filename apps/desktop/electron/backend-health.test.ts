@@ -788,3 +788,169 @@ test('makeNousCloudBackendDownError preserves legacy string-prefix compatibility
   assert.equal((result as any).isCloudBackendDown, true)
   assert.equal((result as any).statusCode, 503)
 })
+
+test('two-tier 401 classifier: previously open endpoint with sustained 401s triggers reauth (C1)', async () => {
+  const endpoint = 'https://pre-open.example.com'
+  let currentTime = 1000
+  let probeCount = 0
+
+  await assert.rejects(
+    waitForHermesReady(endpoint, {
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        probeCount += 1
+        const err = new Error('401: Unauthorized') as any
+        err.statusCode = 401
+        throw err
+      },
+      probeIsCredentialed: true,
+      previousGatewayState: 'open',
+      timeoutMs: 5000,
+      pollMs: 100,
+      now: () => {
+        currentTime += 100
+        return currentTime
+      },
+      sleep: async () => {}
+    }),
+    error => {
+      assert.equal(isReauthRequiredError(error), true)
+      return true
+    }
+  )
+
+  assert.equal(probeCount, 2)
+})
+
+test('two-tier 401 classifier: initial startup with 401 does NOT trigger reauth (C1)', async () => {
+  const endpoint = 'https://startup-401.example.com'
+  let currentTime = 1000
+  let probeCount = 0
+
+  await assert.rejects(
+    waitForHermesReady(endpoint, {
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        probeCount += 1
+        const err = new Error('401: Initial unauthorized') as any
+        err.statusCode = 401
+        throw err
+      },
+      probeIsCredentialed: true,
+      // No previousGatewayState provided and no prior open state recorded
+      timeoutMs: 500,
+      pollMs: 100,
+      now: () => {
+        currentTime += 100
+        return currentTime
+      },
+      sleep: async () => {}
+    }),
+    error => {
+      // Must NOT be classified as reauth required
+      assert.equal(isReauthRequiredError(error), false)
+      assert.ok(String(error).includes('Initial unauthorized') || String(error).includes('did not become ready'))
+      return true
+    }
+  )
+
+  assert.ok(probeCount >= 2)
+})
+
+test('two-tier 401 classifier: non-auth failure resets 401 counter (C1)', async () => {
+  const endpoint = 'https://mixed-failures.example.com'
+  let currentTime = 1000
+  let probeStep = 0
+
+  await assert.rejects(
+    waitForHermesReady(endpoint, {
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        probeStep += 1
+        if (probeStep === 1) {
+          const err = new Error('401: First 401') as any
+          err.statusCode = 401
+          throw err
+        }
+        if (probeStep === 2) {
+          // 503 resets counter
+          const err = new Error('503: Starting up') as any
+          err.statusCode = 503
+          throw err
+        }
+        // Step 3: Second 401 (count restarted at 1)
+        const err = new Error('401: New first 401') as any
+        err.statusCode = 401
+        throw err
+      },
+      probeIsCredentialed: true,
+      previousGatewayState: 'open',
+      timeoutMs: 350,
+      pollMs: 100,
+      now: () => {
+        currentTime += 100
+        return currentTime
+      },
+      sleep: async () => {}
+    }),
+    error => {
+      // Because 503 reset the counter, at deadline count was only 1 -> not reauth required
+      assert.equal(isReauthRequiredError(error), false)
+      return true
+    }
+  )
+})
+
+test('two-tier 401 classifier: isolates state between different endpoints (C1)', async () => {
+  const endpointA = 'https://host-a.example.com'
+  const endpointB = 'https://host-b.example.com'
+  let currentTime = 1000
+
+  // Probe A with previous state open -> escalates to reauth
+  await assert.rejects(
+    waitForHermesReady(endpointA, {
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        const err = new Error('401: Rejection') as any
+        err.statusCode = 401
+        throw err
+      },
+      probeIsCredentialed: true,
+      previousGatewayState: 'open',
+      timeoutMs: 500,
+      pollMs: 100,
+      now: () => {
+        currentTime += 100
+        return currentTime
+      },
+      sleep: async () => {}
+    }),
+    error => isReauthRequiredError(error)
+  )
+
+  // Probe B with NO previous open state -> does NOT escalate to reauth
+  await assert.rejects(
+    waitForHermesReady(endpointB, {
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        const err = new Error('401: Rejection') as any
+        err.statusCode = 401
+        throw err
+      },
+      probeIsCredentialed: true,
+      timeoutMs: 500,
+      pollMs: 100,
+      now: () => {
+        currentTime += 100
+        return currentTime
+      },
+      sleep: async () => {}
+    }),
+    error => !isReauthRequiredError(error)
+  )
+})

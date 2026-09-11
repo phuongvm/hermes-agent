@@ -223,31 +223,50 @@ interface ActiveProfileResponse {
   current: string
 }
 
+let activeProfileInFlight: Promise<void> | null = null
+
 // Pull the running backend's current profile + the available profile list.
 // Best-effort: failures (backend not up yet) leave the prior values intact.
 export async function refreshActiveProfile(): Promise<void> {
-  const epoch = profileListEpoch
+  if (!isGatewayOpen()) {
+    return
+  }
 
-  try {
-    const res = await hermesApi<ActiveProfileResponse>({
-      path: '/api/profiles/active',
-      timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
-    })
+  if (activeProfileInFlight) {
+    return activeProfileInFlight
+  }
 
-    // Same stale-response guard as refreshProfiles: a backend switch mid-fetch
-    // means this answer describes the PREVIOUS backend.
-    if (epoch === profileListEpoch) {
-      setActiveProfile(res.current || 'default')
+  const flight = (async () => {
+    const epoch = profileListEpoch
+
+    try {
+      const res = await hermesApi<ActiveProfileResponse>({
+        path: '/api/profiles/active',
+        timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+      })
+
+      // Same stale-response guard as refreshProfiles: a backend switch mid-fetch
+      // means this answer describes the PREVIOUS backend.
+      if (epoch === profileListEpoch) {
+        setActiveProfile(res.current || 'default')
+      }
+    } catch {
+      // Backend may not be ready; keep the last known value.
     }
-  } catch {
-    // Backend may not be ready; keep the last known value.
-  }
 
-  try {
-    await refreshProfiles()
-  } catch {
-    // Leave the cached list in place.
-  }
+    try {
+      await refreshProfiles()
+    } catch {
+      // Leave the cached list in place.
+    }
+  })().finally(() => {
+    if (activeProfileInFlight === flight) {
+      activeProfileInFlight = null
+    }
+  })
+
+  activeProfileInFlight = flight
+  return flight
 }
 
 // Persist the choice and relaunch the backend under the new HERMES_HOME. The
