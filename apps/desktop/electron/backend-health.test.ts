@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 
-import { test } from 'vitest'
+import { beforeEach, test } from 'vitest'
 
 import {
   DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
+  getEndpoint401State,
   isAuthRejectionError,
   isGatedMissingHealthError,
   isMissingHealthEndpointError,
@@ -12,8 +13,15 @@ import {
   isServerSideHttpError,
   makeNousCloudBackendDownError,
   makeUnsignedOauthError,
+  normalizeEndpointKey,
+  recordEndpoint401,
+  resetEndpoint401State,
   waitForHermesReady
 } from './backend-health'
+
+beforeEach(() => {
+  resetEndpoint401State()
+})
 
 const GATE_401 = '401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}'
 
@@ -181,7 +189,7 @@ test('anonymous gate-shaped 401 falls back to /api/status (backend predates /api
   ])
 })
 
-test('a credentialed 401 fails fast for reauth instead of reporting a dead session ready', async () => {
+test('consecutive credentialed 401s from open connection trigger reauth without falling back to /api/status', async () => {
   // The regression a blanket 401->fallback introduces: /api/status is public,
   // so an expired session would answer 200 and boot would report "ready",
   // deferring the no_cookie to the first real API call.
@@ -203,6 +211,7 @@ test('a credentialed 401 fails fast for reauth instead of reporting a dead sessi
         throw new Error(GATE_401)
       },
       probeIsCredentialed: true,
+      previousGatewayState: 'open',
       sleep: async () => {},
       timeoutMs: 100,
       pollMs: 1
@@ -216,8 +225,248 @@ test('a credentialed 401 fails fast for reauth instead of reporting a dead sessi
     }
   )
 
-  // Fail fast: never reached the public /api/status leg.
-  assert.deepEqual(calls, [['probe', 'https://gateway.example/api/health']])
+  // Requires >= 2 consecutive 401s before latching; never reached the public /api/status leg.
+  assert.deepEqual(calls, [
+    ['probe', 'https://gateway.example/api/health'],
+    ['probe', 'https://gateway.example/api/health']
+  ])
+})
+
+test('single transient 401 during reconnect does not trigger reauth and recovers on next probe', async () => {
+  const calls: string[][] = []
+  let attempt = 0
+
+  await waitForHermesReady('https://gateway.example', {
+    token: 'session-token',
+    fetchPublicJson: async () => ({}),
+    fetchJson: async () => ({}),
+    probeHealth: async url => {
+      calls.push(['probe', url])
+      attempt += 1
+      if (attempt === 1) {
+        throw new Error(GATE_401)
+      }
+      return { ok: true }
+    },
+    probeIsCredentialed: true,
+    previousGatewayState: 'connecting',
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  // Succeeded after transient 401 was absorbed!
+  assert.equal(calls.length, 2)
+  assert.equal(getEndpoint401State('https://gateway.example'), undefined)
+})
+
+test('single transient 401 during reconnect timing out does not set isReauthRequired', async () => {
+  const currentTime = { value: 0 }
+
+  await assert.rejects(
+    waitForHermesReady('https://gateway.example', {
+      token: 'session-token',
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        throw new Error(GATE_401)
+      },
+      probeIsCredentialed: true,
+      previousGatewayState: 'connecting',
+      sleep: async () => {},
+      now: () => {
+        currentTime.value += 30
+        return currentTime.value
+      },
+      timeoutMs: 50,
+      pollMs: 1
+    }),
+    (error: any) => {
+      assert.equal(isReauthRequiredError(error), false)
+      assert.ok(error.message.includes('Hermes backend did not become ready'))
+      return true
+    }
+  )
+})
+
+test('consecutive 401s from stable connection trigger reauth', async () => {
+  const calls: string[][] = []
+
+  await assert.rejects(
+    waitForHermesReady('https://gateway.example', {
+      token: 'session-token',
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async url => {
+        calls.push(['probe', url])
+        throw new Error(GATE_401)
+      },
+      probeIsCredentialed: true,
+      previousGatewayState: 'open',
+      sleep: async () => {},
+      timeoutMs: 100,
+      pollMs: 1
+    }),
+    (error: any) => {
+      assert.equal(isReauthRequiredError(error), true)
+      assert.equal(error.needsOauthLogin, true)
+      assert.match(error.message, /remote gateway session has expired/i)
+      return true
+    }
+  )
+
+  assert.equal(calls.length, 2)
+})
+
+test('mixed 401 and 200 responses reset the consecutive counter', async () => {
+  let attempt = 0
+  const endpoint = 'https://gateway.example'
+
+  // First run: gets 401, then 200
+  await waitForHermesReady(endpoint, {
+    token: 'session-token',
+    fetchPublicJson: async () => ({}),
+    fetchJson: async () => ({}),
+    probeHealth: async () => {
+      attempt += 1
+      if (attempt === 1) {
+        throw new Error(GATE_401)
+      }
+      return { ok: true }
+    },
+    probeIsCredentialed: true,
+    previousGatewayState: 'open',
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  assert.equal(getEndpoint401State(endpoint), undefined)
+
+  // Subsequent run: gets a single 401 then 200 (counter starts at 1, not 2)
+  attempt = 0
+  await waitForHermesReady(endpoint, {
+    token: 'session-token',
+    fetchPublicJson: async () => ({}),
+    fetchJson: async () => ({}),
+    probeHealth: async () => {
+      attempt += 1
+      if (attempt === 1) {
+        throw new Error(GATE_401)
+      }
+      return { ok: true }
+    },
+    probeIsCredentialed: true,
+    previousGatewayState: 'open',
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  assert.equal(getEndpoint401State(endpoint), undefined)
+})
+
+test('503 and non-401 responses reset the consecutive 401 counter', async () => {
+  const endpoint = 'https://gateway.example'
+  let attempt = 0
+
+  await waitForHermesReady(endpoint, {
+    token: 'session-token',
+    fetchPublicJson: async () => ({}),
+    fetchJson: async () => ({}),
+    probeHealth: async () => {
+      attempt += 1
+      if (attempt === 1) {
+        throw new Error(GATE_401)
+      }
+      if (attempt === 2) {
+        throw new Error('503: Service Unavailable')
+      }
+      return { ok: true }
+    },
+    probeIsCredentialed: true,
+    previousGatewayState: 'open',
+    sleep: async () => {},
+    timeoutMs: 100,
+    pollMs: 1
+  })
+
+  assert.equal(getEndpoint401State(endpoint), undefined)
+})
+
+test('two 401s separated by more than 15s reset the window and do not trigger reauth', async () => {
+  const endpoint = 'https://gateway.example'
+  let currentTime = 1000
+  let attempt = 0
+
+  await waitForHermesReady(endpoint, {
+    token: 'session-token',
+    fetchPublicJson: async () => ({}),
+    fetchJson: async () => ({}),
+    probeHealth: async () => {
+      attempt += 1
+      if (attempt === 1) {
+        throw new Error(GATE_401)
+      }
+      if (attempt === 2) {
+        currentTime += 16_000
+        throw new Error(GATE_401)
+      }
+      return { ok: true }
+    },
+    probeIsCredentialed: true,
+    previousGatewayState: 'open',
+    sleep: async () => {},
+    now: () => currentTime,
+    timeoutMs: 20_000,
+    pollMs: 1
+  })
+
+  assert.equal(getEndpoint401State(endpoint), undefined)
+})
+
+test('consecutive 401s without previousGatewayState open do not trigger reauth', async () => {
+  const currentTime = { value: 0 }
+
+  await assert.rejects(
+    waitForHermesReady('https://gateway.example', {
+      token: 'session-token',
+      fetchPublicJson: async () => ({}),
+      fetchJson: async () => ({}),
+      probeHealth: async () => {
+        throw new Error(GATE_401)
+      },
+      probeIsCredentialed: true,
+      // previousGatewayState omitted (defaults to not open)
+      sleep: async () => {},
+      now: () => {
+        currentTime.value += 20
+        return currentTime.value
+      },
+      timeoutMs: 50,
+      pollMs: 1
+    }),
+    (error: any) => {
+      assert.equal(isReauthRequiredError(error), false)
+      assert.ok(error.message.includes('Hermes backend did not become ready'))
+      return true
+    }
+  )
+})
+
+test('tracks 401 state independently per endpoint', () => {
+  resetEndpoint401State()
+  recordEndpoint401('https://endpoint-a.example', 1000)
+  assert.equal(getEndpoint401State('https://endpoint-a.example')?.consecutive401Count, 1)
+  assert.equal(getEndpoint401State('https://endpoint-b.example'), undefined)
+
+  recordEndpoint401('https://endpoint-b.example', 1200)
+  assert.equal(getEndpoint401State('https://endpoint-a.example')?.consecutive401Count, 1)
+  assert.equal(getEndpoint401State('https://endpoint-b.example')?.consecutive401Count, 1)
+
+  resetEndpoint401State('https://endpoint-a.example')
+  assert.equal(getEndpoint401State('https://endpoint-a.example'), undefined)
+  assert.equal(getEndpoint401State('https://endpoint-b.example')?.consecutive401Count, 1)
 })
 
 test('unsigned OAuth is a terminal reauth failure; needsOauthLogin alone is not', () => {

@@ -13,30 +13,30 @@
 
 ## 3. Desktop Renderer — Connection-State-Gated Background Sync
 
-- [ ] 3.1 Identify and audit all background sync hooks that issue refresh calls: profile rail refresh, background sync, config refresh, model refresh. Catalog their trigger conditions (focus, visibility, WebSocket events).
-- [ ] 3.2 Add a connection-state gate to each hook: suppress refresh calls when gateway state is not `'open'`. Defer suppressed calls.
-- [ ] 3.3 Implement coalesced refresh-on-reconnect: when gateway transitions to `'open'`, fire exactly one refresh per data source using the latest cached state as baseline.
-- [ ] 3.4 Add tests: verify no IPC requests during `'connecting'` state; verify single coalesced refresh on reconnect; verify window focus during disconnect does not trigger refresh.
+- [x] 3.1 Identify and audit all background sync hooks that issue refresh calls: profile rail refresh, background sync, config refresh, model refresh. Catalog their trigger conditions (focus, visibility, WebSocket events).
+- [x] 3.2 Add a connection-state gate to each hook: suppress refresh calls when gateway state is not `'open'`. Defer suppressed calls.
+- [x] 3.3 Implement coalesced refresh-on-reconnect: when gateway transitions to `'open'`, fire exactly one refresh per data source using the latest cached state as baseline.
+- [x] 3.4 Add tests: verify no IPC requests during `'connecting'` state; verify single coalesced refresh on reconnect; verify window focus during disconnect does not trigger refresh.
 
 ## 4. Desktop Renderer — Profile Store Error Absorption
 
-- [ ] 4.1 In the profile store (and equivalent session/config stores), wrap refresh error handlers to silently absorb network errors when gateway state is not `'open'`, preserving cached data.
-- [ ] 4.2 Ensure errors during stable `'open'` state still surface through normal error handling (toast/notification).
-- [ ] 4.3 Add tests: network error during reconnect → cached state preserved, no toast; network error during open → toast displayed.
+- [x] 4.1 In the profile store (and equivalent session/config stores), wrap refresh error handlers to silently absorb network errors when gateway state is not `'open'`, preserving cached data.
+- [x] 4.2 Ensure errors during stable `'open'` state still surface through normal error handling (toast/notification).
+- [x] 4.3 Add tests: network error during reconnect → cached state preserved, no toast; network error during open → toast displayed.
 
 ## 5. Electron Main — Debounced Reauth Latch
 
-- [ ] 5.1 Implement two-tier 401 classifier in the backend health probe logic: track consecutive 401 count and timestamps per backend endpoint.
-- [ ] 5.2 Set `isReauthRequired` only when ≥2 consecutive 401s occur within 15 seconds AND the gateway was previously in `'open'` state.
-- [ ] 5.3 Reset the consecutive counter on any non-401 response (200, 503, timeout, network error).
-- [ ] 5.4 Add tests: single transient 401 during reconnect → no reauth; ≥2 consecutive 401s from stable → reauth triggered; mixed 401+200 → counter reset.
+- [x] 5.1 Implement two-tier 401 classifier in the backend health probe logic: track consecutive 401 count and timestamps per backend endpoint.
+- [x] 5.2 Set `isReauthRequired` only when ≥2 consecutive 401s occur within 15 seconds AND the gateway was previously in `'open'` state.
+- [x] 5.3 Reset the consecutive counter on any non-401 response (200, 503, timeout, network error).
+- [x] 5.4 Add tests: single transient 401 during reconnect → no reauth; ≥2 consecutive 401s from stable → reauth triggered; mixed 401+200 → counter reset.
 
 ## 6. Electron Main — Single Global Reauth Modal
 
-- [ ] 6.1 Add a process-wide reauth latch (singleton) that prevents more than one re-auth modal from being displayed simultaneously.
-- [ ] 6.2 When a second pooled connection triggers `isReauthRequired` while a modal is active, queue it to wait for the active modal's outcome.
-- [ ] 6.3 On successful re-auth, resolve the auth state for all queued/waiting connections.
-- [ ] 6.4 Add tests: two simultaneous reauth triggers → one modal; successful reauth resolves both connections; failed reauth surfaces error once.
+- [x] 6.1 Add a process-wide reauth latch (singleton) that prevents more than one re-auth modal from being displayed simultaneously.
+- [x] 6.2 When a second pooled connection triggers `isReauthRequired` while a modal is active, queue it to wait for the active modal's outcome.
+- [x] 6.3 On successful re-auth, resolve the auth state for all queued/waiting connections.
+- [x] 6.4 Add tests: two simultaneous reauth triggers → one modal; successful reauth resolves both connections; failed reauth surfaces error once.
 
 ## 7. Integration Verification
 

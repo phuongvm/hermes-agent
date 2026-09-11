@@ -53,8 +53,10 @@ import {
   isReauthRequiredError,
   makeNousCloudBackendDownError,
   makeUnsignedOauthError,
+  resetEndpoint401State,
   waitForHermesReady
 } from './backend-health'
+import { reauthModalLatch } from './reauth-modal-latch'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
@@ -6504,7 +6506,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
   return { probeHealth: fetchPublicJson, probeIsCredentialed: false }
 }
 
-async function waitForHermes(baseUrl, token, signal?, authMode?, headers = {}) {
+async function waitForHermes(baseUrl, token, signal?, authMode?, headers = {}, previousGatewayState?) {
   const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
 
   return waitForHermesReady(baseUrl, {
@@ -6515,7 +6517,8 @@ async function waitForHermes(baseUrl, token, signal?, authMode?, headers = {}) {
       ? (url, _token, options = {}) => probeHealth(url, requestOptionsWithHeaders(options, headers))
       : fetchJson,
     probeHealth: (url, options = {}) => probeHealth(url, requestOptionsWithHeaders(options, headers)),
-    probeIsCredentialed
+    probeIsCredentialed,
+    previousGatewayState
   })
 }
 
@@ -15961,54 +15964,60 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
   //     to the embedded flow — one sign-in action opens at most one window.
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
 
-  let statusBody: any = null
+  // Single global reauth modal: process-wide singleton latch prevents duplicate concurrent
+  // modals across pooled connections. Second triggers wait and coalesce onto active modal.
+  return reauthModalLatch.triggerReauth(baseUrl, async () => {
+    let statusBody: any = null
 
-  try {
-    statusBody = await fetchPublicJson(`${baseUrl}/api/status`, { timeoutMs: 8_000 })
-  } catch {
-    // Can't read status — fall through to the embedded flow, which has its
-    // own error handling and works against any gated gateway.
-  }
-
-  const authRequired = statusBody && authModeFromStatus(statusBody) === 'oauth'
-  const providers = authRequired ? await gatewayAuthProviders(baseUrl) : []
-
-  const strategy = resolveLoginStrategy(statusBody, { providers })
-
-  if (strategy === 'native') {
     try {
-      const tokens = await runNativeLogin(baseUrl, {
-        openExternal: url => shell.openExternal(url),
-        postJson: (url, body, opts) => postJsonNoAuth(url, body, opts),
-        rememberLog
-      })
-
-      _storeNativeTokens(baseUrl, tokens)
-      // Confirmed sign-in — release the reauth latch so the next
-      // startHermes() re-dials instead of replaying the stale rejection.
-      remoteReauthFailure = null
-
-      return { ok: true, baseUrl, connected: true }
-    } catch (error) {
-      rememberLog(`[native-oauth] native login failed (${error instanceof Error ? error.message : String(error)})`)
-
-      return { ok: false, error: error instanceof Error ? error.message : String(error), connected: false }
+      statusBody = await fetchPublicJson(`${baseUrl}/api/status`, { timeoutMs: 8_000 })
+    } catch {
+      // Can't read status — fall through to the embedded flow, which has its
+      // own error handling and works against any gated gateway.
     }
-  }
 
-  // Legacy embedded-webview cookie flow.
-  await openOauthLoginWindow(baseUrl)
+    const authRequired = statusBody && authModeFromStatus(statusBody) === 'oauth'
+    const providers = authRequired ? await gatewayAuthProviders(baseUrl) : []
 
-  const connected = await hasOauthSessionCookie(baseUrl)
+    const strategy = resolveLoginStrategy(statusBody, { providers })
 
-  // Only a CONFIRMED sign-in releases the latch. A cancelled/closed login
-  // window must leave it set, or the overlay's "Sign in" button starts
-  // flickering again on the next retry.
-  if (connected) {
-    remoteReauthFailure = null
-  }
+    if (strategy === 'native') {
+      try {
+        const tokens = await runNativeLogin(baseUrl, {
+          openExternal: url => shell.openExternal(url),
+          postJson: (url, body, opts) => postJsonNoAuth(url, body, opts),
+          rememberLog
+        })
 
-  return { ok: true, baseUrl, connected }
+        _storeNativeTokens(baseUrl, tokens)
+        // Confirmed sign-in — release the reauth latch so the next
+        // startHermes() re-dials instead of replaying the stale rejection.
+        remoteReauthFailure = null
+        resetEndpoint401State(baseUrl)
+
+        return { ok: true, baseUrl, connected: true }
+      } catch (error) {
+        rememberLog(`[native-oauth] native login failed (${error instanceof Error ? error.message : String(error)})`)
+
+        return { ok: false, error: error instanceof Error ? error.message : String(error), connected: false }
+      }
+    }
+
+    // Legacy embedded-webview cookie flow.
+    await openOauthLoginWindow(baseUrl)
+
+    const connected = await hasOauthSessionCookie(baseUrl)
+
+    // Only a CONFIRMED sign-in releases the latch. A cancelled/closed login
+    // window must leave it set, or the overlay's "Sign in" button starts
+    // flickering again on the next retry.
+    if (connected) {
+      remoteReauthFailure = null
+      resetEndpoint401State(baseUrl)
+    }
+
+    return { ok: true, baseUrl, connected }
+  })
 })
 ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)

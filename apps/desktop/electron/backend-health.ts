@@ -3,9 +3,64 @@ export const DEFAULT_BACKEND_READY_POLL_MS = 500
 // A cold backend can stall its event loop for tens of seconds while Windows
 // scans and byte-compiles the gateway import tree. At the default 15s socket
 // timeout only three probes fit in the budget; a short one keeps retrying
-// across the stall. Health only — the legacy /api/status fallback is genuinely
+// Health only — the legacy /api/status fallback is genuinely
 // slow to answer and keeps the caller's default timeout.
 export const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 5_000
+export const DEFAULT_REAUTH_DEBOUNCE_WINDOW_MS = 15_000
+export const DEFAULT_REAUTH_CONSECUTIVE_THRESHOLD = 2
+
+export interface Endpoint401State {
+  consecutive401Count: number
+  first401Timestamp: number
+  last401Timestamp: number
+}
+
+const endpoint401Map = new Map<string, Endpoint401State>()
+
+export function normalizeEndpointKey(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, '')
+  } catch {
+    return url.trim().replace(/\/+$/, '')
+  }
+}
+
+export function getEndpoint401State(url: string): Endpoint401State | undefined {
+  const state = endpoint401Map.get(normalizeEndpointKey(url))
+  return state ? { ...state } : undefined
+}
+
+export function resetEndpoint401State(url?: string): void {
+  if (url) {
+    endpoint401Map.delete(normalizeEndpointKey(url))
+  } else {
+    endpoint401Map.clear()
+  }
+}
+
+export function recordEndpoint401(
+  url: string,
+  timestamp: number,
+  windowMs: number = DEFAULT_REAUTH_DEBOUNCE_WINDOW_MS
+): Endpoint401State {
+  const key = normalizeEndpointKey(url)
+  const existing = endpoint401Map.get(key)
+
+  if (!existing || timestamp < existing.first401Timestamp || (timestamp - existing.first401Timestamp) > windowMs) {
+    const newState: Endpoint401State = {
+      consecutive401Count: 1,
+      first401Timestamp: timestamp,
+      last401Timestamp: timestamp
+    }
+    endpoint401Map.set(key, newState)
+    return { ...newState }
+  }
+
+  existing.consecutive401Count += 1
+  existing.last401Timestamp = timestamp
+  return { ...existing }
+}
 
 type FetchPublicJson = (url: string, options?: { timeoutMs?: number }) => Promise<unknown>
 type FetchJson = (url: string, token?: string | null, options?: { timeoutMs?: number }) => Promise<unknown>
@@ -33,6 +88,9 @@ export interface HermesReadyOptions {
    * two very different meanings of a 401 (see `waitForHermesReady`).
    */
   probeIsCredentialed?: boolean
+  previousGatewayState?: 'open' | 'connecting' | 'disconnected' | string | null
+  reauthDebounceWindowMs?: number
+  reauthConsecutiveThreshold?: number
 }
 
 export const REMOTE_SESSION_EXPIRED_MESSAGE =
@@ -166,12 +224,42 @@ export function isMissingHealthEndpointError(error: unknown): boolean {
   return /^404:/.test(message) || message.includes('endpoint is likely missing')
 }
 
+export function isHttp401Error(error: unknown): boolean {
+  if (error && typeof error === 'object') {
+    const code = (error as { statusCode?: unknown }).statusCode
+    if (code === 401) {
+      return true
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return /^401:/.test(message)
+}
+
+export function isHttp403Error(error: unknown): boolean {
+  if (error && typeof error === 'object') {
+    const code = (error as { statusCode?: unknown }).statusCode
+    if (code === 403) {
+      return true
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return /^403:/.test(message)
+}
+
 /**
  * True for a hard auth rejection (401/403) as opposed to a transient failure.
  * Deliberately shape-based: 429 is a throttle and 5xx is a server fault, and
  * both must keep polling.
  */
 export function isAuthRejectionError(error: unknown): boolean {
+  if (error && typeof error === 'object') {
+    const code = (error as { statusCode?: unknown }).statusCode
+    if (code === 401 || code === 403) {
+      return true
+    }
+  }
   const message = error instanceof Error ? error.message : String(error ?? '')
 
   return /^40[13]:/.test(message)
@@ -269,18 +357,46 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
         await probeHealth(`${base}/api/health`, { timeoutMs: healthProbeTimeoutMs })
       }
 
+      // Success (HTTP 200) resets consecutive 401 counter
+      resetEndpoint401State(base)
+
       return
     } catch (error) {
       lastError = error
 
-      // A confirmed 401/403 from a CREDENTIALED probe means the session was
-      // rejected, not that the route is missing. Fail fast into a reauth
-      // state: falling back to the public /api/status would answer 200 and
-      // report a dead session as "ready", deferring the failure to the first
-      // real API call. Applies to the /api/status leg too — it is routed
-      // through the same credentials.
-      if (probeIsCredentialed && isAuthRejectionError(error)) {
+      // A confirmed 403 from a CREDENTIALED probe is a permanent authorization failure.
+      if (probeIsCredentialed && isHttp403Error(error)) {
+        resetEndpoint401State(base)
         throw makeReauthRequiredError(error instanceof Error ? error.message : String(error))
+      }
+
+      // Two-tier 401 classifier for credentialed health probes:
+      // Hard Auth Rejection: >= 2 consecutive 401s within 15s AND gateway was previously 'open'.
+      // Transient Gateway Drop: < 2 consecutive 401s OR gateway was not previously 'open'.
+      if (probeIsCredentialed && isHttp401Error(error)) {
+        const windowMs = options.reauthDebounceWindowMs ?? DEFAULT_REAUTH_DEBOUNCE_WINDOW_MS
+        const threshold = options.reauthConsecutiveThreshold ?? DEFAULT_REAUTH_CONSECUTIVE_THRESHOLD
+        const currentTime = now()
+        const state = recordEndpoint401(base, currentTime, windowMs)
+        const wasPreviouslyOpen = options.previousGatewayState === 'open'
+        const isConsecutive401Met =
+          state.consecutive401Count >= threshold &&
+          (currentTime - state.first401Timestamp) <= windowMs
+
+        if (wasPreviouslyOpen && isConsecutive401Met) {
+          resetEndpoint401State(base)
+          throw makeReauthRequiredError(error instanceof Error ? error.message : String(error))
+        }
+
+        // Transient gateway drop: do not escalate to reauth and do not fall back to /api/status.
+        // Sleep and retry until deadline or recovery.
+        await sleep(pollMs)
+        continue
+      }
+
+      // Non-401 response/error (503, timeout, network error, 404, 429) resets consecutive counter
+      if (!isHttp401Error(error)) {
+        resetEndpoint401State(base)
       }
 
       // An explicitly missing route means the backend predates /api/health.
