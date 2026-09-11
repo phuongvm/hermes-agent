@@ -91,7 +91,7 @@ The Desktop app maintains pooled remote backend connections (e.g., `conn:intel-n
 
 - **[Risk] Token file permission on Windows** → Mitigation: Use `icacls` equivalent or rely on user-home directory ACL. Document that `$HERMES_HOME` directory-level permissions protect the token file. Test on Windows CI.
 - **[Risk] 503 grace period could mask a genuine startup failure** → Mitigation: Grace period is time-bounded (configurable, default 30s from server boot). After the window closes, normal 401 behavior resumes. The grace period ONLY applies when the server has not yet finished its initialization sequence — a flag is cleared once routes are fully mounted.
-- **[Risk] 15-second debounce could delay legitimate reauth** → Mitigation: The debounce activates only during reconnect transitions. In a healthy-connection state, a single confirmed 401 (from a revoked token, changed password, etc.) still escalates immediately because the gateway state was previously `'open'`.
+- **[Risk] 15-second debounce could delay legitimate reauth** → Mitigation: ≥2 consecutive 401s within 15s required before escalating (uniform D4 threshold). The ≥2 consecutive 401 threshold applies uniformly including healthy-connection state, with explicit cross-reference to D4:72 and normative spec (spec.md:35,44-48).
 - **[Risk] Coalesced profile store errors could hide non-transient failures** → Mitigation: Error absorption is scoped to the reconnect window only. Errors during stable `'open'` state propagate normally.
 
 ## Migration Plan
