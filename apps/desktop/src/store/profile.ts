@@ -37,7 +37,7 @@ import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
-function isGatewayOpen(): boolean {
+export function isGatewayOpen(): boolean {
   const sessionState = $gatewayState.get()
   if (sessionState && sessionState !== 'idle') {
     return sessionState === 'open'
@@ -93,6 +93,7 @@ export function invalidateProfileListFetches(): void {
   // switch must start a fresh fetch against the new backend, not ride the
   // previous backend's in-flight retry chain.
   refreshInFlight = null
+  activeProfileInFlight = null
 }
 
 // Single-flight guard: on gateway open both useBackgroundSync and the
@@ -102,6 +103,10 @@ export function invalidateProfileListFetches(): void {
 let refreshInFlight: Promise<ProfileInfo[]> | null = null
 
 export function refreshProfiles(): Promise<ProfileInfo[]> {
+  if (!isGatewayOpen()) {
+    return Promise.resolve($profiles.get())
+  }
+
   if (refreshInFlight) {
     return refreshInFlight
   }
@@ -111,10 +116,14 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
     const MAX_RETRIES = 2
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (!isGatewayOpen() || epoch !== profileListEpoch) {
+        return $profiles.get()
+      }
+
       try {
         const { profiles } = await getProfiles()
 
-        if (epoch === profileListEpoch) {
+        if (epoch === profileListEpoch && isGatewayOpen()) {
           $profiles.set(profiles)
         }
 
@@ -247,17 +256,19 @@ export async function refreshActiveProfile(): Promise<void> {
 
       // Same stale-response guard as refreshProfiles: a backend switch mid-fetch
       // means this answer describes the PREVIOUS backend.
-      if (epoch === profileListEpoch) {
+      if (epoch === profileListEpoch && isGatewayOpen()) {
         setActiveProfile(res.current || 'default')
       }
     } catch {
       // Backend may not be ready; keep the last known value.
     }
 
-    try {
-      await refreshProfiles()
-    } catch {
-      // Leave the cached list in place.
+    if (epoch === profileListEpoch && isGatewayOpen()) {
+      try {
+        await refreshProfiles()
+      } catch {
+        // Leave the cached list in place.
+      }
     }
   })().finally(() => {
     if (activeProfileInFlight === flight) {

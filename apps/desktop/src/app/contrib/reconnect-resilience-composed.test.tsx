@@ -27,27 +27,31 @@ function WiringHarness({
   }
 }) {
   // 1. Mount profile rail hook
-  useProfileRailRefreshOnActive({
-    gatewayState: gatewayState as any,
-    isInitialMount: false
-  })
+  useProfileRailRefreshOnActive(gatewayState)
 
   // 2. Mount background sync hook
   useBackgroundSync({
     activeConnectionId,
     activeGatewayProfile,
-    gatewayState: gatewayState as any,
-    isTypingBurstActive: () => false,
+    activeIsMessaging: false,
+    activeSessionId: null,
+    activeStoredSessionId: null,
+    freshDraftReady: false,
+    gatewayState,
+    refreshActiveTranscript: () => {},
+    refreshCronJobs: () => {},
     refreshCurrentModel: async (force?: boolean) => {
       counts.model += 1
     },
-    refreshHermesConfig: async (force?: boolean) => {
+    refreshHermesConfig: async () => {
       counts.config += 1
     },
+    refreshMessagingSessions: () => {},
     refreshSessions: async () => {
       counts.sessions += 1
     },
-    requestGateway: (async () => ({})) as any
+    requestGateway: (async () => ({})) as any,
+    updateSessionState: ((() => ({})) as any)
   })
 
   // 3. Mount scope change wiring (from wiring.tsx:532-563)

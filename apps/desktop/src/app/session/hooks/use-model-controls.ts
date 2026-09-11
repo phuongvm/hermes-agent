@@ -8,7 +8,7 @@ import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
 import { notifyError } from '@/store/notifications'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, isGatewayOpen } from '@/store/profile'
 import {
   $activeSessionId,
   $currentModel,
@@ -45,6 +45,7 @@ export function useModelControls({
   const { t } = useI18n()
   const copy = t.desktop
   const profileRefreshEpochRef = useRef(0)
+  const inFlightModelFetchRef = useRef<Promise<any> | null>(null)
 
   // All callbacks here read reactive session state from the store (.get())
   // rather than capturing it as a prop. The actions bag in wiring.tsx mutates
@@ -112,6 +113,10 @@ export function useModelControls({
   // draft / session events. A live session owns the footer, so skip entirely.
   const refreshCurrentModel = useCallback(
     async (force = false) => {
+      if (!isGatewayOpen()) {
+        return
+      }
+
       // A forced profile swap opens a new intent epoch; an older in-flight
       // response for a previous profile must stand down when it resolves.
       if (force) {
@@ -151,9 +156,24 @@ export function useModelControls({
         // that lands while getGlobalModelInfo is in flight wins over this older
         // default — value comparisons alone miss re-selecting the same row.
         const selectionGeneration = getComposerSelectionGeneration()
-        const result = await getGlobalModelInfo(profile)
+
+        let fetchPromise = inFlightModelFetchRef.current
+        if (!fetchPromise) {
+          fetchPromise = getGlobalModelInfo(profile)
+          inFlightModelFetchRef.current = fetchPromise
+        }
+
+        let result
+        try {
+          result = await fetchPromise
+        } finally {
+          if (inFlightModelFetchRef.current === fetchPromise) {
+            inFlightModelFetchRef.current = null
+          }
+        }
 
         if (
+          !isGatewayOpen() ||
           profileRefreshEpochRef.current !== profileRefreshEpoch ||
           $activeSessionId.get() ||
           getComposerSelectionGeneration() !== selectionGeneration ||

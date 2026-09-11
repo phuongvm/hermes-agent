@@ -147,6 +147,7 @@ import {
   resolveActiveTranscriptSession,
   useBackgroundSync
 } from './hooks/use-background-sync'
+import { useGatewayScopeRefresh } from './hooks/use-gateway-scope-refresh'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
@@ -532,45 +533,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Swapping the live gateway to another source or profile must re-pull that
   // source's model/config/profile state. Two sources commonly both expose a
   // `default` profile, so profile alone is not a sufficient identity.
-  const gatewayScope = `${activeConnectionId ?? ''}\0${activeGatewayProfile}`
-  const lastGatewayScopeRef = useRef(gatewayScope)
-  const pendingGatewayScopeRefreshRef = useRef(false)
-
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    if (gatewayScope === lastGatewayScopeRef.current) {
-      return
-    }
-
-    lastGatewayScopeRef.current = gatewayScope
-    resetProjectTreeState()
-
-    // When the gateway is not open, do not fire background requests into a
-    // disconnected backend. Mark a pending refresh to run when the gateway reconnects.
-    if (gatewayState !== 'open') {
-      pendingGatewayScopeRefreshRef.current = true
-      return
-    }
-
-    pendingGatewayScopeRefreshRef.current = false
-    // Force: the new source/profile pair has its own defaults, so reseed the
-    // selector even if the composer already shows values from the previous
-    // backend. These refreshes carry intent tokens so an in-flight picker
-    // click still wins.
-    void refreshCurrentModel(true)
-    void refreshHermesConfig(true)
-    void refreshActiveProfile()
-  }, [gatewayScope, gatewayState, refreshCurrentModel, refreshHermesConfig])
-
-  // Process deferred scope refresh once the gateway transitions to 'open'
-  useEffect(() => {
-    if (gatewayState === 'open' && pendingGatewayScopeRefreshRef.current) {
-      pendingGatewayScopeRefreshRef.current = false
-      void refreshCurrentModel(true)
-      void refreshHermesConfig(true)
-      void refreshActiveProfile()
-    }
-  }, [gatewayState, refreshCurrentModel, refreshHermesConfig])
+  useGatewayScopeRefresh({
+    activeConnectionId,
+    activeGatewayProfile,
+    gatewayState,
+    refreshCurrentModel,
+    refreshHermesConfig,
+    refreshActiveProfile,
+    onScopeChanged: resetProjectTreeState
+  })
 
   // New session anchored to a workspace. Seeds cwd + branch from the clicked
   // workspace; an explicit worktree path also drills the sidebar into that

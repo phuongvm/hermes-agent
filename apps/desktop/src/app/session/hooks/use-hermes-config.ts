@@ -5,6 +5,7 @@ import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
+import { isGatewayOpen } from '@/store/profile'
 import {
   getComposerSelectionGeneration,
   getCurrentModelSource,
@@ -54,9 +55,14 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
   const [voiceMaxRecordingSeconds, setVoiceMaxRecordingSeconds] = useState(DEFAULT_VOICE_SECONDS)
   const [sttEnabled, setSttEnabled] = useState(true)
   const profileRefreshEpochRef = useRef(0)
+  const inFlightFetchRef = useRef<Promise<[any, any]> | null>(null)
 
   const refreshHermesConfig = useCallback(
     async (force = false, shouldPublish: () => boolean = () => true) => {
+      if (!isGatewayOpen()) {
+        return
+      }
+
       if (force) {
         profileRefreshEpochRef.current += 1
       }
@@ -64,8 +70,18 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
       const profileRefreshEpoch = profileRefreshEpochRef.current
       const selectionGeneration = getComposerSelectionGeneration()
 
+      let fetchPromise = inFlightFetchRef.current
+      if (!fetchPromise) {
+        fetchPromise = Promise.all([getHermesConfig(), getHermesConfigDefaults().catch(() => ({}))])
+        inFlightFetchRef.current = fetchPromise
+      }
+
       try {
-        const [config, defaults] = await Promise.all([getHermesConfig(), getHermesConfigDefaults().catch(() => ({}))])
+        const [config, defaults] = await fetchPromise
+
+        if (!isGatewayOpen()) {
+          return
+        }
 
         const canPublish = () => profileRefreshEpochRef.current === profileRefreshEpoch && shouldPublish()
 
@@ -149,6 +165,10 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         applyThinkingSoundFromConfig(config)
       } catch {
         // Config is nice-to-have; chat still works without it.
+      } finally {
+        if (inFlightFetchRef.current === fetchPromise) {
+          inFlightFetchRef.current = null
+        }
       }
     },
     [activeSessionIdRef]
