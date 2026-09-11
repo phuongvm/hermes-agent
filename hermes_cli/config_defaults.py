@@ -960,6 +960,10 @@ DEFAULT_CONFIG = {
         # leaves disconnected sessions ``ended_at IS NULL`` forever — phantom "active" rows in /resume and
         # dashboards. See #65194.
         "startup_orphan_sweep": True,
+        # Grace period (seconds) during dashboard server startup where authenticated requests
+        # receive 503 Service Unavailable (Retry-After: 3) instead of 401 unauthenticated / session_expired.
+        # Hard ceiling on startup cooldown window.
+        "startup_grace_seconds": 30.0,
         # OAuth gate (engaged when --host is set and --insecure is not), read by the Nous Portal
         # plugin. Env HERMES_DASHBOARD_OAUTH_CLIENT_ID / HERMES_DASHBOARD_PORTAL_URL win when
         # non-empty. Empty client_id = no provider; empty portal_url = production.

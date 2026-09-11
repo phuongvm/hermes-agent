@@ -1,6 +1,8 @@
-import { useEffect } from 'react'
+import { useStore } from '@nanostores/react'
+import { useEffect, useRef } from 'react'
 
 import { refreshActiveProfile } from '@/store/profile'
+import { $gatewayState } from '@/store/session'
 
 /**
  * Re-pull the running profile + list on mount, and again whenever the window
@@ -10,17 +12,42 @@ import { refreshActiveProfile } from '@/store/profile'
  * a deleted profile's square lingers in the rail until the user happens to
  * open Manage Profiles (whose own refresh() call was the only other reader).
  *
- * Cheap and best-effort, matching the focus/visibilitychange refresh pattern
- * used elsewhere in the sidebar (see refreshProjects/refreshProjectTree).
- * Extracted into its own hook (rather than left inline in ProfileRail) so the
- * focus/visibility wiring is unit-testable without rendering the whole rail.
+ * Suppressed when gateway state is not 'open' (e.g. 'connecting', 'closed',
+ * 'idle') to prevent IPC timeout / network storms during reconnect windows.
+ * Any suppressed refresh is deferred and coalesced into a single refresh
+ * when the gateway transitions back to 'open'.
  */
-export function useProfileRailRefreshOnActive(): void {
-  useEffect(() => {
-    void refreshActiveProfile()
+export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): void {
+  const storeGatewayState = useStore($gatewayState)
+  const gatewayState = gatewayStateOverride ?? storeGatewayState
+  const prevGatewayStateRef = useRef<string | null>(null)
+  const hasDeferredRefreshRef = useRef(false)
 
+  useEffect(() => {
+    const isInitial = prevGatewayStateRef.current === null
+    const prev = prevGatewayStateRef.current
+    prevGatewayStateRef.current = gatewayState
+
+    if (gatewayState === 'open') {
+      if (isInitial || prev !== 'open' || hasDeferredRefreshRef.current) {
+        hasDeferredRefreshRef.current = false
+        void refreshActiveProfile()
+      }
+    } else {
+      if (isInitial) {
+        hasDeferredRefreshRef.current = true
+      }
+    }
+  }, [gatewayState])
+
+  useEffect(() => {
     const onActive = () => {
       if (document.visibilityState === 'hidden') {
+        return
+      }
+
+      if (gatewayState !== 'open') {
+        hasDeferredRefreshRef.current = true
         return
       }
 
@@ -34,5 +61,5 @@ export function useProfileRailRefreshOnActive(): void {
       window.removeEventListener('focus', onActive)
       document.removeEventListener('visibilitychange', onActive)
     }
-  }, [])
+  }, [gatewayState])
 }

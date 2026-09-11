@@ -156,6 +156,14 @@ async def gated_auth_middleware(
     # route): not a cookie session, must not bounce to /login.
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
         return await call_next(request)
+
+    from hermes_cli.web_server import is_startup_ready
+    if not is_startup_ready(getattr(request.app, "state", None)):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server initializing", "error": "server_initializing"},
+            headers={"Retry-After": "3"},
+        )
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
     # invalid bearer gets the structured 401 so the desktop refreshes/re-logs instead of

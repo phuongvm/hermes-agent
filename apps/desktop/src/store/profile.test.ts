@@ -33,6 +33,8 @@ vi.mock('@/hermes', () => ({
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+const notifyError = vi.fn()
+vi.mock('@/store/notifications', () => ({ notifyError }))
 
 const {
   $activeGatewayProfile,
@@ -294,6 +296,40 @@ describe('refreshProfiles shared rail list (#49289)', () => {
 
     expect(vi.mocked(getProfiles)).toHaveBeenCalledTimes(3)
     expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'test1'])
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Failed to refresh profiles')
+  })
+
+  it('absorbs network error when gatewayState is connecting: retains cached profiles and suppresses toast', async () => {
+    notifyError.mockClear()
+    $profiles.set([profile('default', true), profile('cached-1')])
+    const { $gatewayState } = await import('./session')
+    $gatewayState.set('connecting')
+    $gateway.set({ id: 'live-socket', connectionState: 'connecting' })
+    vi.mocked(getProfiles).mockRejectedValue(new Error('Network error: ECONNREFUSED'))
+
+    const result = await refreshProfiles()
+
+    expect(result.map(p => p.name)).toEqual(['default', 'cached-1'])
+    expect($profiles.get().map(p => p.name)).toEqual(['default', 'cached-1'])
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('surfaces network error when gatewayState is open: displays toast and throws error', async () => {
+    notifyError.mockClear()
+    $profiles.set([profile('default', true), profile('cached-1')])
+    const { $gatewayState } = await import('./session')
+    $gatewayState.set('open')
+    $gateway.set({ id: 'live-socket', connectionState: 'open' })
+    vi.mocked(getProfiles).mockRejectedValue(new Error('Network error: server error'))
+
+    const refresh = refreshProfiles()
+    const rejection = expect(refresh).rejects.toThrow('Network error: server error')
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(1000)
+    await rejection
+
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Failed to refresh profiles')
+    expect($profiles.get().map(p => p.name)).toEqual(['default', 'cached-1'])
   })
 })
 

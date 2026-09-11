@@ -1,5 +1,5 @@
 import { act, renderHook } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { refreshActiveProfile } = vi.hoisted(() => ({
   refreshActiveProfile: vi.fn().mockResolvedValue(undefined)
@@ -7,15 +7,20 @@ const { refreshActiveProfile } = vi.hoisted(() => ({
 
 vi.mock('@/store/profile', () => ({ refreshActiveProfile }))
 
+import { $gatewayState } from '@/store/session'
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
 describe('useProfileRailRefreshOnActive', () => {
+  beforeEach(() => {
+    $gatewayState.set('open')
+  })
+
   afterEach(() => {
     refreshActiveProfile.mockClear()
     vi.restoreAllMocks()
   })
 
-  it('refreshes once on mount', () => {
+  it('refreshes once on mount when gateway is open', () => {
     renderHook(() => useProfileRailRefreshOnActive())
 
     expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
@@ -86,6 +91,70 @@ describe('useProfileRailRefreshOnActive', () => {
       window.dispatchEvent(new Event('focus'))
     })
 
+    expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT refresh on mount when gateway is in connecting state', () => {
+    $gatewayState.set('connecting')
+    renderHook(() => useProfileRailRefreshOnActive())
+
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+  })
+
+  it('does NOT refresh when window regains focus while gateway is in connecting state', async () => {
+    $gatewayState.set('connecting')
+    renderHook(() => useProfileRailRefreshOnActive())
+    refreshActiveProfile.mockClear()
+
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'))
+    })
+
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+  })
+
+  it('does NOT refresh when visibilitychange fires while gateway is in connecting state', async () => {
+    $gatewayState.set('connecting')
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    renderHook(() => useProfileRailRefreshOnActive())
+    refreshActiveProfile.mockClear()
+
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+  })
+
+  it('refreshes once on reconnect when gateway transitions from connecting to open', async () => {
+    $gatewayState.set('connecting')
+    renderHook(() => useProfileRailRefreshOnActive())
+
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+
+    await act(async () => {
+      $gatewayState.set('open')
+    })
+
+    expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
+  })
+
+  it('defers focus refresh during disconnect and executes single coalesced refresh on reconnect', async () => {
+    $gatewayState.set('connecting')
+    renderHook(() => useProfileRailRefreshOnActive())
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+
+    // Multiple focus events while disconnected
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'))
+      window.dispatchEvent(new Event('focus'))
+    })
+    expect(refreshActiveProfile).not.toHaveBeenCalled()
+
+    // Reconnect to open -> single coalesced refresh
+    await act(async () => {
+      $gatewayState.set('open')
+    })
     expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
   })
 })

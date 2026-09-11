@@ -289,10 +289,105 @@ from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 app.include_router(_memory_oauth_router)
 
 # Session token for sensitive endpoints. The desktop shell mints it via
-# HERMES_DASHBOARD_SESSION_TOKEN; otherwise fresh per server start. It dies with
-# the process and is injected into the SPA HTML so only the web UI can use it.
+# HERMES_DASHBOARD_SESSION_TOKEN; otherwise durable on-disk fallback in
+# $HERMES_HOME/.dashboard_session_token (0o600). Preserved across restarts
+# to prevent spurious 401 re-auth pop-ups.
+_DASHBOARD_TOKEN_FILE = ".dashboard_session_token"
+
+
+def _secure_token_file(path: Path) -> None:
+    """Ensure token file is accessible only to the owner (0o600 on Unix, restricted DACL on Windows)."""
+    if not path.exists():
+        return
+    from hermes_constants import secure_parent_dir
+    secure_parent_dir(path)
+    if os.name == "nt":
+        try:
+            import subprocess
+
+            username = os.environ.get("USERNAME") or ""
+            if not username:
+                try:
+                    username = os.getlogin()
+                except OSError:
+                    pass
+            if not username:
+                try:
+                    import getpass
+                    username = getpass.getuser()
+                except Exception:
+                    pass
+            if username:
+                res = subprocess.run(
+                    ["icacls", str(path), "/inheritance:r", "/grant:r", f"{username}:(F)", "/grant:r", "*S-1-5-18:(F)"],
+                    check=False,
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if res.returncode != 0:
+                    _log.warning(
+                        "icacls failed setting ACL on %s (exit %d): %s",
+                        path,
+                        res.returncode,
+                        res.stderr.decode("utf-8", errors="replace"),
+                    )
+        except Exception as exc:
+            _log.warning("Failed setting Windows ACL on %s: %s", path, exc)
+    else:
+        try:
+            mode = path.stat().st_mode & 0o777
+            if mode != 0o600:
+                os.chmod(path, 0o600)
+        except OSError as exc:
+            _log.warning("Failed setting mode 0600 on %s: %s", path, exc)
+
+
 def _resolve_session_token() -> str:
-    return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+    env_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
+    if env_token:
+        return env_token
+
+    from hermes_constants import get_hermes_home, secure_parent_dir
+
+    token_path = get_hermes_home() / _DASHBOARD_TOKEN_FILE
+    try:
+        if token_path.is_file():
+            _secure_token_file(token_path)
+            token = token_path.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        _log.debug("Failed reading session token file %s: %s", token_path, exc)
+
+    token = secrets.token_urlsafe(32)
+    tmp_path: Optional[Path] = None
+    try:
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        secure_parent_dir(token_path)
+        tmp_path = token_path.with_name(f"{token_path.name}.tmp.{os.getpid()}.{secrets.token_hex(6)}")
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+        os.replace(tmp_path, token_path)
+        _secure_token_file(token_path)
+    except OSError as exc:
+        _log.warning("Could not persist session token to %s: %s", token_path, exc)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+
+    # Re-read the final persisted token from disk so every concurrent caller
+    # returns the exact same persisted credential (last-writer-wins convergence).
+    for _ in range(10):
+        try:
+            if token_path.is_file():
+                persisted = token_path.read_text(encoding="utf-8").strip()
+                if persisted:
+                    return persisted
+        except (OSError, UnicodeDecodeError):
+            time.sleep(0.01)
+    return token
 
 
 _SESSION_TOKEN = _resolve_session_token()
@@ -300,6 +395,52 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
 _SSH_RUNTIME_MARKER: Optional[str] = None
+
+# Startup readiness flag and grace period tracking. During the startup window
+# (before routes and plugins are fully ready), authenticated endpoints return
+# 503 Service Unavailable (Retry-After: 3) instead of 401 session_expired / unauthenticated,
+# preventing client re-auth pop-up storms during daemon restarts.
+_startup_ready: bool = False
+_startup_start_monotonic: float = time.monotonic()
+
+
+def is_startup_ready(app_state=None) -> bool:
+    """Check if server initialization has finished or startup grace period has expired."""
+    global _startup_ready, _startup_start_monotonic
+    if app_state is not None and hasattr(app_state, "startup_ready"):
+        if getattr(app_state, "startup_ready", False):
+            return True
+    elif _startup_ready:
+        return True
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        grace_s = float((cfg.get("dashboard") or {}).get("startup_grace_seconds", 30.0))
+    except Exception:
+        grace_s = 30.0
+
+    start_time = getattr(app_state, "startup_start_monotonic", _startup_start_monotonic) if app_state else _startup_start_monotonic
+    if (time.monotonic() - start_time) >= grace_s:
+        return True
+    return False
+
+
+def set_startup_ready(ready: bool = True, app_state=None) -> None:
+    """Set server startup readiness state."""
+    global _startup_ready, _startup_start_monotonic
+    _startup_ready = ready
+    if not ready:
+        _startup_start_monotonic = time.monotonic()
+    if app_state is not None:
+        app_state.startup_ready = ready
+        if not ready:
+            app_state.startup_start_monotonic = _startup_start_monotonic
+    elif hasattr(app, "state"):
+        app.state.startup_ready = ready
+        if not ready:
+            app.state.startup_start_monotonic = _startup_start_monotonic
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -635,10 +776,15 @@ async def auth_middleware(request: Request, call_next):
         and path.startswith("/api/")
         and path not in _PUBLIC_API_PATHS
         and not path.startswith("/api/mcp/oauth/callback/")
-        and not _has_valid_session_token(request)
-        and not _has_valid_query_token(request, path)
     ):
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        if not is_startup_ready(getattr(request.app, "state", None)):
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Server initializing", "error": "server_initializing"},
+                headers={"Retry-After": "3"},
+            )
+        if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     return await call_next(request)
 
 
@@ -973,6 +1119,7 @@ from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  #
 
 app.include_router(_dashboard_auth_router)
 mount_spa(app)
+set_startup_ready(True)
 
 
 def _no_auth_provider_message(host: str) -> str:
@@ -1303,6 +1450,7 @@ def _on_server_started(
         _hb_loop.call_later(_hb_interval, _loop_heartbeat, now + _hb_interval)
 
     _hb_loop.call_later(_hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval)
+    set_startup_ready(True)
 
 
 def _run_serve(serve, config, host: str, port: int) -> None:
@@ -1371,6 +1519,7 @@ def start_server(
     until the ready sentinel is written so its SDK import can't hold the GIL
     against the pre-bind path.
     """
+    set_startup_ready(False)
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 

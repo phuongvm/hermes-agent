@@ -27,10 +27,24 @@ import {
 import { notifyError } from '@/store/notifications'
 import { $poolLimits } from '@/store/pool-limits'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
-import { clearComposerSelectionOwner, setComposerSelectionOwner, setConnection } from '@/store/session'
+import {
+  $gatewayState,
+  clearComposerSelectionOwner,
+  setComposerSelectionOwner,
+  setConnection
+} from '@/store/session'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
+
+function isGatewayOpen(): boolean {
+  const sessionState = $gatewayState.get()
+  if (sessionState && sessionState !== 'idle') {
+    return sessionState === 'open'
+  }
+
+  return $gateway.get()?.connectionState === 'open'
+}
 
 // Canonical key for a profile: trimmed, empty → "default". Used everywhere we
 // compare a session's owning profile against the live gateway's profile.
@@ -106,12 +120,25 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
 
         return profiles
       } catch (error) {
+        if (!isGatewayOpen()) {
+          // Group 4: Profile Store Error Absorption
+          // Silently absorb network errors when gateway state is not 'open',
+          // preserving cached profile data in the UI instead of surfacing
+          // uncaught promise rejections or error toasts.
+          console.warn(
+            `[profiles] refreshProfiles network error absorbed during gateway disconnect/reconnect:`,
+            error
+          )
+          return $profiles.get()
+        }
+
         if (attempt === MAX_RETRIES || epoch !== profileListEpoch) {
           // Surface the failure so it's visible in the console — the prior
           // silent catch in refreshActiveProfile() hid global-remote timing
           // races (#70679). A stranded epoch stops retrying against the past.
           console.error(`[profiles] refreshProfiles failed after ${attempt + 1} attempt(s):`, error)
 
+          notifyError(error, 'Failed to refresh profiles')
           throw error
         }
 
@@ -123,7 +150,7 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
     }
 
     // Unreachable — satisfies TypeScript.
-    return []
+    return $profiles.get()
   })().finally(() => {
     if (refreshInFlight === flight) {
       refreshInFlight = null

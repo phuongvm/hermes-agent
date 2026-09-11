@@ -637,6 +637,7 @@ export function useBackgroundSync({
     }
 
     void refreshCurrentModel()
+    void refreshHermesConfig()
     void refreshActiveProfile()
     void refreshSessions()
 
@@ -655,7 +656,15 @@ export function useBackgroundSync({
         })
         .catch(() => undefined)
     }
-  }, [activeConnectionId, activeGatewayProfile, gatewayState, refreshCurrentModel, refreshSessions, requestGateway])
+  }, [
+    activeConnectionId,
+    activeGatewayProfile,
+    gatewayState,
+    refreshCurrentModel,
+    refreshHermesConfig,
+    refreshSessions,
+    requestGateway
+  ])
 
   // Reconnect backstop (#94779): turns that finished while the socket was
   // down never replay their sessions.changed tick, so the open transcript
@@ -903,8 +912,24 @@ export function useBackgroundSync({
 
   // A fresh new-session draft (gateway open, no active session) re-pulls the
   // model + config so the composer pill reflects the profile default.
+  const prevFreshDraftStateRef = useRef({ activeSessionId, freshDraftReady, gatewayState })
+
   useEffect(() => {
-    if (gatewayState === 'open' && !activeSessionId && freshDraftReady) {
+    const prev = prevFreshDraftStateRef.current
+    prevFreshDraftStateRef.current = { activeSessionId, freshDraftReady, gatewayState }
+
+    if (gatewayState !== 'open' || activeSessionId || !freshDraftReady) {
+      return
+    }
+
+    // When reconnecting to 'open', the connect effect already fired the coalesced
+    // refresh for model and config. Only fire here if this is a fresh draft state transition
+    // while the gateway was already 'open'.
+    if (prev.gatewayState !== 'open') {
+      return
+    }
+
+    if (prev.activeSessionId !== activeSessionId || prev.freshDraftReady !== freshDraftReady) {
       void refreshCurrentModel()
       void refreshHermesConfig()
     }
