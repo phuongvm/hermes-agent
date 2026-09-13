@@ -11,6 +11,8 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  executeWithNativeBearerSingleReplay,
+  isAuthoritative401,
   normalizeAdvertisedAuthProviders,
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -170,4 +172,139 @@ test('resolveGatedDownloadAuth uses the session token for token and local modes'
   })
   assert.deepEqual(resolveGatedDownloadAuth('local', null, 'sess'), { kind: 'token', token: 'sess' })
   assert.deepEqual(resolveGatedDownloadAuth(undefined, null, null), { kind: 'token', token: null })
+})
+
+// --- 7. native bearer single-replay contract on authoritative 401 ---
+
+test('isAuthoritative401 detects statusCode 401 and 401: error messages', () => {
+  assert.equal(isAuthoritative401({ statusCode: 401 }), true)
+  assert.equal(isAuthoritative401(Object.assign(new Error('unauthorized'), { statusCode: 401 })), true)
+  assert.equal(isAuthoritative401(new Error('401: Unauthorized')), true)
+  assert.equal(isAuthoritative401({ statusCode: 403 }), false)
+  assert.equal(isAuthoritative401({ statusCode: 500 }), false)
+  assert.equal(isAuthoritative401(new Error('500: Internal Server Error')), false)
+  assert.equal(isAuthoritative401(null), false)
+  assert.equal(isAuthoritative401(undefined), false)
+})
+
+test('executeWithNativeBearerSingleReplay returns on first try when request succeeds', async () => {
+  let refreshCalled = 0
+  const result = await executeWithNativeBearerSingleReplay(
+    'https://gateway',
+    'initial-token',
+    async bearer => `ok-${bearer}`,
+    async () => {
+      refreshCalled++
+      return 'refreshed-token'
+    }
+  )
+
+  assert.equal(result, 'ok-initial-token')
+  assert.equal(refreshCalled, 0)
+})
+
+test('executeWithNativeBearerSingleReplay force-refreshes and replays once on authoritative 401', async () => {
+  const calls: string[] = []
+  let refreshCalled = 0
+
+  const result = await executeWithNativeBearerSingleReplay(
+    'https://gateway',
+    'initial-token',
+    async bearer => {
+      calls.push(bearer)
+      if (bearer === 'initial-token') {
+        const err: any = new Error('401: Unauthorized')
+        err.statusCode = 401
+        throw err
+      }
+      return `ok-${bearer}`
+    },
+    async baseUrl => {
+      refreshCalled++
+      assert.equal(baseUrl, 'https://gateway')
+      return 'refreshed-token'
+    }
+  )
+
+  assert.equal(result, 'ok-refreshed-token')
+  assert.deepEqual(calls, ['initial-token', 'refreshed-token'])
+  assert.equal(refreshCalled, 1)
+})
+
+test('executeWithNativeBearerSingleReplay bubbles 401 without replaying if refresh returns null', async () => {
+  let refreshCalled = 0
+  const calls: string[] = []
+
+  await assert.rejects(
+    () =>
+      executeWithNativeBearerSingleReplay(
+        'https://gateway',
+        'initial-token',
+        async bearer => {
+          calls.push(bearer)
+          const err: any = new Error('401: Unauthorized')
+          err.statusCode = 401
+          throw err
+        },
+        async () => {
+          refreshCalled++
+          return null
+        }
+      ),
+    /401: Unauthorized/
+  )
+
+  assert.deepEqual(calls, ['initial-token'])
+  assert.equal(refreshCalled, 1)
+})
+
+test('executeWithNativeBearerSingleReplay performs at most ONE replay if replayed request also 401s', async () => {
+  let refreshCalled = 0
+  const calls: string[] = []
+
+  await assert.rejects(
+    () =>
+      executeWithNativeBearerSingleReplay(
+        'https://gateway',
+        'initial-token',
+        async bearer => {
+          calls.push(bearer)
+          const err: any = new Error(`401: Rejection for ${bearer}`)
+          err.statusCode = 401
+          throw err
+        },
+        async () => {
+          refreshCalled++
+          return 'refreshed-token'
+        }
+      ),
+    /401: Rejection for refreshed-token/
+  )
+
+  assert.deepEqual(calls, ['initial-token', 'refreshed-token'])
+  assert.equal(refreshCalled, 1)
+})
+
+test('executeWithNativeBearerSingleReplay does not refresh on non-401 errors', async () => {
+  let refreshCalled = 0
+
+  await assert.rejects(
+    () =>
+      executeWithNativeBearerSingleReplay(
+        'https://gateway',
+        'initial-token',
+        async () => {
+          const err: any = new Error('500: Internal Server Error')
+          err.statusCode = 500
+          throw err
+        },
+        async () => {
+          refreshCalled++
+          return 'refreshed-token'
+        }
+      ),
+    /500: Internal Server Error/
+  )
+
+  assert.equal(refreshCalled, 0)
 })

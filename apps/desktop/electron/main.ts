@@ -260,6 +260,7 @@ import {
 import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
+  executeWithNativeBearerSingleReplay,
   oauthGuardMayHardFail,
   oauthSessionIsLive,
   oauthTicketFailureAuthMessage,
@@ -15933,13 +15934,19 @@ async function fetchJsonForBackend(
     const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl)
 
     if (nativeAt) {
-      return fetchJson(url, null, {
-        method: opts.method,
-        body: opts.body,
-        timeoutMs: opts.timeoutMs,
-        bearer: nativeAt,
-        headers: descriptor.headers
-      })
+      return executeWithNativeBearerSingleReplay(
+        descriptor.baseUrl,
+        nativeAt,
+        bearer =>
+          fetchJson(url, null, {
+            method: opts.method,
+            body: opts.body,
+            timeoutMs: opts.timeoutMs,
+            bearer,
+            headers: descriptor.headers
+          }),
+        baseUrl => ensureNativeAccessToken(baseUrl, { force: true })
+      )
     }
 
     return fetchJsonViaOauthSession(url, {
@@ -16671,12 +16678,18 @@ async function handleHermesApiRequest(request: unknown): Promise<unknown> {
           const restAuth = resolveOauthRestAuth(nativeAt)
 
           if (restAuth.kind === 'bearer') {
-            response = await fetchJson(url, null, {
-              method: req.method,
-              body: req.body,
-              timeoutMs,
-              bearer: restAuth.token
-            })
+            response = await executeWithNativeBearerSingleReplay(
+              connection.baseUrl,
+              restAuth.token,
+              bearer =>
+                fetchJson(url, null, {
+                  method: req.method,
+                  body: req.body,
+                  timeoutMs,
+                  bearer
+                }),
+              baseUrl => ensureNativeAccessToken(baseUrl, { force: true })
+            )
           } else {
             response = await fetchJsonViaOauthSession(url, {
               method: req.method,

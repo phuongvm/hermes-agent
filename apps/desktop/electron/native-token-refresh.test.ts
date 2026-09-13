@@ -144,4 +144,71 @@ describe('native token renewal', () => {
     await Promise.all([context.ensure('gateway-a'), context.ensure('gateway-b')])
     expect(context.refresh).toHaveBeenCalledTimes(2)
   })
+
+  it('bypasses local expiresAt on forced refresh and mints new token via refreshToken', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+    expect(await context.ensure('gateway')).toBe('old-at')
+    expect(context.refresh).not.toHaveBeenCalled()
+
+    const refreshed = await context.ensure('gateway', { force: true })
+    expect(refreshed).toBe('new-at')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(context.store).toHaveBeenCalledTimes(1)
+    expect(context.get()?.accessToken).toBe('new-at')
+  })
+
+  it('coalesces concurrent forced refresh callers into a single in-flight refresh promise', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => context.ensure('gateway', { force: true }))
+    )
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(results).toEqual(Array(10).fill('new-at'))
+    expect(context.store).toHaveBeenCalledTimes(1)
+    expect(context.get()?.accessToken).toBe('new-at')
+  })
+
+  it('does not overwrite newer tokens with stale in-flight forced refresh results', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+
+    const pending = context.ensure('gateway', { force: true })
+    context.set({ ...context.get()!, accessToken: 'newer-at', refreshToken: 'newer-rt' })
+
+    expect(await pending).toBe('newer-at')
+    expect(context.store).not.toHaveBeenCalled()
+    expect(context.get()?.accessToken).toBe('newer-at')
+  })
+
+  it('clears credentials when forced refresh fails with 401', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    expect(await context.ensure('gateway', { force: true })).toBeNull()
+    expect(context.clear).toHaveBeenCalledTimes(1)
+    expect(context.get()).toBeNull()
+  })
+
+  it('clears credentials on forced refresh when no refreshToken is present', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, refreshToken: '', expiresAt: 5000 })
+
+    expect(await context.ensure('gateway', { force: true })).toBeNull()
+    expect(context.clear).toHaveBeenCalledTimes(1)
+    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.get()).toBeNull()
+  })
+
+  it('supports forceRefresh convenience method on the refresher function', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+
+    const refreshed = await context.ensure.forceRefresh!('gateway')
+    expect(refreshed).toBe('new-at')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+  })
 })

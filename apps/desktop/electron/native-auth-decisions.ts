@@ -233,3 +233,47 @@ export function oauthGuardMayHardFail(providers: unknown): boolean {
 
   return !named.every(provider => provider.supportsPassword)
 }
+
+/**
+ * True only when an error represents an authoritative 401 HTTP response
+ * (either with statusCode property 401 or formatted as a standard Error
+ * with message starting with "401:").
+ */
+export function isAuthoritative401(error: unknown): boolean {
+  if (error && typeof error === 'object' && 'statusCode' in error && Number((error as any).statusCode) === 401) {
+    return true
+  }
+
+  if (error instanceof Error && /^401:/.test(error.message)) {
+    return true
+  }
+
+  return false
+}
+
+/**
+ * Execute a request using an active native bearer token. When the request fails
+ * with an authoritative 401 (e.g. token revoked or rejected remotely before
+ * local client-side expiry), trigger at most ONE forced refresh and replay the
+ * request once with the rotated bearer before escalating or bubbling the 401.
+ */
+export async function executeWithNativeBearerSingleReplay<T>(
+  baseUrl: string,
+  initialBearer: string,
+  execute: (bearer: string) => Promise<T>,
+  forceRefresh: (baseUrl: string) => Promise<string | null>
+): Promise<T> {
+  try {
+    return await execute(initialBearer)
+  } catch (error) {
+    if (isAuthoritative401(error)) {
+      const refreshedAt = await forceRefresh(baseUrl)
+
+      if (refreshedAt) {
+        return await execute(refreshedAt)
+      }
+    }
+
+    throw error
+  }
+}

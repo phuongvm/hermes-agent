@@ -8,32 +8,20 @@ interface NativeTokenRefreshIo {
   now?: () => number
 }
 
-export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
+export interface EnsureNativeAccessTokenOptions {
+  force?: boolean
+}
+
+export interface NativeTokenRefresher {
+  (baseUrl: string, options?: EnsureNativeAccessTokenOptions): Promise<string | null>
+  force?: (baseUrl: string) => Promise<string | null>
+  forceRefresh?: (baseUrl: string) => Promise<string | null>
+}
+
+export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeTokenRefresher {
   const inFlight = new Map<string, Promise<string | null>>()
 
-  async function resolve(baseUrl: string): Promise<string | null> {
-    const tokens = io.load(baseUrl)
-
-    if (!tokens) {
-      return null
-    }
-
-    const now = io.now?.() ?? Math.floor(Date.now() / 1000)
-
-    if (!tokenNeedsRefresh(tokens, now)) {
-      return tokens.accessToken
-    }
-
-    if (!tokens.refreshToken) {
-      if (Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) {
-        return tokens.accessToken
-      }
-
-      io.clear(baseUrl)
-
-      return null
-    }
-
+  async function resolveRefresh(baseUrl: string, tokens: NativeTokenSet): Promise<string | null> {
     const unchanged = () => {
       const current = io.load(baseUrl)
 
@@ -74,14 +62,40 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
     }
   }
 
-  return function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
+  function ensureNativeAccessToken(
+    baseUrl: string,
+    options?: EnsureNativeAccessTokenOptions
+  ): Promise<string | null> {
     const pending = inFlight.get(baseUrl)
 
     if (pending) {
       return pending
     }
 
-    const request = resolve(baseUrl).finally(() => {
+    const tokens = io.load(baseUrl)
+
+    if (!tokens) {
+      return Promise.resolve(null)
+    }
+
+    const now = io.now?.() ?? Math.floor(Date.now() / 1000)
+    const force = Boolean(options?.force)
+
+    if (!force && !tokenNeedsRefresh(tokens, now)) {
+      return Promise.resolve(tokens.accessToken)
+    }
+
+    if (!tokens.refreshToken) {
+      if (!force && Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) {
+        return Promise.resolve(tokens.accessToken)
+      }
+
+      io.clear(baseUrl)
+
+      return Promise.resolve(null)
+    }
+
+    const request = resolveRefresh(baseUrl, tokens).finally(() => {
       if (inFlight.get(baseUrl) === request) {
         inFlight.delete(baseUrl)
       }
@@ -91,4 +105,9 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
 
     return request
   }
+
+  ensureNativeAccessToken.force = (baseUrl: string) => ensureNativeAccessToken(baseUrl, { force: true })
+  ensureNativeAccessToken.forceRefresh = ensureNativeAccessToken.force
+
+  return ensureNativeAccessToken
 }
