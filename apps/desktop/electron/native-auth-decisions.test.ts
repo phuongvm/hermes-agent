@@ -22,6 +22,7 @@ import {
   resolveOauthRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
+import { createNativeTokenRefresher } from './native-token-refresh'
 
 // --- 1. body encoding (guards the double-JSON.stringify 422) ---
 
@@ -189,12 +190,14 @@ test('isAuthoritative401 detects statusCode 401 and 401: error messages', () => 
 
 test('executeWithNativeBearerSingleReplay returns on first try when request succeeds', async () => {
   let refreshCalled = 0
+
   const result = await executeWithNativeBearerSingleReplay(
     'https://gateway',
     'initial-token',
     async bearer => `ok-${bearer}`,
     async () => {
       refreshCalled++
+
       return 'refreshed-token'
     }
   )
@@ -212,16 +215,19 @@ test('executeWithNativeBearerSingleReplay force-refreshes and replays once on au
     'initial-token',
     async bearer => {
       calls.push(bearer)
+
       if (bearer === 'initial-token') {
         const err: any = new Error('401: Unauthorized')
         err.statusCode = 401
         throw err
       }
+
       return `ok-${bearer}`
     },
     async baseUrl => {
       refreshCalled++
       assert.equal(baseUrl, 'https://gateway')
+
       return 'refreshed-token'
     }
   )
@@ -248,6 +254,7 @@ test('executeWithNativeBearerSingleReplay bubbles 401 without replaying if refre
         },
         async () => {
           refreshCalled++
+
           return null
         }
       ),
@@ -275,6 +282,7 @@ test('executeWithNativeBearerSingleReplay performs at most ONE replay if replaye
         },
         async () => {
           refreshCalled++
+
           return 'refreshed-token'
         }
       ),
@@ -300,6 +308,7 @@ test('executeWithNativeBearerSingleReplay does not refresh on non-401 errors', a
         },
         async () => {
           refreshCalled++
+
           return 'refreshed-token'
         }
       ),
@@ -307,4 +316,142 @@ test('executeWithNativeBearerSingleReplay does not refresh on non-401 errors', a
   )
 
   assert.equal(refreshCalled, 0)
+})
+
+test('executeWithNativeBearerSingleReplay passes rejectedBearer to forceRefresh on 401', async () => {
+  let passedRejectedBearer = ''
+  await executeWithNativeBearerSingleReplay(
+    'https://gateway',
+    'my-stale-bearer',
+    async bearer => {
+      if (bearer === 'my-stale-bearer') {
+        const err: any = new Error('401: Unauthorized')
+        err.statusCode = 401
+        throw err
+      }
+
+      return 'ok'
+    },
+    async (baseUrl, rejectedBearer) => {
+      passedRejectedBearer = rejectedBearer
+
+      return 'new-bearer'
+    }
+  )
+  assert.equal(passedRejectedBearer, 'my-stale-bearer')
+})
+
+test('executeWithNativeBearerSingleReplay does not replay if refresh returns the same rejected bearer', async () => {
+  const calls: string[] = []
+  await assert.rejects(
+    () =>
+      executeWithNativeBearerSingleReplay(
+        'https://gateway',
+        'stale-token',
+        async bearer => {
+          calls.push(bearer)
+          const err: any = new Error('401: Unauthorized')
+          err.statusCode = 401
+          throw err
+        },
+        async () => 'stale-token'
+      ),
+    /401: Unauthorized/
+  )
+  assert.deepEqual(calls, ['stale-token'])
+})
+
+test('staggered authoritative 401s for the same rejected bearer share single rotation and both replay successfully', async () => {
+  let tokens: any = {
+    accessToken: 'old-at',
+    refreshToken: 'stable-rt',
+    expiresAt: 9999999999,
+    provider: 'self-hosted',
+    userId: 'user'
+  }
+
+  let refreshes = 0
+  let releaseSecondOld401!: () => void
+  let releaseFirstReplay!: () => void
+  let signalFirstReplayStarted!: () => void
+
+  const secondOld401 = new Promise<void>(resolve => {
+    releaseSecondOld401 = resolve
+  })
+
+  const firstReplayGate = new Promise<void>(resolve => {
+    releaseFirstReplay = resolve
+  })
+
+  const firstReplayStarted = new Promise<void>(resolve => {
+    signalFirstReplayStarted = resolve
+  })
+
+  const ensure = createNativeTokenRefresher({
+    load: () => tokens,
+    store: (_baseUrl, next) => {
+      tokens = next
+    },
+    clear: () => {
+      tokens = null
+    },
+    refresh: async () => {
+      refreshes += 1
+
+      return {
+        access_token: `new-at-${refreshes}`,
+        refresh_token: 'stable-rt',
+        expires_at: 9999999999,
+        provider: 'self-hosted',
+        user_id: 'user'
+      }
+    },
+    now: () => 1000
+  })
+
+  function unauthorized(label: string): Error {
+    return Object.assign(new Error(`401: ${label}`), { statusCode: 401 })
+  }
+
+  const first = executeWithNativeBearerSingleReplay(
+    'https://gateway.example',
+    'old-at',
+    async bearer => {
+      if (bearer === 'old-at') {throw unauthorized('old bearer rejected')}
+      signalFirstReplayStarted()
+      await firstReplayGate
+
+      if (bearer !== tokens?.accessToken) {throw unauthorized('replay bearer invalidated by later refresh')}
+
+      return bearer
+    },
+    (baseUrl, rejectedBearer) => ensure(baseUrl, { force: true, rejectedBearer })
+  )
+
+  const second = executeWithNativeBearerSingleReplay(
+    'https://gateway.example',
+    'old-at',
+    async bearer => {
+      if (bearer === 'old-at') {
+        await secondOld401
+        throw unauthorized('delayed old bearer rejected')
+      }
+
+      if (bearer !== tokens?.accessToken) {throw unauthorized('unexpected stale second replay')}
+
+      return bearer
+    },
+    (baseUrl, rejectedBearer) => ensure(baseUrl, { force: true, rejectedBearer })
+  )
+
+  await firstReplayStarted
+  releaseSecondOld401()
+  const secondResult = await second
+  releaseFirstReplay()
+  const firstResult = await first
+
+  assert.equal(firstResult, 'new-at-1')
+  assert.equal(secondResult, 'new-at-1')
+  assert.equal(refreshes, 1)
+  assert.equal(tokens?.accessToken, 'new-at-1')
 })

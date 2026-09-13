@@ -58,7 +58,6 @@ import {
   resetEndpoint401State,
   waitForHermesReady
 } from './backend-health'
-import { reauthModalLatch } from './reauth-modal-latch'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
@@ -331,6 +330,7 @@ import {
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { reauthModalLatch } from './reauth-modal-latch'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
@@ -15945,7 +15945,7 @@ async function fetchJsonForBackend(
             bearer,
             headers: descriptor.headers
           }),
-        baseUrl => ensureNativeAccessToken(baseUrl, { force: true })
+        (baseUrl, rejectedBearer) => ensureNativeAccessToken(baseUrl, { force: true, rejectedBearer })
       )
     }
 
@@ -16688,7 +16688,7 @@ async function handleHermesApiRequest(request: unknown): Promise<unknown> {
                   timeoutMs,
                   bearer
                 }),
-              baseUrl => ensureNativeAccessToken(baseUrl, { force: true })
+              (baseUrl, rejectedBearer) => ensureNativeAccessToken(baseUrl, { force: true, rejectedBearer })
             )
           } else {
             response = await fetchJsonViaOauthSession(url, {

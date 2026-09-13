@@ -261,15 +261,15 @@ export async function executeWithNativeBearerSingleReplay<T>(
   baseUrl: string,
   initialBearer: string,
   execute: (bearer: string) => Promise<T>,
-  forceRefresh: (baseUrl: string) => Promise<string | null>
+  forceRefresh: (baseUrl: string, rejectedBearer: string) => Promise<string | null>
 ): Promise<T> {
   try {
     return await execute(initialBearer)
   } catch (error) {
     if (isAuthoritative401(error)) {
-      const refreshedAt = await forceRefresh(baseUrl)
+      const refreshedAt = await forceRefresh(baseUrl, initialBearer)
 
-      if (refreshedAt) {
+      if (refreshedAt && refreshedAt !== initialBearer) {
         return await execute(refreshedAt)
       }
     }

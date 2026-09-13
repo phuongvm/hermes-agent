@@ -10,16 +10,17 @@ interface NativeTokenRefreshIo {
 
 export interface EnsureNativeAccessTokenOptions {
   force?: boolean
+  rejectedBearer?: string
 }
 
 export interface NativeTokenRefresher {
-  (baseUrl: string, options?: EnsureNativeAccessTokenOptions): Promise<string | null>
-  force?: (baseUrl: string) => Promise<string | null>
-  forceRefresh?: (baseUrl: string) => Promise<string | null>
+  (baseUrl: string, options?: EnsureNativeAccessTokenOptions | string): Promise<string | null>
+  force?: (baseUrl: string, rejectedBearer?: string) => Promise<string | null>
+  forceRefresh?: (baseUrl: string, rejectedBearer?: string) => Promise<string | null>
 }
 
 export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeTokenRefresher {
-  const inFlight = new Map<string, Promise<string | null>>()
+  const inFlight = new Map<string, { promise: Promise<string | null>; refreshingBearer?: string }>()
 
   async function resolveRefresh(baseUrl: string, tokens: NativeTokenSet): Promise<string | null> {
     const unchanged = () => {
@@ -39,6 +40,7 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
       if (!rotated.refreshToken) {
         rotated.refreshToken = tokens.refreshToken
       }
+
       io.store(baseUrl, rotated)
 
       return rotated.accessToken
@@ -64,13 +66,13 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
 
   function ensureNativeAccessToken(
     baseUrl: string,
-    options?: EnsureNativeAccessTokenOptions
+    options?: EnsureNativeAccessTokenOptions | string
   ): Promise<string | null> {
-    const pending = inFlight.get(baseUrl)
+    const normalizedOptions: EnsureNativeAccessTokenOptions =
+      typeof options === 'string' ? { force: true, rejectedBearer: options } : (options ?? {})
 
-    if (pending) {
-      return pending
-    }
+    const force = Boolean(normalizedOptions.force)
+    const rejectedBearer = normalizedOptions.rejectedBearer
 
     const tokens = io.load(baseUrl)
 
@@ -79,12 +81,32 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
     }
 
     const now = io.now?.() ?? Math.floor(Date.now() / 1000)
-    const force = Boolean(options?.force)
 
+    // 1. Generation/rejected-bearer aware recovery:
+    // If a forced refresh was requested for a specific rejected bearer,
+    // and storage already contains a different access token than the one rejected,
+    // reuse that current bearer instead of forcing another refresh.
+    if (force && rejectedBearer && tokens.accessToken && tokens.accessToken !== rejectedBearer) {
+      if (!tokenNeedsRefresh(tokens, now)) {
+        return Promise.resolve(tokens.accessToken)
+      }
+    }
+
+    // 2. Preserve one in-flight refresh per gateway when the rejected bearer is still current:
+    const pending = inFlight.get(baseUrl)
+
+    if (pending) {
+      if (!rejectedBearer || !pending.refreshingBearer || pending.refreshingBearer === rejectedBearer) {
+        return pending.promise
+      }
+    }
+
+    // 3. Normal client-side expiration check:
     if (!force && !tokenNeedsRefresh(tokens, now)) {
       return Promise.resolve(tokens.accessToken)
     }
 
+    // 4. Missing refresh token handling:
     if (!tokens.refreshToken) {
       if (!force && Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) {
         return Promise.resolve(tokens.accessToken)
@@ -95,18 +117,22 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
       return Promise.resolve(null)
     }
 
+    // 5. Trigger refresh:
+    const refreshingBearer = tokens.accessToken
+
     const request = resolveRefresh(baseUrl, tokens).finally(() => {
-      if (inFlight.get(baseUrl) === request) {
+      if (inFlight.get(baseUrl)?.promise === request) {
         inFlight.delete(baseUrl)
       }
     })
 
-    inFlight.set(baseUrl, request)
+    inFlight.set(baseUrl, { promise: request, refreshingBearer })
 
     return request
   }
 
-  ensureNativeAccessToken.force = (baseUrl: string) => ensureNativeAccessToken(baseUrl, { force: true })
+  ensureNativeAccessToken.force = (baseUrl: string, rejectedBearer?: string) =>
+    ensureNativeAccessToken(baseUrl, { force: true, rejectedBearer })
   ensureNativeAccessToken.forceRefresh = ensureNativeAccessToken.force
 
   return ensureNativeAccessToken

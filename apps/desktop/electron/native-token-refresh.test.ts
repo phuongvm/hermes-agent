@@ -165,6 +165,7 @@ describe('native token renewal', () => {
     const results = await Promise.all(
       Array.from({ length: 10 }, () => context.ensure('gateway', { force: true }))
     )
+
     expect(context.refresh).toHaveBeenCalledTimes(1)
     expect(results).toEqual(Array(10).fill('new-at'))
     expect(context.store).toHaveBeenCalledTimes(1)
@@ -210,5 +211,66 @@ describe('native token renewal', () => {
     const refreshed = await context.ensure.forceRefresh!('gateway')
     expect(refreshed).toBe('new-at')
     expect(context.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('reuses currently stored bearer without refreshing if storage already has a different token than rejectedBearer', async () => {
+    const context = fixture()
+    context.set({
+      accessToken: 'new-at-1',
+      refreshToken: 'stable-rt',
+      expiresAt: 5000,
+      provider: 'self-hosted',
+      userId: 'user'
+    })
+
+    const result = await context.ensure('gateway', { force: true, rejectedBearer: 'old-at' })
+    expect(result).toBe('new-at-1')
+    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.store).not.toHaveBeenCalled()
+  })
+
+  it('does not rotate or clear newer session when a stale 401 arrives for an older rejectedBearer', async () => {
+    const context = fixture()
+    context.set({
+      accessToken: 'brand-new-login-at',
+      refreshToken: 'brand-new-login-rt',
+      expiresAt: 5000,
+      provider: 'self-hosted',
+      userId: 'new-user'
+    })
+
+    const result = await context.ensure('gateway', { force: true, rejectedBearer: 'stale-pre-login-at' })
+    expect(result).toBe('brand-new-login-at')
+    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.clear).not.toHaveBeenCalled()
+    expect(context.get()?.accessToken).toBe('brand-new-login-at')
+  })
+
+  it('handles staggered 401s for the same rejected bearer with exactly one refresh and identical rotated bearer', async () => {
+    const context = fixture()
+    let serial = 0
+    context.refresh.mockImplementation(async () => {
+      serial++
+
+      return {
+        access_token: `rotated-at-${serial}`,
+        refresh_token: 'stable-rt',
+        expires_at: 5000,
+        provider: 'self-hosted',
+        user_id: 'user'
+      }
+    })
+
+    const firstRefreshPromise = context.ensure('gateway', { force: true, rejectedBearer: 'old-at' })
+    const firstResult = await firstRefreshPromise
+    expect(firstResult).toBe('rotated-at-1')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+
+    const secondRefreshPromise = context.ensure('gateway', { force: true, rejectedBearer: 'old-at' })
+    const secondResult = await secondRefreshPromise
+
+    expect(secondResult).toBe('rotated-at-1')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(context.get()?.accessToken).toBe('rotated-at-1')
   })
 })
