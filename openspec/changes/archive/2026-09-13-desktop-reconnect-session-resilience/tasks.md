@@ -40,7 +40,7 @@
 
 ## 7. Integration Verification
 
-- [ ] 7.1 E2E test: restart backend with active Desktop client → Desktop reconnects without 401 pop-ups, no browser OAuth window, no IPC timeout errors.
-- [ ] 7.2 E2E test: restart backend with multiple pooled remote connections → at most one reauth modal if token genuinely changes.
-- [ ] 7.3 Regression test: genuine token revocation (delete token file + restart) → reauth flow triggers correctly within 15 seconds.
-- [ ] 7.4 Run full test suite (`scripts/run_tests.sh`) and verify zero regressions.
+- [x] 7.1 E2E test: restart backend with active Desktop client → Desktop reconnects without 401 pop-ups, no browser OAuth window, no IPC timeout errors.
+- [x] 7.2 E2E test: restart backend with multiple pooled remote connections → at most one reauth modal if token genuinely changes.
+- [x] 7.3 Regression test: genuine token revocation (delete token file + restart) → reauth flow triggers correctly within 15 seconds.
+- [x] 7.4 Run full regression suite (`scripts/run_tests.sh`) and verify zero regressions.

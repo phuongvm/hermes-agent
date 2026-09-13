@@ -92,6 +92,7 @@ def scan_session_providers(
 def is_loopback_process_token(peer_host: str, token: str, expected_token: str) -> bool:
     import hmac
     import ipaddress
+    import os
     if not peer_host or not token or not expected_token:
         return False
     try:
@@ -100,4 +101,34 @@ def is_loopback_process_token(peer_host: str, token: str, expected_token: str) -
         return False
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
         address = address.ipv4_mapped
-    return address.is_loopback and hmac.compare_digest(token.encode(), expected_token.encode())
+    
+    # Standard loopback verification
+    if address.is_loopback and hmac.compare_digest(token.encode(), expected_token.encode()):
+        return True
+
+    # Operator LAN allowance: HERMES_DASHBOARD_ALLOW_LAN_TOKENS=1 or HERMES_DASHBOARD_ALLOWED_SUBNETS
+    allowed_subnets_env = os.environ.get("HERMES_DASHBOARD_ALLOWED_SUBNETS", "")
+    allow_lan = os.environ.get("HERMES_DASHBOARD_ALLOW_LAN_TOKENS", "0") == "1" or bool(allowed_subnets_env)
+    if allow_lan:
+        subnets_to_check = []
+        if allowed_subnets_env:
+            for s in allowed_subnets_env.split(","):
+                s = s.strip()
+                if s:
+                    try:
+                        subnets_to_check.append(ipaddress.ip_network(s, strict=False))
+                    except ValueError:
+                        pass
+        else:
+            # Default private LAN ranges (RFC 1918)
+            subnets_to_check = [
+                ipaddress.ip_network("192.168.0.0/16"),
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12")
+            ]
+        for net in subnets_to_check:
+            if address in net and hmac.compare_digest(token.encode(), expected_token.encode()):
+                return True
+
+    return False
+
