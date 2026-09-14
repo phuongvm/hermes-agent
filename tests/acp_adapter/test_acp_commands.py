@@ -163,6 +163,49 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert state.interrupted_prompt_text == "original request"
 
 
+def test_acp_max_iterations_resolution(monkeypatch):
+    from acp_adapter.session import SessionManager
+
+    captured = {}
+    def fake_ai_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_ai_agent)
+    monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **kw: None)
+
+    manager = SessionManager(agent_factory=None)
+    
+    # 1. Default when config and env are empty -> 90
+    monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    manager._make_agent(session_id="test-sess-1", cwd=".")
+    assert captured["max_iterations"] == 90
+
+    # 2. agent.max_turns fallback
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"agent": {"max_turns": 45}})
+    manager._make_agent(session_id="test-sess-2", cwd=".")
+    assert captured["max_iterations"] == 45
+
+    # 3. agent.max_iterations fallback
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"agent": {"max_iterations": 75, "max_turns": 45}})
+    manager._make_agent(session_id="test-sess-3", cwd=".")
+    assert captured["max_iterations"] == 75
+
+    # 4. HERMES_MAX_ITERATIONS env fallback
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "120")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    manager._make_agent(session_id="test-sess-4", cwd=".")
+    assert captured["max_iterations"] == 120
+
+    # 5. acp.max_iterations takes highest precedence
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"acp": {"max_iterations": 200}, "agent": {"max_iterations": 75}})
+    manager._make_agent(session_id="test-sess-5", cwd=".")
+    assert captured["max_iterations"] == 200
+
+
+
+
 
 
 

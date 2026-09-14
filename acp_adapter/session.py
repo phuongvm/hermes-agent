@@ -389,7 +389,15 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
         acp_cfg = config.get("acp") or {}
-        max_iter = acp_cfg.get("max_iterations") or 25
+        agent_cfg = config.get("agent") or {}
+        env_max_iter = os.environ.get("HERMES_MAX_ITERATIONS")
+        max_iter = (
+            acp_cfg.get("max_iterations")
+            or agent_cfg.get("max_iterations")
+            or agent_cfg.get("max_turns")
+            or (int(env_max_iter) if env_max_iter and env_max_iter.isdigit() else None)
+            or 90
+        )
         kwargs = {
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
             "enabled_toolsets": _expand_acp_enabled_toolsets(["hermes-acp"], mcp_server_names=configured_mcp_servers),
