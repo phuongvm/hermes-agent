@@ -144,4 +144,133 @@ describe('native token renewal', () => {
     await Promise.all([context.ensure('gateway-a'), context.ensure('gateway-b')])
     expect(context.refresh).toHaveBeenCalledTimes(2)
   })
+
+  it('bypasses local expiresAt on forced refresh and mints new token via refreshToken', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+    expect(await context.ensure('gateway')).toBe('old-at')
+    expect(context.refresh).not.toHaveBeenCalled()
+
+    const refreshed = await context.ensure('gateway', { force: true })
+    expect(refreshed).toBe('new-at')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(context.store).toHaveBeenCalledTimes(1)
+    expect(context.get()?.accessToken).toBe('new-at')
+  })
+
+  it('coalesces concurrent forced refresh callers into a single in-flight refresh promise', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => context.ensure('gateway', { force: true }))
+    )
+
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(results).toEqual(Array(10).fill('new-at'))
+    expect(context.store).toHaveBeenCalledTimes(1)
+    expect(context.get()?.accessToken).toBe('new-at')
+  })
+
+  it('does not overwrite newer tokens with stale in-flight forced refresh results', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+
+    const pending = context.ensure('gateway', { force: true })
+    context.set({ ...context.get()!, accessToken: 'newer-at', refreshToken: 'newer-rt' })
+
+    expect(await pending).toBe('newer-at')
+    expect(context.store).not.toHaveBeenCalled()
+    expect(context.get()?.accessToken).toBe('newer-at')
+  })
+
+  it('clears credentials when forced refresh fails with 401', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    expect(await context.ensure('gateway', { force: true })).toBeNull()
+    expect(context.clear).toHaveBeenCalledTimes(1)
+    expect(context.get()).toBeNull()
+  })
+
+  it('clears credentials on forced refresh when no refreshToken is present', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, refreshToken: '', expiresAt: 5000 })
+
+    expect(await context.ensure('gateway', { force: true })).toBeNull()
+    expect(context.clear).toHaveBeenCalledTimes(1)
+    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.get()).toBeNull()
+  })
+
+  it('supports forceRefresh convenience method on the refresher function', async () => {
+    const context = fixture()
+    context.set({ ...context.get()!, expiresAt: 5000 })
+
+    const refreshed = await context.ensure.forceRefresh!('gateway')
+    expect(refreshed).toBe('new-at')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('reuses currently stored bearer without refreshing if storage already has a different token than rejectedBearer', async () => {
+    const context = fixture()
+    context.set({
+      accessToken: 'new-at-1',
+      refreshToken: 'stable-rt',
+      expiresAt: 5000,
+      provider: 'self-hosted',
+      userId: 'user'
+    })
+
+    const result = await context.ensure('gateway', { force: true, rejectedBearer: 'old-at' })
+    expect(result).toBe('new-at-1')
+    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.store).not.toHaveBeenCalled()
+  })
+
+  it('does not rotate or clear newer session when a stale 401 arrives for an older rejectedBearer', async () => {
+    const context = fixture()
+    context.set({
+      accessToken: 'brand-new-login-at',
+      refreshToken: 'brand-new-login-rt',
+      expiresAt: 5000,
+      provider: 'self-hosted',
+      userId: 'new-user'
+    })
+
+    const result = await context.ensure('gateway', { force: true, rejectedBearer: 'stale-pre-login-at' })
+    expect(result).toBe('brand-new-login-at')
+    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.clear).not.toHaveBeenCalled()
+    expect(context.get()?.accessToken).toBe('brand-new-login-at')
+  })
+
+  it('handles staggered 401s for the same rejected bearer with exactly one refresh and identical rotated bearer', async () => {
+    const context = fixture()
+    let serial = 0
+    context.refresh.mockImplementation(async () => {
+      serial++
+
+      return {
+        access_token: `rotated-at-${serial}`,
+        refresh_token: 'stable-rt',
+        expires_at: 5000,
+        provider: 'self-hosted',
+        user_id: 'user'
+      }
+    })
+
+    const firstRefreshPromise = context.ensure('gateway', { force: true, rejectedBearer: 'old-at' })
+    const firstResult = await firstRefreshPromise
+    expect(firstResult).toBe('rotated-at-1')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+
+    const secondRefreshPromise = context.ensure('gateway', { force: true, rejectedBearer: 'old-at' })
+    const secondResult = await secondRefreshPromise
+
+    expect(secondResult).toBe('rotated-at-1')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(context.get()?.accessToken).toBe('rotated-at-1')
+  })
 })

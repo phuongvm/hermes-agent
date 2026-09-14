@@ -58,7 +58,6 @@ import {
   resetEndpoint401State,
   waitForHermesReady
 } from './backend-health'
-import { reauthModalLatch } from './reauth-modal-latch'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
@@ -260,6 +259,7 @@ import {
 import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
+  executeWithNativeBearerSingleReplay,
   oauthGuardMayHardFail,
   oauthSessionIsLive,
   oauthTicketFailureAuthMessage,
@@ -330,6 +330,7 @@ import {
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { reauthModalLatch } from './reauth-modal-latch'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
@@ -15933,13 +15934,19 @@ async function fetchJsonForBackend(
     const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl)
 
     if (nativeAt) {
-      return fetchJson(url, null, {
-        method: opts.method,
-        body: opts.body,
-        timeoutMs: opts.timeoutMs,
-        bearer: nativeAt,
-        headers: descriptor.headers
-      })
+      return executeWithNativeBearerSingleReplay(
+        descriptor.baseUrl,
+        nativeAt,
+        bearer =>
+          fetchJson(url, null, {
+            method: opts.method,
+            body: opts.body,
+            timeoutMs: opts.timeoutMs,
+            bearer,
+            headers: descriptor.headers
+          }),
+        (baseUrl, rejectedBearer) => ensureNativeAccessToken(baseUrl, { force: true, rejectedBearer })
+      )
     }
 
     return fetchJsonViaOauthSession(url, {
@@ -16671,12 +16678,18 @@ async function handleHermesApiRequest(request: unknown): Promise<unknown> {
           const restAuth = resolveOauthRestAuth(nativeAt)
 
           if (restAuth.kind === 'bearer') {
-            response = await fetchJson(url, null, {
-              method: req.method,
-              body: req.body,
-              timeoutMs,
-              bearer: restAuth.token
-            })
+            response = await executeWithNativeBearerSingleReplay(
+              connection.baseUrl,
+              restAuth.token,
+              bearer =>
+                fetchJson(url, null, {
+                  method: req.method,
+                  body: req.body,
+                  timeoutMs,
+                  bearer
+                }),
+              (baseUrl, rejectedBearer) => ensureNativeAccessToken(baseUrl, { force: true, rejectedBearer })
+            )
           } else {
             response = await fetchJsonViaOauthSession(url, {
               method: req.method,

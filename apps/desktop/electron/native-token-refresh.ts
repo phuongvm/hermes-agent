@@ -8,32 +8,21 @@ interface NativeTokenRefreshIo {
   now?: () => number
 }
 
-export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
-  const inFlight = new Map<string, Promise<string | null>>()
+export interface EnsureNativeAccessTokenOptions {
+  force?: boolean
+  rejectedBearer?: string
+}
 
-  async function resolve(baseUrl: string): Promise<string | null> {
-    const tokens = io.load(baseUrl)
+export interface NativeTokenRefresher {
+  (baseUrl: string, options?: EnsureNativeAccessTokenOptions | string): Promise<string | null>
+  force?: (baseUrl: string, rejectedBearer?: string) => Promise<string | null>
+  forceRefresh?: (baseUrl: string, rejectedBearer?: string) => Promise<string | null>
+}
 
-    if (!tokens) {
-      return null
-    }
+export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeTokenRefresher {
+  const inFlight = new Map<string, { promise: Promise<string | null>; refreshingBearer?: string }>()
 
-    const now = io.now?.() ?? Math.floor(Date.now() / 1000)
-
-    if (!tokenNeedsRefresh(tokens, now)) {
-      return tokens.accessToken
-    }
-
-    if (!tokens.refreshToken) {
-      if (Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) {
-        return tokens.accessToken
-      }
-
-      io.clear(baseUrl)
-
-      return null
-    }
-
+  async function resolveRefresh(baseUrl: string, tokens: NativeTokenSet): Promise<string | null> {
     const unchanged = () => {
       const current = io.load(baseUrl)
 
@@ -51,6 +40,7 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
       if (!rotated.refreshToken) {
         rotated.refreshToken = tokens.refreshToken
       }
+
       io.store(baseUrl, rotated)
 
       return rotated.accessToken
@@ -74,21 +64,76 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo) {
     }
   }
 
-  return function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
+  function ensureNativeAccessToken(
+    baseUrl: string,
+    options?: EnsureNativeAccessTokenOptions | string
+  ): Promise<string | null> {
+    const normalizedOptions: EnsureNativeAccessTokenOptions =
+      typeof options === 'string' ? { force: true, rejectedBearer: options } : (options ?? {})
+
+    const force = Boolean(normalizedOptions.force)
+    const rejectedBearer = normalizedOptions.rejectedBearer
+
+    const tokens = io.load(baseUrl)
+
+    if (!tokens) {
+      return Promise.resolve(null)
+    }
+
+    const now = io.now?.() ?? Math.floor(Date.now() / 1000)
+
+    // 1. Generation/rejected-bearer aware recovery:
+    // If a forced refresh was requested for a specific rejected bearer,
+    // and storage already contains a different access token than the one rejected,
+    // reuse that current bearer instead of forcing another refresh.
+    if (force && rejectedBearer && tokens.accessToken && tokens.accessToken !== rejectedBearer) {
+      if (!tokenNeedsRefresh(tokens, now)) {
+        return Promise.resolve(tokens.accessToken)
+      }
+    }
+
+    // 2. Preserve one in-flight refresh per gateway when the rejected bearer is still current:
     const pending = inFlight.get(baseUrl)
 
     if (pending) {
-      return pending
+      if (!rejectedBearer || !pending.refreshingBearer || pending.refreshingBearer === rejectedBearer) {
+        return pending.promise
+      }
     }
 
-    const request = resolve(baseUrl).finally(() => {
-      if (inFlight.get(baseUrl) === request) {
+    // 3. Normal client-side expiration check:
+    if (!force && !tokenNeedsRefresh(tokens, now)) {
+      return Promise.resolve(tokens.accessToken)
+    }
+
+    // 4. Missing refresh token handling:
+    if (!tokens.refreshToken) {
+      if (!force && Number.isFinite(tokens.expiresAt) && now < tokens.expiresAt) {
+        return Promise.resolve(tokens.accessToken)
+      }
+
+      io.clear(baseUrl)
+
+      return Promise.resolve(null)
+    }
+
+    // 5. Trigger refresh:
+    const refreshingBearer = tokens.accessToken
+
+    const request = resolveRefresh(baseUrl, tokens).finally(() => {
+      if (inFlight.get(baseUrl)?.promise === request) {
         inFlight.delete(baseUrl)
       }
     })
 
-    inFlight.set(baseUrl, request)
+    inFlight.set(baseUrl, { promise: request, refreshingBearer })
 
     return request
   }
+
+  ensureNativeAccessToken.force = (baseUrl: string, rejectedBearer?: string) =>
+    ensureNativeAccessToken(baseUrl, { force: true, rejectedBearer })
+  ensureNativeAccessToken.forceRefresh = ensureNativeAccessToken.force
+
+  return ensureNativeAccessToken
 }
