@@ -1,9 +1,10 @@
-import { type MutableRefObject, useCallback, useRef, useState } from 'react'
+import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getApiRequestConnection, getApiRequestProfile, getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
+import { isTerminalSignedOut, normalizeBaseUrl, registerResumeSyncHandler } from '@/store/auth-terminal-state'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
 import { $activeGatewayProfile, getProfileFetchGeneration, isGatewayOpen, normalizeProfileKey } from '@/store/profile'
 import {
@@ -77,7 +78,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
   const refreshHermesConfig = useCallback(
     async (force = false, shouldPublish: () => boolean = () => true) => {
-      if (!isGatewayOpen()) {
+      if (!isGatewayOpen() || isTerminalSignedOut()) {
         return
       }
 
@@ -207,6 +208,15 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
     },
     [activeSessionIdRef, getScopeKey]
   )
+
+  useEffect(() => {
+    return registerResumeSyncHandler(baseUrl => {
+      const currentBaseUrl = normalizeBaseUrl(getApiRequestConnection() ?? '')
+      if ((!currentBaseUrl || currentBaseUrl === normalizeBaseUrl(baseUrl)) && isGatewayOpen()) {
+        void refreshHermesConfig(true)
+      }
+    })
+  }, [refreshHermesConfig])
 
   return { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds }
 }

@@ -7935,6 +7935,16 @@ function postJsonNoAuth(url: string, body: unknown, opts: any = {}) {
   return fetchJson(url, null, { method: 'POST', body: resolveJsonBody(body), ...opts })
 }
 
+function broadcastAuthTerminalStateChanged(payload: { baseUrl: string; signedOut: boolean; reason?: string }) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    const { webContents } = win
+
+    if (webContents && !webContents.isDestroyed()) {
+      webContents.send('hermes:auth:terminal-state-changed', payload)
+    }
+  }
+}
+
 // Return a valid native access token for baseUrl, refreshing via
 // /auth/native/refresh if the stored one is at/near expiry. Returns null when
 // there are no tokens or the refresh is terminally rejected (caller re-logins).
@@ -7947,7 +7957,11 @@ const ensureNativeAccessToken = createNativeTokenRefresher({
       nativeRefreshUrl(baseUrl),
       { refresh_token: tokens.refreshToken, provider: tokens.provider },
       { timeoutMs: 10_000 }
-    )
+    ),
+  markSignedOut: (baseUrl, reason) =>
+    broadcastAuthTerminalStateChanged({ baseUrl, signedOut: true, reason }),
+  clearSignedOut: baseUrl =>
+    broadcastAuthTerminalStateChanged({ baseUrl, signedOut: false })
 })
 
 // OAuth-session download that streams the response body straight to a
@@ -15925,6 +15939,11 @@ async function fetchJsonForBackend(
   const url = `${descriptor.baseUrl}${path}`
 
   if (descriptor.authMode === 'oauth') {
+    if (ensureNativeAccessToken.isTerminalSignedOut?.(descriptor.baseUrl)) {
+      const err = new Error('Authentication required (signed-out)')
+      Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
+      throw err
+    }
     // The OAuth cookie path rides electron.net with JSON headers; multipart
     // isn't wired there. Fail loudly rather than corrupting the upload.
     if (opts.upload) {
@@ -16022,6 +16041,7 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
         // startHermes() re-dials instead of replaying the stale rejection.
         remoteReauthFailure = null
         resetEndpoint401State(baseUrl)
+        ensureNativeAccessToken.clearTerminalSignedOut?.(baseUrl)
 
         return { ok: true, baseUrl, connected: true }
       } catch (error) {
@@ -16042,6 +16062,7 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
     if (connected) {
       remoteReauthFailure = null
       resetEndpoint401State(baseUrl)
+      ensureNativeAccessToken.clearTerminalSignedOut?.(baseUrl)
     }
 
     return { ok: true, baseUrl, connected }
@@ -16070,6 +16091,7 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
   // Also drop any native (RFC 8252) bearer tokens for this gateway so a
   // logout clears BOTH auth shapes.
   _clearNativeTokens(baseUrl)
+  ensureNativeAccessToken.markTerminalSignedOut?.(baseUrl, 'explicit_logout')
 
   // Report against the SAME liveness notion the Settings indicator uses
   // (AT-or-RT cookie, or a native token) so a logout that left any session

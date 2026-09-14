@@ -555,4 +555,49 @@ describe('useProjectTree', () => {
 
     await waitFor(() => expect(result.current.data.map(node => node.name)).toEqual(['from-b']))
   })
+
+  it('suppresses loadRoot directory reads when connection is in terminal signed-out state', async () => {
+    const { setTerminalSignedOut, resetAuthTerminalState } = await import('@/store/auth-terminal-state')
+    resetAuthTerminalState()
+    $connection.set({
+      baseUrl: 'https://gateway.example.com',
+      isFullscreen: false,
+      nativeOverlayWidth: 0,
+      token: 'tok',
+      wsUrl: 'ws://gateway.example.com',
+      logs: []
+    } as never)
+    setTerminalSignedOut('https://gateway.example.com', true)
+
+    const { result } = renderHook(() => useProjectTree('/p'))
+
+    expect(readDir).not.toHaveBeenCalled()
+    expect(result.current.data).toEqual([])
+  })
+
+  it('resumes and coalesces deferred tree sync once upon confirmed sign-in', async () => {
+    const { setTerminalSignedOut, resetAuthTerminalState } = await import('@/store/auth-terminal-state')
+    resetAuthTerminalState()
+    $connection.set({
+      baseUrl: 'https://gateway.example.com',
+      isFullscreen: false,
+      nativeOverlayWidth: 0,
+      token: 'tok',
+      wsUrl: 'ws://gateway.example.com',
+      logs: []
+    } as never)
+    setTerminalSignedOut('https://gateway.example.com', true)
+
+    readDir.mockResolvedValue(ok([{ name: 'resumed.ts', path: '/p/resumed.ts', isDirectory: false }]))
+
+    const { result } = renderHook(() => useProjectTree('/p'))
+    expect(readDir).not.toHaveBeenCalled()
+
+    await act(async () => {
+      setTerminalSignedOut('https://gateway.example.com', false)
+    })
+
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(1))
+    expect(readDir).toHaveBeenCalledWith('/p')
+  })
 })

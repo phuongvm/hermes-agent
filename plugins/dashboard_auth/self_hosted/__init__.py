@@ -74,6 +74,8 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
     def __init__(
         self, *, issuer: str, client_id: str, scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "", session_ttl_seconds: int | None = None,
+        process_home: Path | str | None = None,
+        session_db_path: Path | str | None = None,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -86,12 +88,19 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         self._client_id = client_id
         if session_ttl_seconds is not None and (isinstance(session_ttl_seconds, bool) or not isinstance(session_ttl_seconds, int) or session_ttl_seconds < 0):
             raise ValueError("session_ttl_seconds must be a non-negative integer")
+        if session_db_path is not None:
+            self._process_home = Path(session_db_path).parent
+        elif process_home is not None:
+            self._process_home = Path(process_home)
+        else:
+            from hermes_constants import get_process_hermes_home
+            self._process_home = get_process_hermes_home()
+
         self._session_store = None
         if session_ttl_seconds:
-            from hermes_constants import get_hermes_home
-
+            store_path = Path(session_db_path) if session_db_path is not None else self._process_home / "dashboard-auth-sessions.db"
             self._session_store = OIDCSessionStore(
-                get_hermes_home() / "dashboard-auth-sessions.db",
+                store_path,
                 issuer=self._issuer, client_id=client_id, ttl_seconds=session_ttl_seconds,
             )
         self._scopes = (scopes or "").strip().strip("\"'") or _DEFAULT_SCOPES

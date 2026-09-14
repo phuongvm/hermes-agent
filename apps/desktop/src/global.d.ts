@@ -232,6 +232,11 @@ declare global {
         set: (name: string | null) => Promise<DesktopActiveProfile>
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
+      auth?: {
+        onTerminalStateChanged?: (
+          callback: (payload: { baseUrl: string; signedOut: boolean; reason?: string }) => void
+        ) => () => void
+      }
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
       /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
@@ -327,6 +332,11 @@ declare global {
       setDisableF12?: (blocked: boolean) => void
       setPreviewShortcutActive?: (active: boolean) => void
       openExternal: (url: string) => Promise<void>
+      auth?: {
+        onTerminalStateChanged?: (
+          callback: (payload: { baseUrl: string; signedOut: boolean; reason?: string }) => void
+        ) => () => void
+      }
       /** One-shot loopback callback listener for MCP OAuth against remote
        *  backends (electron/mcp-oauth-callback-ipc.ts): bind on THIS machine,
        *  pass redirectUri as client_redirect_uri to mcp.servers.oauth.start,

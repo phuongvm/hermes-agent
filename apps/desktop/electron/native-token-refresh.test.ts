@@ -30,13 +30,26 @@ function fixture() {
     tokens = next
   })
 
-  const ensure = createNativeTokenRefresher({ load: () => tokens, store, clear, refresh, now: () => now })
+  const markSignedOut = vi.fn()
+  const clearSignedOut = vi.fn()
+
+  const ensure = createNativeTokenRefresher({
+    load: () => tokens,
+    store,
+    clear,
+    refresh,
+    now: () => now,
+    markSignedOut,
+    clearSignedOut
+  })
 
   return {
     ensure,
     refresh,
     clear,
     store,
+    markSignedOut,
+    clearSignedOut,
     get: () => tokens,
     set: (next: NativeTokenSet | null) => {
       tokens = next
@@ -272,5 +285,106 @@ describe('native token renewal', () => {
     expect(secondResult).toBe('rotated-at-1')
     expect(context.refresh).toHaveBeenCalledTimes(1)
     expect(context.get()?.accessToken).toBe('rotated-at-1')
+  })
+
+  it('marks normalized base URL as terminal signed-out on authoritative 401', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    expect(context.ensure.isTerminalSignedOut!('https://gateway.example/')).toBe(false)
+    await context.ensure('https://gateway.example')
+
+    expect(context.ensure.isTerminalSignedOut!('https://gateway.example/')).toBe(true)
+    expect(context.ensure.isTerminalSignedOut!('https://gateway.example')).toBe(true)
+    expect(context.clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('suppresses network refresh calls when base URL is in terminal signed-out state', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    await context.ensure('gateway')
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+    expect(context.ensure.isTerminalSignedOut!('gateway')).toBe(true)
+
+    // Subsequent calls return null immediately without network calls
+    const subsequent = await context.ensure('gateway')
+    expect(subsequent).toBeNull()
+    expect(context.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('isolates terminal signed-out state per normalized base URL', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    await context.ensure('https://gateway-a.example')
+    expect(context.ensure.isTerminalSignedOut!('https://gateway-a.example')).toBe(true)
+    expect(context.ensure.isTerminalSignedOut!('https://gateway-b.example')).toBe(false)
+
+    // Gateway B can still refresh
+    context.set({
+      accessToken: 'at-b',
+      refreshToken: 'rt-b',
+      expiresAt: 1000,
+      provider: 'self-hosted',
+      userId: 'user'
+    })
+    const resultB = await context.ensure('https://gateway-b.example')
+    expect(resultB).toBe('new-at')
+    expect(context.refresh).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not mark base URL as signed-out when a stale in-flight 401 arrives after newer login', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('stale expired'), { statusCode: 401 }))
+
+    const pending = context.ensure('gateway')
+    // Fresh login occurs before rejection resolves
+    context.set({
+      accessToken: 'brand-new-token',
+      refreshToken: 'brand-new-rt',
+      expiresAt: 5000,
+      provider: 'self-hosted',
+      userId: 'user'
+    })
+
+    const result = await pending
+    expect(result).toBe('brand-new-token')
+    expect(context.clear).not.toHaveBeenCalled()
+    expect(context.ensure.isTerminalSignedOut!('gateway')).toBe(false)
+  })
+
+  it('clears terminal signed-out state when clearTerminalSignedOut is called on confirmed sign-in', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    await context.ensure('gateway')
+    expect(context.ensure.isTerminalSignedOut!('gateway')).toBe(true)
+
+    context.ensure.clearTerminalSignedOut!('gateway')
+    expect(context.ensure.isTerminalSignedOut!('gateway')).toBe(false)
+  })
+
+  it('invokes io.markSignedOut on authoritative 401 and io.clearSignedOut on clearTerminalSignedOut', async () => {
+    const context = fixture()
+    context.refresh.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { statusCode: 401 }))
+
+    await context.ensure('https://gateway.example')
+    expect(context.markSignedOut).toHaveBeenCalledWith('https://gateway.example', 'authoritative_401')
+
+    context.ensure.clearTerminalSignedOut!('https://gateway.example')
+    expect(context.clearSignedOut).toHaveBeenCalledWith('https://gateway.example')
+  })
+
+  it('marks terminal signed-out on explicit logout and suppresses subsequent refresh calls', async () => {
+    const context = fixture()
+    context.ensure.markTerminalSignedOut!('https://gateway.example', 'explicit_logout')
+
+    expect(context.ensure.isTerminalSignedOut!('https://gateway.example')).toBe(true)
+    expect(context.markSignedOut).toHaveBeenCalledWith('https://gateway.example', 'explicit_logout')
+
+    const result = await context.ensure('https://gateway.example')
+    expect(result).toBeNull()
+    expect(context.refresh).not.toHaveBeenCalled()
   })
 })

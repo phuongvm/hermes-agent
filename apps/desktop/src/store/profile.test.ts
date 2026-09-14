@@ -329,7 +329,51 @@ describe('refreshProfiles shared rail list (#49289)', () => {
     await rejection
 
     expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'Failed to refresh profiles')
-    expect($profiles.get().map(p => p.name)).toEqual(['default', 'cached-1'])
+    expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'cached-1'])
+  })
+
+  it('suppresses refreshProfiles and error toasts when base URL is in terminal signed-out state', async () => {
+    notifyError.mockClear()
+    vi.mocked(getProfiles).mockClear()
+    $profiles.set([profile('default', true), profile('saved-profile')])
+    const { $gatewayState, $connection } = await import('./session')
+    const { setTerminalSignedOut, resetAuthTerminalState } = await import('./auth-terminal-state')
+
+    resetAuthTerminalState()
+    $gatewayState.set('open')
+    $gateway.set({ id: 'live-socket', connectionState: 'open' })
+    $connection.set(remoteConn())
+    setTerminalSignedOut('https://hermes-roy.tail.ts.net', true)
+
+    const result = await refreshProfiles()
+
+    expect(result.map(p => p.name)).toEqual(['default', 'saved-profile'])
+    expect(vi.mocked(getProfiles)).not.toHaveBeenCalled()
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('absorbs terminal signed-out error during refreshProfiles without error toast', async () => {
+    notifyError.mockClear()
+    vi.mocked(getProfiles).mockClear()
+    $profiles.set([profile('default', true), profile('saved-profile')])
+    const { $gatewayState, $connection } = await import('./session')
+    const { setTerminalSignedOut, resetAuthTerminalState } = await import('./auth-terminal-state')
+
+    resetAuthTerminalState()
+    $gatewayState.set('open')
+    $gateway.set({ id: 'live-socket', connectionState: 'open' })
+    $connection.set(remoteConn())
+
+    vi.mocked(getProfiles).mockImplementationOnce(async () => {
+      setTerminalSignedOut('https://hermes-roy.tail.ts.net', true)
+      const err = Object.assign(new Error('Authentication required (signed-out)'), { code: 'ERR_SIGNED_OUT' })
+      throw err
+    })
+
+    const result = await refreshProfiles()
+
+    expect(result.map(p => p.name)).toEqual(['default', 'saved-profile'])
+    expect(notifyError).not.toHaveBeenCalled()
   })
 })
 

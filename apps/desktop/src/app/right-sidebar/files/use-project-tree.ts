@@ -3,6 +3,12 @@ import { atom } from 'nanostores'
 import { useCallback, useEffect, useMemo } from 'react'
 
 import { desktopFsCacheKey } from '@/lib/desktop-fs'
+import {
+  $terminalSignedOutUrls,
+  isTerminalSignedOut,
+  normalizeBaseUrl,
+  registerResumeSyncHandler
+} from '@/store/auth-terminal-state'
 import { $connection } from '@/store/session'
 import { $workspaceChangeTick, consumeWorkspaceChange } from '@/store/workspace-events'
 
@@ -188,7 +194,7 @@ async function loadRoot(
     reset = false
   }: { connectionKey?: string; force?: boolean; reset?: boolean } = {}
 ) {
-  if (!cwd) {
+  if (!cwd || isTerminalSignedOut($connection.get()?.baseUrl)) {
     clearProjectTree()
 
     return
@@ -376,10 +382,16 @@ async function revalidateTree(
 export function useProjectTree(cwd: string): UseProjectTreeResult {
   const state = useStore($projectTree)
   const connection = useStore($connection)
+  const signedOutUrls = useStore($terminalSignedOutUrls)
   const workspaceTick = useStore($workspaceChangeTick)
   const connectionKey = desktopFsCacheKey(connection)
+  const isSignedOut = isTerminalSignedOut(connection?.baseUrl)
 
-  const refreshRoot = useCallback(() => loadRoot(cwd, { connectionKey, force: true }), [connectionKey, cwd])
+  const refreshRoot = useCallback(async () => {
+    if (!isTerminalSignedOut($connection.get()?.baseUrl)) {
+      await loadRoot(cwd, { connectionKey, force: true })
+    }
+  }, [connectionKey, cwd])
 
   const setNodeOpen = useCallback(
     (id: string, open: boolean) => {
@@ -417,7 +429,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     async (id: string) => {
       const inflightKey = `${connectionKey}:${id}`
 
-      if (!cwd || inflight.has(inflightKey)) {
+      if (!cwd || isTerminalSignedOut($connection.get()?.baseUrl) || inflight.has(inflightKey)) {
         return
       }
 
@@ -489,18 +501,27 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     void loadRoot(cwd, { connectionKey })
   }, [connectionKey, cwd])
 
+  useEffect(() => {
+    return registerResumeSyncHandler(baseUrl => {
+      const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+      if (cwd && currentBaseUrl === normalizeBaseUrl(baseUrl)) {
+        void loadRoot(cwd, { connectionKey, force: true })
+      }
+    })
+  }, [connectionKey, cwd])
+
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
   // timer; a success clears rootError and stops it.
   useEffect(() => {
-    if (!cwd || state.cwd !== cwd || !state.rootError) {
+    if (!cwd || state.cwd !== cwd || !state.rootError || isSignedOut) {
       return
     }
 
     const timer = window.setTimeout(() => void loadRoot(cwd, { connectionKey, force: true }), ROOT_ERROR_RETRY_MS)
 
     return () => window.clearTimeout(timer)
-  }, [connectionKey, cwd, state.cwd, state.requestId, state.rootError])
+  }, [connectionKey, cwd, isSignedOut, state.cwd, state.requestId, state.rootError])
 
   // While showing the fallback root, quietly re-probe the session's real cwd
   // (a worktree re-created, a checkout restored) and switch back when it
@@ -508,7 +529,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
   const usingFallback = state.cwd === cwd && Boolean(state.resolvedCwd) && state.resolvedCwd !== cwd
 
   useEffect(() => {
-    if (!cwd || !usingFallback) {
+    if (!cwd || !usingFallback || isSignedOut) {
       return
     }
 
@@ -528,7 +549,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [connectionKey, cwd, usingFallback])
+  }, [connectionKey, cwd, isSignedOut, usingFallback])
 
   return useMemo(
     () => ({

@@ -1,8 +1,14 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
+import {
+  isTerminalSignedOut,
+  normalizeBaseUrl,
+  registerResumeSyncHandler,
+  $terminalSignedOutUrls
+} from '@/store/auth-terminal-state'
 import { refreshActiveProfile } from '@/store/profile'
-import { $gatewayState } from '@/store/session'
+import { $connection, $gatewayState } from '@/store/session'
 
 /**
  * Re-pull the running profile + list on mount, and again whenever the window
@@ -13,32 +19,51 @@ import { $gatewayState } from '@/store/session'
  * open Manage Profiles (whose own refresh() call was the only other reader).
  *
  * Suppressed when gateway state is not 'open' (e.g. 'connecting', 'closed',
- * 'idle') to prevent IPC timeout / network storms during reconnect windows.
+ * 'idle') or when the active connection is in terminal signed-out state to
+ * prevent IPC timeout / network storms.
  * Any suppressed refresh is deferred and coalesced into a single refresh
- * when the gateway transitions back to 'open'.
+ * when the gateway transitions back to 'open' and authenticated.
  */
 export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): void {
   const storeGatewayState = useStore($gatewayState)
   const gatewayState = gatewayStateOverride ?? storeGatewayState
+  const connection = useStore($connection)
+  const signedOutUrls = useStore($terminalSignedOutUrls)
+  const isSignedOut = isTerminalSignedOut(connection?.baseUrl)
+
   const prevGatewayStateRef = useRef<string | null>(null)
+  const prevSignedOutRef = useRef<boolean | null>(null)
   const hasDeferredRefreshRef = useRef(false)
 
   useEffect(() => {
-    const isInitial = prevGatewayStateRef.current === null
-    const prev = prevGatewayStateRef.current
-    prevGatewayStateRef.current = gatewayState
+    return registerResumeSyncHandler(baseUrl => {
+      const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+      if (currentBaseUrl === normalizeBaseUrl(baseUrl) && $gatewayState.get() === 'open') {
+        hasDeferredRefreshRef.current = false
+        void refreshActiveProfile()
+      }
+    })
+  }, [])
 
-    if (gatewayState === 'open') {
-      if (isInitial || prev !== 'open' || hasDeferredRefreshRef.current) {
+  useEffect(() => {
+    const isInitial = prevGatewayStateRef.current === null
+    const prevGateway = prevGatewayStateRef.current
+    const prevSignedOut = prevSignedOutRef.current
+
+    prevGatewayStateRef.current = gatewayState
+    prevSignedOutRef.current = isSignedOut
+
+    if (gatewayState === 'open' && !isSignedOut) {
+      if (isInitial || prevGateway !== 'open' || prevSignedOut || hasDeferredRefreshRef.current) {
         hasDeferredRefreshRef.current = false
         void refreshActiveProfile()
       }
     } else {
-      if (isInitial) {
+      if (isInitial || isSignedOut) {
         hasDeferredRefreshRef.current = true
       }
     }
-  }, [gatewayState])
+  }, [gatewayState, isSignedOut, signedOutUrls])
 
   useEffect(() => {
     const onActive = () => {
@@ -46,7 +71,7 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
         return
       }
 
-      if (gatewayState !== 'open') {
+      if (gatewayState !== 'open' || isTerminalSignedOut(connection?.baseUrl)) {
         hasDeferredRefreshRef.current = true
         return
       }
@@ -61,5 +86,5 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
       window.removeEventListener('focus', onActive)
       document.removeEventListener('visibilitychange', onActive)
     }
-  }, [gatewayState])
+  }, [gatewayState, connection?.baseUrl])
 }

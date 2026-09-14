@@ -28,14 +28,24 @@ import { notifyError } from '@/store/notifications'
 import { $poolLimits } from '@/store/pool-limits'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
 import {
+  $connection,
   $gatewayState,
   clearComposerSelectionOwner,
   setComposerSelectionOwner,
   setConnection
 } from '@/store/session'
+import { isTerminalSignedOut, normalizeBaseUrl, registerResumeSyncHandler } from '@/store/auth-terminal-state'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
+
+registerResumeSyncHandler(baseUrl => {
+  const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+  if (currentBaseUrl === normalizeBaseUrl(baseUrl) && isGatewayOpen()) {
+    void refreshProfiles()
+    void refreshActiveProfile()
+  }
+})
 
 export function isGatewayOpen(): boolean {
   const sessionState = $gatewayState.get()
@@ -107,7 +117,7 @@ export function invalidateProfileListFetches(): void {
 let refreshInFlight: Promise<ProfileInfo[]> | null = null
 
 export function refreshProfiles(): Promise<ProfileInfo[]> {
-  if (!isGatewayOpen()) {
+  if (!isGatewayOpen() || isTerminalSignedOut()) {
     return Promise.resolve($profiles.get())
   }
 
@@ -120,26 +130,30 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
     const MAX_RETRIES = 2
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (!isGatewayOpen() || epoch !== profileListEpoch) {
+      if (!isGatewayOpen() || isTerminalSignedOut() || epoch !== profileListEpoch) {
         return $profiles.get()
       }
 
       try {
         const { profiles } = await getProfiles()
 
-        if (epoch === profileListEpoch && isGatewayOpen()) {
+        if (epoch === profileListEpoch && isGatewayOpen() && !isTerminalSignedOut()) {
           $profiles.set(profiles)
         }
 
         return profiles
       } catch (error) {
-        if (!isGatewayOpen()) {
+        const isSignedOut =
+          isTerminalSignedOut() ||
+          (error && typeof error === 'object' && 'code' in error && error.code === 'ERR_SIGNED_OUT')
+        if (!isGatewayOpen() || isSignedOut) {
           // Group 4: Profile Store Error Absorption
-          // Silently absorb network errors when gateway state is not 'open',
+          // Silently absorb network errors when gateway state is not 'open'
+          // or base URL is in terminal signed-out state,
           // preserving cached profile data in the UI instead of surfacing
           // uncaught promise rejections or error toasts.
           console.warn(
-            `[profiles] refreshProfiles network error absorbed during gateway disconnect/reconnect:`,
+            `[profiles] refreshProfiles network error absorbed during gateway disconnect/signed-out state:`,
             error
           )
           return $profiles.get()
@@ -241,7 +255,7 @@ let activeProfileInFlight: Promise<void> | null = null
 // Pull the running backend's current profile + the available profile list.
 // Best-effort: failures (backend not up yet) leave the prior values intact.
 export async function refreshActiveProfile(): Promise<void> {
-  if (!isGatewayOpen()) {
+  if (!isGatewayOpen() || isTerminalSignedOut()) {
     return
   }
 

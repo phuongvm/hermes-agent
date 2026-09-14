@@ -742,24 +742,38 @@ class PluginContext:
         auth gate (non-loopback bind without ``--insecure``). Wrong type / duplicate name warn and
         are ignored, never raised."""
         from hermes_cli.dashboard_auth import DashboardAuthProvider
-        from hermes_cli.dashboard_auth.registry import register_global_provider, unregister_global_provider
+        from hermes_cli.dashboard_auth.registry import (
+            register_global_provider, unregister_global_provider, snapshot_registration
+        )
         if self._wrong_type(provider, DashboardAuthProvider, "dashboard-auth provider"):
             return
         registry_name = provider.name
         # The auth registry is process-global (lifetime = web server). Disposing it on a routine
         # per-home manager teardown emptied it for the WHOLE process and disabled sign-in until
         # restart — so upsert and keep it out of reverse-order teardown (``persistent=True``).
+        from hermes_constants import get_hermes_home_override, get_process_hermes_home, hermes_home_key
+        active = snapshot_registration(registry_name)
+        if active is not None:
+            is_scoped = False
+            if get_hermes_home_override() is not None:
+                is_scoped = True
+            elif getattr(self._manager, "scope_key", None) is not None:
+                if self._manager.scope_key != hermes_home_key(get_process_hermes_home()):
+                    is_scoped = True
+            if is_scoped:
+                logger.info(
+                    "Plugin '%s' dashboard-auth provider %r skipped: active host provider preserved in request/profile-scoped context",
+                    self.manifest.name, registry_name,
+                )
+                return None
         try:
-            # A per-home manager is torn down routinely (profile-scoped dashboard activity, force
-            # re-discovery), and disposing this registration on that teardown emptied the auth registry for
-            # the WHOLE process, permanently disabling sign-in until restart (#91701). The handle still
-            # disposes explicitly (identity- conditional), and a forced re-discovery rotates the provider in
-            # place via the upsert.
             register_global_provider(provider)
         except (TypeError, ValueError) as e:
             logger.warning("Plugin '%s' failed to register dashboard-auth provider %r: %s",
                            self.manifest.name, getattr(provider, "name", "?"), e)
             return
+        if snapshot_registration(registry_name) is not provider:
+            return None
         handle = self._track("dashboard_auth_provider", registry_name,
                              lambda: unregister_global_provider(registry_name, provider), persistent=True)
         logger.info("Plugin '%s' registered dashboard-auth provider: %s (%s)", self.manifest.name,

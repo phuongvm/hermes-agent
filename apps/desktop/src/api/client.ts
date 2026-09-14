@@ -1,6 +1,7 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
 import type { HermesApiRequest } from '@/global'
+import { isTerminalSignedOut } from '@/store/auth-terminal-state'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
 // model info/options, cron) the moment the backend passes readiness. On a
@@ -34,6 +35,21 @@ export class HermesGateway extends JsonRpcGatewayClient {
       notConnectedErrorMessage: 'Hermes gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
+  }
+
+  override request<T>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<T> {
+    if (isTerminalSignedOut()) {
+      const err = new Error('Authentication required (signed-out)')
+      Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
+      return Promise.reject(err)
+    }
+
+    return super.request<T>(method, params, timeoutMs, signal)
   }
 }
 
@@ -96,6 +112,12 @@ export function connectionScoped(): { connectionId?: string } {
  *  underneath it. (It used to omit the key for 'local', which made the pin
  *  unable to beat the ambient tag; helpers then had to bypass this wrapper.) */
 export function hermesApi<T>(request: HermesApiRequest): Promise<T> {
+  if (isTerminalSignedOut()) {
+    const err = new Error('Authentication required (signed-out)')
+    Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
+    return Promise.reject(err)
+  }
+
   return window.hermesDesktop.api<T>({ ...connectionScoped(), ...request })
 }
 

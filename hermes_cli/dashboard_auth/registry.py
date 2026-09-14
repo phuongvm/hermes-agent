@@ -104,6 +104,22 @@ def register_global_provider(provider: DashboardAuthProvider) -> None:
     """
     assert_protocol_compliance(type(provider))
     with _lock:
+        if provider.name in _providers:
+            from hermes_constants import get_hermes_home_override, get_process_hermes_home, hermes_home_key
+            if get_hermes_home_override() is not None:
+                _log.warning(
+                    "dashboard-auth: rejected replacing host provider %r with request-scoped instance",
+                    provider.name,
+                )
+                return
+            current_scope = hermes_home_key()
+            host_scope = hermes_home_key(get_process_hermes_home())
+            if current_scope != host_scope:
+                _log.warning(
+                    "dashboard-auth: rejected replacing host provider %r with profile-scoped instance from %r",
+                    provider.name, current_scope,
+                )
+                return
         _providers[provider.name] = provider
     _log_registered("global provider ", provider)
 
