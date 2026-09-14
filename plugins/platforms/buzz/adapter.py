@@ -628,6 +628,8 @@ _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
 
+    SUPPORTS_MESSAGE_EDITING = False  # Nostr Kind 9 messages cannot be reliably edited in-place across clients; prevents frozen preview frames with cursor
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("buzz"))
         extra = getattr(config, "extra", {}) or {}

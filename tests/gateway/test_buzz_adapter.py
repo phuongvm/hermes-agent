@@ -152,6 +152,9 @@ class TestBuzzAdapterInit:
         assert adapter.poll_interval == 2.0
         assert adapter.home_channel == "ccc"
 
+    def test_supports_message_editing_is_false(self):
+        assert BuzzAdapter.SUPPORTS_MESSAGE_EDITING is False
+
     def test_env_overrides_config(self, monkeypatch):
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://env.relay")
         from gateway.config import PlatformConfig
