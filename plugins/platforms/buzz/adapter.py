@@ -267,6 +267,9 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 _WS_AUTH_TIMEOUT = 20.0
+_DEFAULT_WS_OPEN_TIMEOUT = 30.0
+_DEFAULT_WS_PING_INTERVAL = 30.0
+_DEFAULT_WS_PING_TIMEOUT = 60.0
 # Last-resort read bound: an unsurfaced relay-side close (CLOSE_WAIT) would leave us "connected" with inbound stopped.
 # The library keepalive (ping_interval/ping_timeout below) should catch a dead relay first, but a relay-side
 # close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
@@ -655,6 +658,31 @@ class BuzzAdapter(BasePlatformAdapter):
         _transport_raw = _scoped_platform_setting("BUZZ_TRANSPORT", extra, "transport")
         _transport = (_transport_raw or str(extra.get("transport", "auto") or "auto")).strip().lower()
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
+        # WebSocket keepalive tuning: library defaults (20/20) cause spurious 1011 keepalive ping timeouts
+        # over WAN / proxy paths (#98097 / ws_transport parity); default to 30s interval / 60s timeout.
+        _open_to_raw = _setting_or("BUZZ_WS_OPEN_TIMEOUT", extra, "ws_open_timeout", None)
+        if _open_to_raw is None:
+            _open_to_raw = extra.get("open_timeout")
+        try:
+            self.ws_open_timeout = max(5.0, float(_open_to_raw if _open_to_raw is not None else _DEFAULT_WS_OPEN_TIMEOUT))
+        except (TypeError, ValueError):
+            self.ws_open_timeout = _DEFAULT_WS_OPEN_TIMEOUT
+
+        _ping_int_raw = _setting_or("BUZZ_WS_PING_INTERVAL", extra, "ws_ping_interval", None)
+        if _ping_int_raw is None:
+            _ping_int_raw = extra.get("ping_interval")
+        try:
+            self.ws_ping_interval = max(5.0, float(_ping_int_raw if _ping_int_raw is not None else _DEFAULT_WS_PING_INTERVAL))
+        except (TypeError, ValueError):
+            self.ws_ping_interval = _DEFAULT_WS_PING_INTERVAL
+
+        _ping_to_raw = _setting_or("BUZZ_WS_PING_TIMEOUT", extra, "ws_ping_timeout", None)
+        if _ping_to_raw is None:
+            _ping_to_raw = extra.get("ping_timeout")
+        try:
+            self.ws_ping_timeout = max(5.0, float(_ping_to_raw if _ping_to_raw is not None else _DEFAULT_WS_PING_TIMEOUT))
+        except (TypeError, ValueError):
+            self.ws_ping_timeout = _DEFAULT_WS_PING_TIMEOUT
         # Entries may be hex or npub (normalized to hex). Reaction-only identities get a 👀 on explicit tags but
         # never dispatch; allowed_users wins on overlap.
         self._allowed_pubkeys: set = _pubkey_set(_setting_or("BUZZ_ALLOWED_USERS", extra, "allowed_users", []))
@@ -1159,7 +1187,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._membership_since = int(time.time())
         self._ws_task = asyncio.create_task(self._websocket_loop())
         try:
-            await asyncio.wait_for(self._ws_ready.wait(), timeout=_WS_AUTH_TIMEOUT + 5)
+            await asyncio.wait_for(self._ws_ready.wait(), timeout=self.ws_open_timeout + _WS_AUTH_TIMEOUT + 5)
             return True
         except (asyncio.TimeoutError, TimeoutError):
             logger.warning("Buzz: WebSocket did not authenticate in time")
@@ -1274,8 +1302,8 @@ class BuzzAdapter(BasePlatformAdapter):
         while True:
             try:
                 async with websockets.connect(
-                    self._websocket_url(), open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5,
-                    ping_interval=20, ping_timeout=20, max_size=_WS_MAX_MESSAGE_BYTES,
+                    self._websocket_url(), open_timeout=self.ws_open_timeout, close_timeout=5,
+                    ping_interval=self.ws_ping_interval, ping_timeout=self.ws_ping_timeout, max_size=_WS_MAX_MESSAGE_BYTES,
                 ) as websocket:
                     await self._authenticate_websocket(websocket)
                     subscriptions = await self._subscribe_websocket(websocket)
@@ -1309,7 +1337,7 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.TimeoutError:
                 try:
                     pong_waiter = await websocket.ping()
-                    await asyncio.wait_for(pong_waiter, timeout=10.0)
+                    await asyncio.wait_for(pong_waiter, timeout=min(self.ws_ping_timeout, 30.0))
                     logger.debug("Buzz: idle WebSocket keepalive probe succeeded")
                     continue
                 except Exception as ping_error:

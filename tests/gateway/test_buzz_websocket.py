@@ -801,3 +801,53 @@ async def test_ws_discovery_task_cancelled_when_connection_exits(monkeypatch):
 
     assert started, "discovery task was never started with the connection"
     assert all(t.done() for t in started), "discovery task outlived its connection"
+
+
+def test_websocket_keepalive_defaults_and_configuration():
+    """Buzz WebSocket transport must default to WAN-friendly keepalive (30/60) and accept extra overrides."""
+    adapter_default = _make_adapter()
+    assert adapter_default.ws_ping_interval == 30.0
+    assert adapter_default.ws_ping_timeout == 60.0
+    assert adapter_default.ws_open_timeout == 30.0
+
+    adapter_custom = _make_adapter(
+        extra={
+            "ws_ping_interval": 45,
+            "ws_ping_timeout": 90,
+            "ws_open_timeout": 50,
+        }
+    )
+    assert adapter_custom.ws_ping_interval == 45.0
+    assert adapter_custom.ws_ping_timeout == 90.0
+    assert adapter_custom.ws_open_timeout == 50.0
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_passes_configured_keepalive_to_connect(monkeypatch):
+    """_websocket_loop must pass ws_ping_interval, ws_ping_timeout, and ws_open_timeout to websockets.connect."""
+    adapter = _make_adapter(
+        extra={
+            "ws_ping_interval": 42.0,
+            "ws_ping_timeout": 84.0,
+            "ws_open_timeout": 48.0,
+        }
+    )
+    captured_kwargs = []
+
+    def fake_connect(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        raise asyncio.CancelledError()
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2.0)
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["ping_interval"] == 42.0
+    assert captured_kwargs[0]["ping_timeout"] == 84.0
+    assert captured_kwargs[0]["open_timeout"] == 48.0
+
