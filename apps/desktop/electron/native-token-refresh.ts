@@ -3,6 +3,7 @@ import { type NativeTokenSet, parseTokenResponse, tokenNeedsRefresh } from './na
 export function normalizeBaseUrlKey(url: string): string {
   try {
     const parsed = new URL(url)
+
     return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, '')
   } catch {
     return String(url || '').trim().replace(/\/+$/, '')
@@ -40,6 +41,7 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
 
   function isTerminalSignedOut(baseUrl: string): boolean {
     const key = normalizeBaseUrlKey(baseUrl)
+
     if (io.isSignedOut) {
       return io.isSignedOut(key)
     }
@@ -114,6 +116,7 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
     const rejectedBearer = normalizedOptions.rejectedBearer
 
     const key = normalizeBaseUrlKey(baseUrl)
+
     if (isTerminalSignedOut(key)) {
       return Promise.resolve(null)
     }

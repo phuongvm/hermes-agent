@@ -14,6 +14,7 @@ import {
   storedStringRecord
 } from '@/lib/storage'
 import { withTimeout } from '@/lib/with-timeout'
+import { isTerminalSignedOut, normalizeBaseUrl, registerResumeSyncHandler } from '@/store/auth-terminal-state'
 import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-scope'
 import {
   $gateway,
@@ -34,13 +35,13 @@ import {
   setComposerSelectionOwner,
   setConnection
 } from '@/store/session'
-import { isTerminalSignedOut, normalizeBaseUrl, registerResumeSyncHandler } from '@/store/auth-terminal-state'
 import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
 registerResumeSyncHandler(baseUrl => {
   const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+
   if (currentBaseUrl === normalizeBaseUrl(baseUrl) && isGatewayOpen()) {
     void refreshProfiles()
     void refreshActiveProfile()
@@ -49,6 +50,7 @@ registerResumeSyncHandler(baseUrl => {
 
 export function isGatewayOpen(): boolean {
   const sessionState = $gatewayState.get()
+
   if (sessionState && sessionState !== 'idle') {
     return sessionState === 'open'
   }
@@ -146,6 +148,7 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
         const isSignedOut =
           isTerminalSignedOut() ||
           (error && typeof error === 'object' && 'code' in error && error.code === 'ERR_SIGNED_OUT')
+
         if (!isGatewayOpen() || isSignedOut) {
           // Group 4: Profile Store Error Absorption
           // Silently absorb network errors when gateway state is not 'open'
@@ -156,6 +159,7 @@ export function refreshProfiles(): Promise<ProfileInfo[]> {
             `[profiles] refreshProfiles network error absorbed during gateway disconnect/signed-out state:`,
             error
           )
+
           return $profiles.get()
         }
 
@@ -295,6 +299,7 @@ export async function refreshActiveProfile(): Promise<void> {
   })
 
   activeProfileInFlight = flight
+
   return flight
 }
 

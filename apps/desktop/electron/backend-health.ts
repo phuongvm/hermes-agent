@@ -40,6 +40,7 @@ export function resetEndpointConnectionState(url?: string): void {
 export function normalizeEndpointKey(url: string): string {
   try {
     const parsed = new URL(url)
+
     return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, '')
   } catch {
     return url.trim().replace(/\/+$/, '')
@@ -48,6 +49,7 @@ export function normalizeEndpointKey(url: string): string {
 
 export function getEndpoint401State(url: string): Endpoint401State | undefined {
   const state = endpoint401Map.get(normalizeEndpointKey(url))
+
   return state ? { ...state } : undefined
 }
 
@@ -73,12 +75,15 @@ export function recordEndpoint401(
       first401Timestamp: timestamp,
       last401Timestamp: timestamp
     }
+
     endpoint401Map.set(key, newState)
+
     return { ...newState }
   }
 
   existing.consecutive401Count += 1
   existing.last401Timestamp = timestamp
+
   return { ...existing }
 }
 
@@ -247,10 +252,12 @@ export function isMissingHealthEndpointError(error: unknown): boolean {
 export function isHttp401Error(error: unknown): boolean {
   if (error && typeof error === 'object') {
     const code = (error as { statusCode?: unknown }).statusCode
+
     if (code === 401) {
       return true
     }
   }
+
   const message = error instanceof Error ? error.message : String(error ?? '')
 
   return /^401:/.test(message)
@@ -259,10 +266,12 @@ export function isHttp401Error(error: unknown): boolean {
 export function isHttp403Error(error: unknown): boolean {
   if (error && typeof error === 'object') {
     const code = (error as { statusCode?: unknown }).statusCode
+
     if (code === 403) {
       return true
     }
   }
+
   const message = error instanceof Error ? error.message : String(error ?? '')
 
   return /^403:/.test(message)
@@ -276,10 +285,12 @@ export function isHttp403Error(error: unknown): boolean {
 export function isAuthRejectionError(error: unknown): boolean {
   if (error && typeof error === 'object') {
     const code = (error as { statusCode?: unknown }).statusCode
+
     if (code === 401 || code === 403) {
       return true
     }
   }
+
   const message = error instanceof Error ? error.message : String(error ?? '')
 
   return /^40[13]:/.test(message)
@@ -401,6 +412,7 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
         const state = recordEndpoint401(base, currentTime, windowMs)
         const authoritativePreviousState = options.previousGatewayState ?? getEndpointConnectionState(base)
         const wasPreviouslyOpen = authoritativePreviousState === 'open'
+
         const isConsecutive401Met =
           state.consecutive401Count >= threshold &&
           (currentTime - state.first401Timestamp) <= windowMs
@@ -413,6 +425,7 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
         // Transient gateway drop: do not escalate to reauth and do not fall back to /api/status.
         // Sleep and retry until deadline or recovery.
         await sleep(pollMs)
+
         continue
       }
 

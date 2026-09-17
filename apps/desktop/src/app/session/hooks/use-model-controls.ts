@@ -57,6 +57,7 @@ export function useModelControls({
     const connection = (cacheOwnerConnectionId ?? getApiRequestConnection() ?? '').trim()
     const profile = normalizeProfileKey(cacheProfile ?? getApiRequestProfile() ?? $activeGatewayProfile.get())
     const generation = getProfileFetchGeneration()
+
     return {
       connection,
       profile,
@@ -194,6 +195,7 @@ export function useModelControls({
         }
 
         let result: any
+
         try {
           result = await fetchPromise
         } finally {

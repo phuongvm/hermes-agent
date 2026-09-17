@@ -15944,6 +15944,7 @@ async function fetchJsonForBackend(
       Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
       throw err
     }
+
     // The OAuth cookie path rides electron.net with JSON headers; multipart
     // isn't wired there. Fail loudly rather than corrupting the upload.
     if (opts.upload) {
@@ -15987,6 +15988,7 @@ async function fetchJsonForBackend(
 
 reauthModalLatch.setAuthStateResolver(async (connectionKey, _outcome) => {
   rememberLog(`[reauth] connection ${connectionKey} authenticated; revalidating pool`)
+
   try {
     await revalidatePool()
   } catch (error) {

@@ -1,12 +1,15 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { useState, useEffect, useRef } from 'react'
 import { atom } from 'nanostores'
+import { useEffect, useRef } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
 import { $gateway } from '@/store/gateway'
 const $gatewayState = atom<string>('connecting')
-import { $activeProfile, $profiles, refreshActiveProfile, refreshProfiles } from '@/store/profile'
-import { useBackgroundSync } from './hooks/use-background-sync'
+import { $activeProfile, $profiles, refreshActiveProfile } from '@/store/profile'
+
 import { useProfileRailRefreshOnActive } from '../chat/sidebar/use-profile-rail-refresh-on-active'
+
+import { useBackgroundSync } from './hooks/use-background-sync'
 
 // Real caller wiring composition harness
 function WiringHarness({
@@ -68,6 +71,7 @@ function WiringHarness({
 
     if (gatewayState !== 'open') {
       pendingGatewayScopeRefreshRef.current = true
+
       return
     }
 
@@ -109,14 +113,19 @@ describe('Reconnect Session Resilience Composed Wiring (C3)', () => {
     vi.stubGlobal('hermesDesktop', {
       api: async (req: any) => {
         const path = String(req?.path || '')
+
         if (path.includes('/api/profiles/active')) {
           requestCounts.activeProfileApi += 1
+
           return { active: 'default', current: 'default' }
         }
+
         if (path.includes('/api/profiles')) {
           requestCounts.profilesApi += 1
+
           return { profiles: [{ name: 'default' }] }
         }
+
         return {}
       }
     })
@@ -142,8 +151,8 @@ describe('Reconnect Session Resilience Composed Wiring (C3)', () => {
       <WiringHarness
         activeConnectionId="conn-1"
         activeGatewayProfile="default"
-        gatewayState="connecting"
         counts={counts}
+        gatewayState="connecting"
       />
     )
 
@@ -153,8 +162,8 @@ describe('Reconnect Session Resilience Composed Wiring (C3)', () => {
         <WiringHarness
           activeConnectionId="conn-1"
           activeGatewayProfile="researcher"
-          gatewayState="connecting"
           counts={counts}
+          gatewayState="connecting"
         />
       )
     })
@@ -189,8 +198,8 @@ describe('Reconnect Session Resilience Composed Wiring (C3)', () => {
       <WiringHarness
         activeConnectionId="conn-1"
         activeGatewayProfile="default"
-        gatewayState="connecting"
         counts={counts}
+        gatewayState="connecting"
       />
     )
 
@@ -200,8 +209,8 @@ describe('Reconnect Session Resilience Composed Wiring (C3)', () => {
         <WiringHarness
           activeConnectionId="conn-1"
           activeGatewayProfile="researcher"
-          gatewayState="connecting"
           counts={counts}
+          gatewayState="connecting"
         />
       )
     })
@@ -217,8 +226,8 @@ describe('Reconnect Session Resilience Composed Wiring (C3)', () => {
         <WiringHarness
           activeConnectionId="conn-1"
           activeGatewayProfile="researcher"
-          gatewayState="open"
           counts={counts}
+          gatewayState="open"
         />
       )
     })

@@ -1,14 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $connection } from '@/store/session'
+
 import {
-  $terminalSignedOutUrls,
   initAuthTerminalStateListener,
   isTerminalSignedOut,
   normalizeBaseUrl,
   registerResumeSyncHandler,
   resetAuthTerminalState,
-  resumeDeferredSync,
   setTerminalSignedOut
 } from './auth-terminal-state'
 
@@ -89,12 +88,14 @@ describe('auth-terminal-state', () => {
 
   it('subscribes to window.hermesDesktop.auth.onTerminalStateChanged when initialized', () => {
     let listener: ((payload: { baseUrl: string; signedOut: boolean; reason?: string }) => void) | null = null
+
     const unsubscribe = vi.fn()
 
     ;(window as any).hermesDesktop = {
       auth: {
         onTerminalStateChanged: vi.fn(cb => {
           listener = cb
+
           return unsubscribe
         })
       }

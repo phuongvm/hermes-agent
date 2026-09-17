@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { reconnectGateway, registerGatewayReconnect } from './gateway-reconnect'
 import { resetAuthTerminalState, setTerminalSignedOut } from './auth-terminal-state'
+import { reconnectGateway, registerGatewayReconnect } from './gateway-reconnect'
 
 const disposers: Array<() => void> = []
 
 afterEach(() => {
   resetAuthTerminalState()
+
   while (disposers.length > 0) {
     disposers.pop()?.()
   }
