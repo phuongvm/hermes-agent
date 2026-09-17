@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { reconnectGateway, registerGatewayReconnect } from './gateway-reconnect'
+import { resetAuthTerminalState, setTerminalSignedOut } from './auth-terminal-state'
 
 const disposers: Array<() => void> = []
 
 afterEach(() => {
+  resetAuthTerminalState()
   while (disposers.length > 0) {
     disposers.pop()?.()
   }
@@ -55,5 +57,18 @@ describe('gateway reconnect controller', () => {
 
   it('rejects when the gateway boot owner is not mounted', async () => {
     await expect(reconnectGateway()).rejects.toThrow('Gateway reconnect is unavailable')
+  })
+
+  it('suppresses reconnect when the endpoint is marked terminal signed-out', async () => {
+    const endpoint = 'https://gateway.example.com'
+    setTerminalSignedOut(endpoint, true, 'test_terminal')
+
+    const handler = vi.fn().mockResolvedValue(undefined)
+    disposers.push(registerGatewayReconnect(handler, { basePath: endpoint }))
+
+    await expect(reconnectGateway({ basePath: endpoint })).rejects.toMatchObject({
+      code: 'ERR_SIGNED_OUT'
+    })
+    expect(handler).not.toHaveBeenCalled()
   })
 })

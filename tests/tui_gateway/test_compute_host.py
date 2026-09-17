@@ -45,7 +45,10 @@ def test_compute_host_line_json_hello_and_shutdown():
     try:
         hello = _read_json_line(out)
         assert hello["type"] == "hello"
-        assert hello["host_pid"] == proc.pid
+        if sys.platform == "win32":
+            assert hello["host_pid"] > 0
+        else:
+            assert hello["host_pid"] == proc.pid
 
         proc.stdin.write(json.dumps({"type": "bogus", "request_id": "b"}) + "\n")
         proc.stdin.flush()

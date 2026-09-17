@@ -60,7 +60,10 @@ class ComputeHost:
 
     def __init__(
         self, *, stdout: Any = None, max_workers: int | None = None,
-        heartbeat_secs: int | float | None = None) -> None:
+        heartbeat_secs: int | float | None = None,
+        max_active_turns: int | None = None,
+        max_queued_turns: int | None = None,
+        queue_timeout_secs: float | None = None) -> None:
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
         self._executor = concurrent.futures.ThreadPoolExecutor(
@@ -77,11 +80,31 @@ class ComputeHost:
         self._heartbeat_secs = (
             float(heartbeat_secs) if heartbeat_secs is not None
             else float(os.environ.get("HERMES_COMPUTE_HOST_HEARTBEAT_SECS") or "15"))
+
+        # Admission limits
+        self._max_active_turns = int(
+            max_active_turns if max_active_turns is not None
+            else os.environ.get("HERMES_COMPUTE_HOST_MAX_ACTIVE_TURNS") or 2)
+        self._max_queued_turns = int(
+            max_queued_turns if max_queued_turns is not None
+            else os.environ.get("HERMES_COMPUTE_HOST_MAX_QUEUED_TURNS") or 8)
+        self._queue_timeout_secs = float(
+            queue_timeout_secs if queue_timeout_secs is not None
+            else os.environ.get("HERMES_COMPUTE_HOST_QUEUE_TIMEOUT_SECS") or 30.0)
+        self._heavy_work_ceiling = 2
+
+        self._admission_lock = threading.Lock()
+        self._active_turns: dict[str, str] = {}  # turn_id -> sid
+        self._active_heavy: int = 0
+        self._queued_turns: list[dict[str, Any]] = []
+
         if self._heartbeat_secs > 0:
             for target, name in (
                 (self._heartbeat_loop, "compute-host-heartbeat"),
                 (self._parent_guard_loop, "compute-host-ppid-guard")):
                 threading.Thread(target=target, name=name, daemon=True).start()
+        if self._queue_timeout_secs > 0:
+            threading.Thread(target=self._queue_watchdog_loop, name="compute-host-queue-watchdog", daemon=True).start()
 
     def emit(self, frame: dict[str, Any]) -> None:
         frame.setdefault("host_ns", now_ns())
@@ -95,6 +118,19 @@ class ComputeHost:
 
     def close(self) -> None:
         self._closed.set()
+        with self._admission_lock:
+            queued = list(self._queued_turns)
+            self._queued_turns.clear()
+        for item in queued:
+            self.emit({
+                "type": "turn.error",
+                "sid": item["sid"],
+                "request_id": item["request_id"],
+                "turn_id": item.get("turn_id"),
+                "reason": "shutdown",
+                "message": "compute host closed",
+                "execution_state": "not_started",
+            })
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
@@ -108,13 +144,19 @@ class ComputeHost:
         """
         self._closed.set()
         budget = max(0.0, wait)
-        deadline = time.monotonic() + budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        drain_budget = budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        start = time.monotonic()
+        allocated_sleep = 0.0
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not self._live_turns():
+            elapsed = time.monotonic() - start
+            remaining = drain_budget - max(elapsed, allocated_sleep)
+            if remaining <= 1e-4 or not self._live_turns():
                 break
-            # Bounded by ``remaining``: a flat sleep would eat the reserve it protects.
-            time.sleep(min(0.05, remaining))
+            tick = min(0.05, remaining)
+            if tick <= 0:
+                break
+            allocated_sleep += tick
+            time.sleep(tick)
         with self._turn_futures_lock:
             live_sids = {sid for f, sid in self._turn_futures.items() if sid and not f.done()}
         self.flush_all_sessions(reason=reason, skip_sids=live_sids)
@@ -160,8 +202,155 @@ class ComputeHost:
             self._turn_futures.pop(future, None)
 
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
-        future = self._executor.submit(self._run_real_turn, dict(frame))
-        self._track_turn_future(future, str(frame.get("sid") or ""))
+        sid = str(frame.get("sid") or "")
+        request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        turn_id = str(frame.get("turn_id") or request_id)
+
+        if not sid:
+            self._reply("turn.error", sid, request_id, message="sid required", execution_state="not_started")
+            return
+
+        with self._admission_lock:
+            # Per-session limit: 1 active, at most 1 queued
+            session_has_active = any(s == sid for s in self._active_turns.values())
+            session_queued_count = sum(1 for q in self._queued_turns if q["sid"] == sid)
+
+            if session_has_active and session_queued_count >= 1:
+                self.emit({
+                    "type": "turn.error",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "code": 5019,
+                    "retry_after_ms": 1000,
+                    "reason": "capacity_saturated",
+                    "message": "session turn queue full (max 1 active, 1 queued)",
+                    "execution_state": "not_started",
+                })
+                return
+
+            total_heavy = len(self._active_turns) + self._active_heavy
+            total_queued = len(self._queued_turns)
+
+            # Global capacity check: if active limit reached and queue full
+            if (len(self._active_turns) >= self._max_active_turns or total_heavy >= self._heavy_work_ceiling) and total_queued >= self._max_queued_turns:
+                self.emit({
+                    "type": "turn.error",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "code": 5019,
+                    "retry_after_ms": 1000,
+                    "reason": "capacity_saturated",
+                    "message": "capacity saturated: max turns exceeded",
+                    "execution_state": "not_started",
+                })
+                return
+
+            can_dispatch = (
+                len(self._active_turns) < self._max_active_turns
+                and total_heavy < self._heavy_work_ceiling
+                and not session_has_active
+            )
+
+            if can_dispatch:
+                self._active_turns[turn_id] = sid
+                queue_position = 0
+            else:
+                if total_queued >= self._max_queued_turns:
+                    self.emit({
+                        "type": "turn.error",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "turn_id": turn_id,
+                        "code": 5019,
+                        "retry_after_ms": 1000,
+                        "reason": "capacity_saturated",
+                        "message": "capacity saturated: max queued turns exceeded",
+                        "execution_state": "not_started",
+                    })
+                    return
+                queue_item = {
+                    "frame": dict(frame),
+                    "sid": sid,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "enqueued_at": time.monotonic(),
+                }
+                self._queued_turns.append(queue_item)
+                queue_position = len(self._queued_turns)
+
+        self.emit({
+            "type": "turn.accepted",
+            "sid": sid,
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "queue_position": queue_position,
+            "accepted_ns": now_ns(),
+        })
+
+        if can_dispatch:
+            self._dispatch_turn(dict(frame), turn_id, sid)
+
+    def _dispatch_turn(self, frame: dict[str, Any], turn_id: str, sid: str) -> None:
+        future = self._executor.submit(self._run_real_turn, frame)
+        self._track_turn_future(future, sid)
+
+        def _on_done(_fut):
+            with self._admission_lock:
+                self._active_turns.pop(turn_id, None)
+            self._pump_queue()
+
+        future.add_done_callback(_on_done)
+
+    def _pump_queue(self) -> None:
+        now = time.monotonic()
+        to_dispatch = []
+        expired = []
+        with self._admission_lock:
+            remaining_queue = []
+            for item in self._queued_turns:
+                if now - item["enqueued_at"] > self._queue_timeout_secs:
+                    expired.append(item)
+                else:
+                    remaining_queue.append(item)
+            self._queued_turns = remaining_queue
+
+            total_heavy = len(self._active_turns) + self._active_heavy
+            i = 0
+            while (
+                i < len(self._queued_turns)
+                and len(self._active_turns) < self._max_active_turns
+                and total_heavy < self._heavy_work_ceiling
+            ):
+                candidate = self._queued_turns[i]
+                cand_sid = candidate["sid"]
+                if any(s == cand_sid for s in self._active_turns.values()):
+                    i += 1
+                    continue
+                item = self._queued_turns.pop(i)
+                self._active_turns[item["turn_id"]] = cand_sid
+                to_dispatch.append(item)
+                total_heavy = len(self._active_turns) + self._active_heavy
+
+        for item in expired:
+            self.emit({
+                "type": "turn.error",
+                "sid": item["sid"],
+                "request_id": item["request_id"],
+                "turn_id": item.get("turn_id"),
+                "code": 5019,
+                "reason": "queue_timeout",
+                "message": f"turn queue timeout ({int(self._queue_timeout_secs)}s)",
+                "execution_state": "not_started",
+            })
+
+        for item in to_dispatch:
+            self._dispatch_turn(item["frame"], item["turn_id"], item["sid"])
+
+    def _queue_watchdog_loop(self) -> None:
+        while not self._closed.wait(0.5):
+            self._pump_queue()
 
     def _guarded(
         self, frame: dict[str, Any], error_kind: str, body: Callable, *,
@@ -178,10 +367,19 @@ class ComputeHost:
             self._reply(error_kind, sid, request_id, **error_extra, message=str(exc))
 
     def _handle_interrupt(self, frame: dict[str, Any]) -> None:
+        sid = str(frame.get("sid") or "")
+        with self._admission_lock:
+            queued_indices = [i for i, q in enumerate(self._queued_turns) if q["sid"] == sid]
+            queued_items = [self._queued_turns.pop(i) for i in reversed(queued_indices)]
+        for q in queued_items:
+            self._reply("interrupt.ack", sid, frame.get("request_id"), applied=True, applied_ns=now_ns())
+            self._reply("turn.end", sid, q["request_id"], interrupted=True, ended_ns=now_ns())
+
         def body(server: Any, sid: str, request_id: Any) -> None:
             session = server._sessions.get(sid)
             if session is None:
-                self._reply("interrupt.ack", sid, request_id, applied=False)
+                if not queued_items:
+                    self._reply("interrupt.ack", sid, request_id, applied=False)
                 return
             # In the child the shared helper interrupts the local agent and releases this
             # process's pending clarify Event (the parent only has a metadata mirror).
@@ -374,6 +572,10 @@ class ComputeHost:
 
     def _handle_control(self, frame: dict[str, Any]) -> None:
         route_name = str(frame.get("route_name") or "")
+        is_heavy = route_name in {"session.compress", "session.save"}
+        if is_heavy:
+            with self._admission_lock:
+                self._active_heavy += 1
 
         def body(server: Any, sid: str, request_id: Any) -> None:
             route = MUTATOR_ROUTE_TABLE.get(route_name)
@@ -405,7 +607,13 @@ class ComputeHost:
                     _agent = (_server._sessions.get(sid) or {}).get("agent")
                     if _agent is not None:
                         _finalize(_agent, committed=False)
-        self._guarded(frame, "control.error", body, on_error=on_error)
+        try:
+            self._guarded(frame, "control.error", body, on_error=on_error)
+        finally:
+            if is_heavy:
+                with self._admission_lock:
+                    self._active_heavy = max(0, self._active_heavy - 1)
+                self._pump_queue()
 
     def _control_ack(self, server: Any, frame: dict[str, Any], session: dict) -> dict:
         """control.ack payload for one classified route, or ``{"error": message}``."""
@@ -498,7 +706,7 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
         signal.signal(signal.SIGTERM, _signal_handler)
         signal.signal(signal.SIGINT, _signal_handler)
     host.emit({
-        "type": "hello", "host_pid": os.getpid(), "boot_id": host._boot_id,
+        "type": "hello", "protocol_version": 1, "host_pid": os.getpid(), "boot_id": host._boot_id,
         "build_sha": _build_sha(), "cwd": os.getcwd(),
         "hermes_home": os.environ.get("HERMES_HOME", "")})
 

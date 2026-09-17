@@ -339,3 +339,169 @@ def test_shutdown_drain_sleep_never_overshoots_the_reserve(monkeypatch):
     assert events == ["finalize:idle:compute_host_sigterm"]
     assert slept, "the drain loop should have ticked at least once"
     assert sum(slept) <= drain_budget + 1e-6
+
+
+def test_compute_host_admission_concurrency_and_saturation(monkeypatch):
+    """Admission allows max 2 active, max 8 queued; excess returns 5019 saturation."""
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_active_turns=2, max_queued_turns=8, heartbeat_secs=0)
+    release = threading.Event()
+
+    def _block_turn(*_args, **_kwargs):
+        release.wait(timeout=5.0)
+
+    monkeypatch.setattr(host, "_run_real_turn", _block_turn)
+
+    try:
+        # Submit 2 active turns (different sessions)
+        host.handle_frame({"type": "turn.start", "sid": "s1", "request_id": "r1"})
+        host.handle_frame({"type": "turn.start", "sid": "s2", "request_id": "r2"})
+
+        # Submit 8 queued turns (different sessions)
+        for i in range(3, 11):
+            host.handle_frame({"type": "turn.start", "sid": f"s{i}", "request_id": f"r{i}"})
+
+        # 11th turn saturates capacity (2 active + 8 queued = 10 capacity full)
+        host.handle_frame({"type": "turn.start", "sid": "s11", "request_id": "r11"})
+
+        frames = _json_lines(out)
+        accepted = [f for f in frames if f["type"] == "turn.accepted"]
+        errors = [f for f in frames if f["type"] == "turn.error"]
+
+        assert len(accepted) == 10
+        assert [a["queue_position"] for a in accepted[:2]] == [0, 0]
+        assert [a["queue_position"] for a in accepted[2:]] == list(range(1, 9))
+
+        assert len(errors) == 1
+        err = errors[0]
+        assert err["request_id"] == "r11"
+        assert err["code"] == 5019
+        assert err["retry_after_ms"] == 1000
+        assert err["reason"] == "capacity_saturated"
+        assert err["execution_state"] == "not_started"
+    finally:
+        release.set()
+        host.close()
+
+
+def test_compute_host_per_session_serialization(monkeypatch):
+    """Per-session serialization allows 1 active and at most 1 queued; third turn fails."""
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_active_turns=2, max_queued_turns=8, heartbeat_secs=0)
+    release = threading.Event()
+
+    def _block_turn(*_args, **_kwargs):
+        release.wait(timeout=5.0)
+
+    monkeypatch.setattr(host, "_run_real_turn", _block_turn)
+
+    try:
+        # Turn 1 for s1: active
+        host.handle_frame({"type": "turn.start", "sid": "s1", "request_id": "r1"})
+        # Turn 2 for s1: queued
+        host.handle_frame({"type": "turn.start", "sid": "s1", "request_id": "r2"})
+        # Turn 3 for s1: rejected (already 1 active + 1 queued for this session)
+        host.handle_frame({"type": "turn.start", "sid": "s1", "request_id": "r3"})
+
+        frames = _json_lines(out)
+        accepted = [f for f in frames if f["type"] == "turn.accepted"]
+        errors = [f for f in frames if f["type"] == "turn.error"]
+
+        assert len(accepted) == 2
+        assert accepted[0]["request_id"] == "r1" and accepted[0]["queue_position"] == 0
+        assert accepted[1]["request_id"] == "r2" and accepted[1]["queue_position"] == 1
+
+        assert len(errors) == 1
+        err = errors[0]
+        assert err["request_id"] == "r3"
+        assert err["code"] == 5019
+        assert err["retry_after_ms"] == 1000
+        assert err["reason"] == "capacity_saturated"
+        assert "session turn queue full" in err["message"]
+    finally:
+        release.set()
+        host.close()
+
+
+def test_compute_host_queue_timeout_expires_turn(monkeypatch):
+    """Queued turn expires with queue_timeout if not started within queue_timeout_secs."""
+    out = io.StringIO()
+    host = ComputeHost(
+        stdout=out, max_active_turns=1, max_queued_turns=2,
+        queue_timeout_secs=0.05, heartbeat_secs=0
+    )
+    release = threading.Event()
+
+    def _block_turn(*_args, **_kwargs):
+        release.wait(timeout=5.0)
+
+    monkeypatch.setattr(host, "_run_real_turn", _block_turn)
+
+    try:
+        # Turn 1 for s1: active
+        host.handle_frame({"type": "turn.start", "sid": "s1", "request_id": "r1"})
+        # Turn 2 for s2: queued
+        host.handle_frame({"type": "turn.start", "sid": "s2", "request_id": "r2"})
+
+        # Wait for queue timeout to trigger
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            frames = _json_lines(out)
+            if any(f["type"] == "turn.error" and f.get("reason") == "queue_timeout" for f in frames):
+                break
+            time.sleep(0.02)
+
+        frames = _json_lines(out)
+        timeout_errs = [f for f in frames if f["type"] == "turn.error" and f.get("reason") == "queue_timeout"]
+        assert len(timeout_errs) == 1
+        assert timeout_errs[0]["request_id"] == "r2"
+        assert timeout_errs[0]["execution_state"] == "not_started"
+    finally:
+        release.set()
+        host.close()
+
+
+def test_compute_host_heavy_work_ceiling_shared_with_control(monkeypatch):
+    """Total heavy-work ceiling of 2 is shared between active turns and heavy controls."""
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_active_turns=2, max_queued_turns=8, heartbeat_secs=0)
+    release_turn = threading.Event()
+    release_ctrl = threading.Event()
+
+    def _block_turn(*_args, **_kwargs):
+        release_turn.wait(timeout=5.0)
+
+    monkeypatch.setattr(host, "_run_real_turn", _block_turn)
+    # Mock heavy control
+    monkeypatch.setattr(host, "_control_ack", lambda *a, **kw: release_ctrl.wait(timeout=5.0) or {})
+
+    sid = "s-ctrl"
+    session = {"history_lock": threading.Lock(), "agent": None}
+    server._sessions[sid] = session
+
+    try:
+        # Start heavy control (session.compress)
+        ctrl_thread = threading.Thread(
+            target=host.handle_frame,
+            args=({"type": "control", "route_name": "session.compress", "sid": sid, "request_id": "c1"},),
+            daemon=True,
+        )
+        ctrl_thread.start()
+        time.sleep(0.05)
+
+        # 1 active turn permitted (heavy_work = 1 control + 1 turn = 2)
+        host.handle_frame({"type": "turn.start", "sid": "s1", "request_id": "r1"})
+        # 2nd turn must be queued because heavy_work reaches ceiling 2
+        host.handle_frame({"type": "turn.start", "sid": "s2", "request_id": "r2"})
+
+        frames = _json_lines(out)
+        accepted = [f for f in frames if f["type"] == "turn.accepted"]
+        assert len(accepted) == 2
+        assert accepted[0]["request_id"] == "r1" and accepted[0]["queue_position"] == 0
+        assert accepted[1]["request_id"] == "r2" and accepted[1]["queue_position"] == 1
+    finally:
+        release_ctrl.set()
+        release_turn.set()
+        ctrl_thread.join(timeout=2.0)
+        server._sessions.pop(sid, None)
+        host.close()

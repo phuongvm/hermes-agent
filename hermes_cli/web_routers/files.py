@@ -739,16 +739,22 @@ async def fs_download(
 
 @router.get("/api/fs/git-root")
 async def fs_git_root(path: str):
-    target = _fs_path(path)
-    try:
-        st = target.stat()
-        start = target if stat.S_ISDIR(st.st_mode) else target.parent
-    except OSError:
-        start = target
-    return {"root": _fs_find_git_root(start)}
+    def _run():
+        target = _fs_path(path)
+        try:
+            st = target.stat()
+            start = target if stat.S_ISDIR(st.st_mode) else target.parent
+        except OSError:
+            start = target
+        return {"root": _fs_find_git_root(start)}
+
+    return await asyncio.to_thread(_run)
 
 
 @router.get("/api/fs/default-cwd")
 async def fs_default_cwd():
-    cwd = _fs_default_cwd()
-    return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
+    def _run():
+        cwd = _fs_default_cwd()
+        return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
+
+    return await asyncio.to_thread(_run)

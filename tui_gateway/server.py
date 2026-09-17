@@ -1088,6 +1088,12 @@ def _sess_building(params, rid):
 _DASHBOARD_TURN_ISOLATION_DEFAULT = False
 _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT = 15
 _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT = 3
+_DASHBOARD_COMPUTE_HOST_MAX_ACTIVE_TURNS_DEFAULT = 2
+_DASHBOARD_COMPUTE_HOST_MAX_QUEUED_TURNS_DEFAULT = 8
+_DASHBOARD_COMPUTE_HOST_QUEUE_TIMEOUT_SECS_DEFAULT = 30
+_DASHBOARD_COMPUTE_HOST_MAX_SESSIONS_DEFAULT = 64
+_DASHBOARD_IO_MAX_WORKERS_DEFAULT = 4
+_DASHBOARD_IO_MAX_QUEUED_DEFAULT = 16
 
 
 def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int:
@@ -1110,6 +1116,18 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
             dash.get("compute_host_heartbeat_secs"), _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT, min_value=1),
         "compute_host_respawn_max": _coerce_int_config_value(
             dash.get("compute_host_respawn_max"), _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT, min_value=0),
+        "compute_host_max_active_turns": min(8, _coerce_int_config_value(
+            dash.get("compute_host_max_active_turns"), _DASHBOARD_COMPUTE_HOST_MAX_ACTIVE_TURNS_DEFAULT, min_value=1)),
+        "compute_host_max_queued_turns": min(64, _coerce_int_config_value(
+            dash.get("compute_host_max_queued_turns"), _DASHBOARD_COMPUTE_HOST_MAX_QUEUED_TURNS_DEFAULT, min_value=0)),
+        "compute_host_queue_timeout_secs": _coerce_int_config_value(
+            dash.get("compute_host_queue_timeout_secs"), _DASHBOARD_COMPUTE_HOST_QUEUE_TIMEOUT_SECS_DEFAULT, min_value=1),
+        "compute_host_max_sessions": min(256, _coerce_int_config_value(
+            dash.get("compute_host_max_sessions"), _DASHBOARD_COMPUTE_HOST_MAX_SESSIONS_DEFAULT, min_value=1)),
+        "io_max_workers": min(16, _coerce_int_config_value(
+            dash.get("io_max_workers"), _DASHBOARD_IO_MAX_WORKERS_DEFAULT, min_value=1)),
+        "io_max_queued": min(128, _coerce_int_config_value(
+            dash.get("io_max_queued"), _DASHBOARD_IO_MAX_QUEUED_DEFAULT, min_value=0)),
     }
 
 

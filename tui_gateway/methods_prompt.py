@@ -569,7 +569,10 @@ def _(rid, params: dict) -> dict:
         # A rewind replays what the transcript shows: re-expand a skill invocation or
         # `/work fix it` sends nine literal chars.
         text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
-    turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
+    isolation_cfg = _load_dashboard_process_isolation_config()
+    turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if _turn_isolation_enabled(isolation_cfg) and not turn_isolation:
+        return _err(rid, 4092, "turn isolation enabled: pre-existing in-process session cannot execute in-process; restart or resume session")
     if internal_hosted_submit and turn_isolation:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
     # Re-bind to the current transport: streaming must stay on the active websocket even
@@ -611,17 +614,13 @@ def _(rid, params: dict) -> dict:
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
             return isolated_response
-        # An ordinal/id alone is not consent. A client that carries a leftover ordinal into an ORDINARY
-        # submit sends a request that is indistinguishable, field by field, from a real rewind — same
-        # method, same shape, an in-range target — and the cut it asks for is a destructive
-        # replace_messages() the user never requested (#80763: 296 -> 52 messages, 244 durable rows gone).
-        # Only the client knows whether this submit is a rewind/edit/regenerate, so it has to say so; refuse
-        # the cut when it doesn't. Consent is checked BEFORE target resolution: an unconfirmed
-        # (leaked-state) request must refuse with 4029 without paying the durable transcript read or
-        # heal-stamping live history dicts that row-id resolution performs.
-        logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s", sid,
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        logger.error(
+            "compute-host dispatch failed for session %s; failing closed under turn_isolation: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
+        return isolated_response
     if (err := _persist_session_row_for_submit(rid, session)) is not None:
         return err
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
