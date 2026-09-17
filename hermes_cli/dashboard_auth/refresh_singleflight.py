@@ -65,7 +65,17 @@ def _refresh_provider(provider: DashboardAuthProvider, token: str) -> Session | 
             with _guard:
                 cached = _cache.get(key)
                 if cached is not None and cached[0] > time.monotonic():
-                    return cached[2]
+                    session = cached[2]
+                    if session is not None:
+                        try:
+                            if (getattr(session, "expires_at", 0) and session.expires_at <= time.time()) or provider.verify_session(access_token=session.access_token) is None:
+                                cached = None
+                                _cache.pop(key, None)
+                        except Exception:
+                            cached = None
+                            _cache.pop(key, None)
+                    if cached is not None:
+                        return cached[2]
             try:
                 session = provider.refresh_session(refresh_token=token)
             except RefreshExpiredError:

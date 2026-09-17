@@ -34,6 +34,7 @@ import {
   triggerCronJob
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
+import { $gatewayState } from './store/session'
 import { $transcriptTailBySessionId, transcriptTailState } from './store/transcript-tail'
 
 const emptySessionsResponse = {
@@ -56,6 +57,7 @@ describe('Hermes REST helpers', () => {
   })
 
   afterEach(() => {
+    $gatewayState.set('idle')
     setApiRequestConnection(null)
     setApiRequestProfile(null)
     vi.restoreAllMocks()
@@ -443,6 +445,7 @@ describe('Hermes REST helpers', () => {
   })
 
   it('uses a longer timeout for active profile refresh during desktop startup', async () => {
+    $gatewayState.set('open')
     api.mockResolvedValueOnce({ current: 'default' }).mockResolvedValueOnce({ profiles: [] })
 
     await refreshActiveProfile()

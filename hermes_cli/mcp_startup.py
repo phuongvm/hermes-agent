@@ -83,6 +83,9 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
     """
     home_key = hermes_home_key()
     with _mcp_discovery_lock:
+        if not _has_configured_mcp_servers():
+            return
+
         if home_key in _mcp_discovery_started:
             thread = _mcp_discovery_thread.get(home_key)
             if thread is not None and thread.is_alive():
@@ -100,8 +103,6 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             _mcp_discovery_thread.pop(home_key, None)
 
         _mcp_discovery_started.add(home_key)
-        if not _has_configured_mcp_servers():
-            return
 
         # Bare threads start from an empty context: run discovery under a copy of the caller's, so
         # the context-local HERMES_HOME override (multi-profile dashboard/desktop backends, #67605)
