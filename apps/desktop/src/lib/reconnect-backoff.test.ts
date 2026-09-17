@@ -1,17 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
-  DEFAULT_BASE_DELAY_MS,
-  DEFAULT_CAP_MS,
-  MAX_RECONNECT_ATTEMPTS,
-  reconnectBackoffDelayMs,
-  ReconnectBackoffTracker,
-} from './reconnect-backoff'
-import {
   buildReconnectOwnerKey,
   reconnectGateway,
   registerGatewayReconnect,
 } from '../store/gateway-reconnect'
+
+import {
+  MAX_RECONNECT_ATTEMPTS,
+  reconnectBackoffDelayMs,
+  ReconnectBackoffTracker,
+} from './reconnect-backoff'
 
 describe('reconnectBackoffDelayMs', () => {
   it('enforces equal jitter with a positive floor (500–1000ms on attempt 0)', () => {
@@ -87,11 +86,13 @@ describe('ReconnectBackoffTracker', () => {
   it('transitions to exhausted after 12 retries or 5 minutes', () => {
     const tracker = new ReconnectBackoffTracker()
     let now = 1000
+
     for (let i = 0; i < MAX_RECONNECT_ATTEMPTS; i++) {
       const res = tracker.recordFailure(now)
       expect(res.exhausted).toBe(false)
       now += 1000
     }
+
     const res = tracker.recordFailure(now)
     expect(res.exhausted).toBe(true)
   })
@@ -106,6 +107,7 @@ describe('gateway-reconnect single-flight owner', () => {
       windowId: 'w1',
       logicalOwner: 'owner1',
     })
+
     const key2 = buildReconnectOwnerKey({
       connectionId: 'c1',
       basePath: 'http://localhost:8080',
@@ -113,11 +115,13 @@ describe('gateway-reconnect single-flight owner', () => {
       windowId: 'w1',
       logicalOwner: 'owner1',
     })
+
     expect(key1).toBe(key2)
   })
 
   it('coalesces concurrent reconnect calls into a single in-flight promise', async () => {
     let callCount = 0
+
     const unregister = registerGatewayReconnect(async () => {
       callCount++
       await new Promise(r => setTimeout(r, 20))
@@ -129,6 +133,7 @@ describe('gateway-reconnect single-flight owner', () => {
         reconnectGateway({ connectionId: 'test-conn' }),
         reconnectGateway({ connectionId: 'test-conn' }),
       ]
+
       await Promise.all([p1, p2, p3])
       expect(callCount).toBe(1)
     } finally {

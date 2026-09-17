@@ -75,6 +75,7 @@ export class ReconnectBackoffTracker {
     }
 
     const elapsed = now - this.firstFailureTime
+
     if (this.attempt >= this.maxAttempts || elapsed >= this.maxDurationMs) {
       return { delayMs: 0, exhausted: true }
     }
@@ -98,8 +99,10 @@ export class ReconnectBackoffTracker {
   checkStreakReset(now = Date.now()): boolean {
     if (this.openTime !== null && this.hasPinged && now - this.openTime >= this.streakResetMs) {
       this.reset()
+
       return true
     }
+
     return false
   }
 

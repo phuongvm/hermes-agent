@@ -2,10 +2,10 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
 import {
+  $terminalSignedOutUrls,
   isTerminalSignedOut,
   normalizeBaseUrl,
-  registerResumeSyncHandler,
-  $terminalSignedOutUrls
+  registerResumeSyncHandler
 } from '@/store/auth-terminal-state'
 import { refreshActiveProfile } from '@/store/profile'
 import { $connection, $gatewayState } from '@/store/session'
@@ -38,6 +38,7 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
   useEffect(() => {
     return registerResumeSyncHandler(baseUrl => {
       const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+
       if (currentBaseUrl === normalizeBaseUrl(baseUrl) && $gatewayState.get() === 'open') {
         hasDeferredRefreshRef.current = false
         void refreshActiveProfile()
@@ -73,6 +74,7 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
 
       if (gatewayState !== 'open' || isTerminalSignedOut(connection?.baseUrl)) {
         hasDeferredRefreshRef.current = true
+
         return
       }
 

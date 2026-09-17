@@ -1057,6 +1057,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     // The remote comes back: next reconnect attempt opens.
     FakeWebSocket.mode = 'open'
     await advanceBackoff()
+
     if ($gatewayState.get() !== 'open') {
       await advanceBackoff()
     }

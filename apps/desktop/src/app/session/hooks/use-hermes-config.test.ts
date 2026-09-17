@@ -1,11 +1,10 @@
 // @vitest-environment jsdom
 import { act, renderHook } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $terminalFontFamily, setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getHermesConfig } from '@/hermes'
 import { persistString } from '@/lib/storage'
-import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentCwd,
   $currentFastMode,

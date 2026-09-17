@@ -504,6 +504,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
   useEffect(() => {
     return registerResumeSyncHandler(baseUrl => {
       const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+
       if (cwd && currentBaseUrl === normalizeBaseUrl(baseUrl)) {
         void loadRoot(cwd, { connectionKey, force: true })
       }

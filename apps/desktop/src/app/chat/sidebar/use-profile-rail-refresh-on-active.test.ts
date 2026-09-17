@@ -8,6 +8,7 @@ const { refreshActiveProfile } = vi.hoisted(() => ({
 vi.mock('@/store/profile', () => ({ refreshActiveProfile }))
 
 import { $gatewayState } from '@/store/session'
+
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
 describe('useProfileRailRefreshOnActive', () => {
