@@ -469,10 +469,13 @@ test('tracks 401 state independently per endpoint', () => {
   assert.equal(getEndpoint401State('https://endpoint-b.example')?.consecutive401Count, 1)
 })
 
-test('unsigned OAuth is a terminal reauth failure; needsOauthLogin alone is not', () => {
+test('unsigned OAuth is a terminal reauth failure; a bare needsOauthLogin hint is not', () => {
   // The unsigned-in throw must set isReauthRequired so startHermes latches.
-  // needsOauthLogin alone (ticket 401/403) stays a Sign-in hint, not a latch —
-  // a lapsed AT cookie can still rotate from a live RT on the next mint.
+  // A bare needsOauthLogin (the IPC-shaped hint) stays Sign-in copy, not a
+  // latch. A CONFIRMED ticket 401/403 is different: the gateway has already
+  // tried the AT/RT rotation (cookie) or the desktop has forced one (native)
+  // before that rejection reaches gatewayTicketFailure, which tags it
+  // isReauthRequired itself (#95701).
   const unsigned = makeUnsignedOauthError() as any
 
   assert.equal(unsigned.needsOauthLogin, true)

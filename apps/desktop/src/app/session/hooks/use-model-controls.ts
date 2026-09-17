@@ -1,3 +1,4 @@
+import type { ModelOptionsResult } from '@hermes/shared'
 import { type QueryClient } from '@tanstack/react-query'
 import { useCallback, useRef } from 'react'
 
@@ -6,7 +7,7 @@ import { getApiRequestConnection, getApiRequestProfile, getGlobalModelInfo } fro
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
-import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
+import { modelOptionsQueryKey } from '@/lib/model-options'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, getProfileFetchGeneration, isGatewayOpen, normalizeProfileKey } from '@/store/profile'
 import {
@@ -21,7 +22,6 @@ import {
   setCurrentProvider
 } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
-import type { ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelControlsOptions {
   cacheOwnerConnectionId?: string
@@ -79,7 +79,7 @@ export function useModelControls({
       profile = cacheProfile || $activeGatewayProfile.get(),
       ownerConnectionId = cacheOwnerConnectionId
     ) => {
-      const patch = (prev: ModelOptionsResponse | undefined) => {
+      const patch = (prev: ModelOptionsResult | undefined) => {
         // Selection state can update before the catalog query has resolved.
         // Keep that optimistic cache structurally complete; the composer
         // interprets a response without `providers` as an empty catalog.
@@ -92,10 +92,10 @@ export function useModelControls({
         return { ...prev, provider, model, providers }
       }
 
-      queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile, sessionId, ownerConnectionId), patch)
+      queryClient.setQueryData<ModelOptionsResult>(modelOptionsQueryKey(profile, sessionId, ownerConnectionId), patch)
 
       if (includeGlobal) {
-        queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile, null, ownerConnectionId), patch)
+        queryClient.setQueryData<ModelOptionsResult>(modelOptionsQueryKey(profile, null, ownerConnectionId), patch)
       }
     },
     [cacheOwnerConnectionId, cacheProfile, queryClient]
@@ -149,22 +149,10 @@ export function useModelControls({
           return
         }
 
-        // A manual pick stays sticky UNLESS it was removed from the catalog (its
-        // model no longer exists on the provider), in which case keeping it would
-        // 404 every new chat — fall through to reseed from the profile default.
-        // Reads the model-options cache the composer already populated; an
-        // unknown/not-yet-loaded catalog conservatively preserves the pick.
-        const keepManualPick = () => {
-          if (force || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
-            return false
-          }
-
-          const options = queryClient.getQueryData<ModelOptionsResponse>(
-            modelOptionsQueryKey(cacheProfile || $activeGatewayProfile.get(), null, cacheOwnerConnectionId)
-          )
-
-          return !manualPickRemoved(options?.providers, $currentProvider.get(), $currentModel.get())
-        }
+        // A manual pick is sticky. It is never diffed against the catalog: rows
+        // are hints, and a custom slug the row lacks is still the user's choice
+        // (the gateway validates it on switch).
+        const keepManualPick = () => !force && Boolean($currentModel.get()) && getCurrentModelSource() === 'manual'
 
         if (keepManualPick()) {
           return

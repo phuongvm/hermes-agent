@@ -40,6 +40,7 @@ describe('5.4: Client-Only Startup Boundary Integration Tests', () => {
     }))
 
     const result = await runPrimaryBackendStartup({
+      assertCurrentAttempt: vi.fn(),
       resolveRemote: vi.fn(async () => seededRemote),
       connectRemote,
       prepareLocalBackend,
@@ -88,6 +89,7 @@ describe('5.4: Client-Only Startup Boundary Integration Tests', () => {
 
     await assert.rejects(async () => {
       await runPrimaryBackendStartup({
+        assertCurrentAttempt: vi.fn(),
         resolveRemote: vi.fn(async () => unreachableRemote),
         connectRemote,
         prepareLocalBackend,

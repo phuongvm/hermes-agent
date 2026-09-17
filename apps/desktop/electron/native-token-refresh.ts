@@ -22,7 +22,9 @@ export interface NativeTokenRefreshIo {
 
 export interface EnsureNativeAccessTokenOptions {
   force?: boolean
+  forceRefresh?: boolean
   rejectedBearer?: string
+  rejectedAccessToken?: string
 }
 
 export interface NativeTokenRefresher {
@@ -110,8 +112,8 @@ export function createNativeTokenRefresher(io: NativeTokenRefreshIo): NativeToke
     const normalizedOptions: EnsureNativeAccessTokenOptions =
       typeof options === 'string' ? { force: true, rejectedBearer: options } : (options ?? {})
 
-    const force = Boolean(normalizedOptions.force)
-    const rejectedBearer = normalizedOptions.rejectedBearer
+    const force = Boolean(normalizedOptions.force || normalizedOptions.forceRefresh)
+    const rejectedBearer = normalizedOptions.rejectedBearer || normalizedOptions.rejectedAccessToken
 
     const key = normalizeBaseUrlKey(baseUrl)
     if (isTerminalSignedOut(key)) {

@@ -468,6 +468,7 @@ def render_login_html(*, next_path: str = "") -> str:
     )
 
 
+
 def _render_password_form(provider, next_path: str) -> str:
     """Username/password form for a ``supports_password`` provider.
 

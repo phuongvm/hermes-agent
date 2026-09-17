@@ -6,7 +6,7 @@ import type { ProfileInfo } from '@/types/hermes'
 
 // Keep profile.ts's side-effecting imports inert: the gateway socket layer and
 // the REST query client must not run for real in a unit test.
-const ensureGatewayForProfile = vi.fn(async () => undefined)
+const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openSecondaryCount = vi.fn(() => 0)
@@ -15,6 +15,8 @@ const resetStarmapGraph = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
+  // Activation now verifies the socket's route before publishing the profile.
+  activeGatewayProfileKey: () => ensureGatewayForProfile.mock.lastCall?.[0] ?? $activeGatewayProfile.get(),
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForProfile,
@@ -335,7 +337,6 @@ describe('refreshProfiles shared rail list (#49289)', () => {
   it('suppresses refreshProfiles and error toasts when base URL is in terminal signed-out state', async () => {
     notifyError.mockClear()
     vi.mocked(getProfiles).mockClear()
-    $profiles.set([profile('default', true), profile('saved-profile')])
     const { $gatewayState, $connection } = await import('./session')
     const { setTerminalSignedOut, resetAuthTerminalState } = await import('./auth-terminal-state')
 
@@ -343,6 +344,7 @@ describe('refreshProfiles shared rail list (#49289)', () => {
     $gatewayState.set('open')
     $gateway.set({ id: 'live-socket', connectionState: 'open' })
     $connection.set(remoteConn())
+    $profiles.set([profile('default', true), profile('saved-profile')])
     setTerminalSignedOut('https://hermes-roy.tail.ts.net', true)
 
     const result = await refreshProfiles()
@@ -355,7 +357,6 @@ describe('refreshProfiles shared rail list (#49289)', () => {
   it('absorbs terminal signed-out error during refreshProfiles without error toast', async () => {
     notifyError.mockClear()
     vi.mocked(getProfiles).mockClear()
-    $profiles.set([profile('default', true), profile('saved-profile')])
     const { $gatewayState, $connection } = await import('./session')
     const { setTerminalSignedOut, resetAuthTerminalState } = await import('./auth-terminal-state')
 
@@ -363,6 +364,7 @@ describe('refreshProfiles shared rail list (#49289)', () => {
     $gatewayState.set('open')
     $gateway.set({ id: 'live-socket', connectionState: 'open' })
     $connection.set(remoteConn())
+    $profiles.set([profile('default', true), profile('saved-profile')])
 
     vi.mocked(getProfiles).mockImplementationOnce(async () => {
       setTerminalSignedOut('https://hermes-roy.tail.ts.net', true)
