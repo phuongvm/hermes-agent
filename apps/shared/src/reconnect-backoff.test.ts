@@ -1,50 +1,64 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { reconnectBackoffDelayMs } from './reconnect-backoff.js'
+import {
+  DEFAULT_BASE_DELAY_MS,
+  DEFAULT_CAP_MS,
+  MAX_RECONNECT_ATTEMPTS,
+  reconnectBackoffDelayMs,
+  ReconnectBackoffTracker,
+} from './reconnect-backoff.js'
 
 describe('reconnectBackoffDelayMs', () => {
-  it('increases the delay ceiling across consecutive failed attempts', () => {
-    // Pin Math.random so we can read the ceiling directly through the
-    // returned value instead of statistically sampling it.
-    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(1)
+  it('enforces equal jitter with a positive floor (500–1000ms on attempt 0)', () => {
+    const randomSpy = vi.spyOn(Math, 'random')
 
     try {
-      const delays = [0, 1, 2, 3, 4].map(attempt => reconnectBackoffDelayMs(attempt, { baseDelayMs: 300 }))
+      // ceiling = 1000, half = 500
+      randomSpy.mockReturnValue(0)
+      expect(reconnectBackoffDelayMs(0)).toBe(500)
 
-      expect(delays).toEqual([300, 600, 1200, 2400, 4800])
+      randomSpy.mockReturnValue(0.5)
+      expect(reconnectBackoffDelayMs(0)).toBe(750)
 
-      for (let i = 1; i < delays.length; i++) {
-        expect(delays[i]).toBeGreaterThan(delays[i - 1])
-      }
+      randomSpy.mockReturnValue(1)
+      expect(reconnectBackoffDelayMs(0)).toBe(1000)
     } finally {
       randomSpy.mockRestore()
     }
   })
 
-  it('caps the delay ceiling instead of growing unbounded', () => {
+  it('increases the delay ceiling across consecutive failed attempts with equal jitter', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(1)
 
     try {
-      // Attempt 10 would be 300 * 2**10 = 307_200ms uncapped — must clamp.
-      expect(reconnectBackoffDelayMs(10, { baseDelayMs: 300, capMs: 15_000 })).toBe(15_000)
-      expect(reconnectBackoffDelayMs(50, { baseDelayMs: 300, capMs: 15_000 })).toBe(15_000)
+      const delays = [0, 1, 2, 3, 4, 5].map(attempt => reconnectBackoffDelayMs(attempt))
+      expect(delays).toEqual([1000, 2000, 4000, 8000, 16000, 30000])
     } finally {
       randomSpy.mockRestore()
     }
   })
 
-  it('applies full jitter: delay is uniformly within [0, ceiling)', () => {
+  it('caps delay at 30,000ms and guarantees 15,000–30,000ms at saturation', () => {
     const randomSpy = vi.spyOn(Math, 'random')
 
     try {
       randomSpy.mockReturnValue(0)
-      expect(reconnectBackoffDelayMs(3, { baseDelayMs: 300 })).toBe(0)
+      expect(reconnectBackoffDelayMs(10)).toBe(15000)
 
-      randomSpy.mockReturnValue(0.5)
-      expect(reconnectBackoffDelayMs(3, { baseDelayMs: 300 })).toBe(1200)
+      randomSpy.mockReturnValue(1)
+      expect(reconnectBackoffDelayMs(10)).toBe(30000)
+      expect(reconnectBackoffDelayMs(50)).toBe(30000)
+    } finally {
+      randomSpy.mockRestore()
+    }
+  })
 
-      randomSpy.mockReturnValue(0.999)
-      expect(reconnectBackoffDelayMs(3, { baseDelayMs: 300 })).toBeCloseTo(2400 * 0.999, 5)
+  it('honors Retry-After header when it exceeds the jittered delay', () => {
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0) // delay = 500ms
+
+    try {
+      expect(reconnectBackoffDelayMs(0, { retryAfterMs: 5000 })).toBe(5000)
+      expect(reconnectBackoffDelayMs(0, { retryAfterMs: 200 })).toBe(500)
     } finally {
       randomSpy.mockRestore()
     }
@@ -54,9 +68,6 @@ describe('reconnectBackoffDelayMs', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(1)
 
     try {
-      // Simulates: fail, fail, fail (attempt climbs), succeed (caller resets
-      // its counter to 0), fail again — the very next delay must be back at
-      // the base ceiling, not continuing the climb.
       reconnectBackoffDelayMs(0, { baseDelayMs: 300 })
       reconnectBackoffDelayMs(1, { baseDelayMs: 300 })
       const afterSeveralFailures = reconnectBackoffDelayMs(2, { baseDelayMs: 300 })
@@ -83,8 +94,8 @@ describe('reconnectBackoffDelayMs', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(1)
 
     try {
-      expect(reconnectBackoffDelayMs(0)).toBe(300)
-      expect(reconnectBackoffDelayMs(100)).toBe(15_000)
+      expect(reconnectBackoffDelayMs(0)).toBe(DEFAULT_BASE_DELAY_MS)
+      expect(reconnectBackoffDelayMs(100)).toBe(DEFAULT_CAP_MS)
     } finally {
       randomSpy.mockRestore()
     }
@@ -98,9 +109,36 @@ describe('reconnectBackoffDelayMs', () => {
         [1000, 2000, 4000, 8000]
       )
       expect(reconnectBackoffDelayMs(99, { baseDelayMs: 1000, capMs: 30_000, jitter: false })).toBe(30_000)
-      expect(reconnectBackoffDelayMs(10_000, { jitter: false })).toBeLessThanOrEqual(15_000)
+      expect(reconnectBackoffDelayMs(10_000, { jitter: false })).toBeLessThanOrEqual(DEFAULT_CAP_MS)
     } finally {
       randomSpy.mockRestore()
     }
+  })
+})
+
+describe('ReconnectBackoffTracker', () => {
+  it('resets streak only after 30s open with successful ping', () => {
+    const tracker = new ReconnectBackoffTracker()
+    tracker.recordFailure(1000)
+    expect(tracker.currentAttempt).toBe(1)
+
+    tracker.recordConnected(2000)
+    tracker.recordPingResponse(2500)
+    expect(tracker.currentAttempt).toBe(1)
+
+    expect(tracker.checkStreakReset(32500)).toBe(true)
+    expect(tracker.currentAttempt).toBe(0)
+  })
+
+  it('transitions to exhausted after 12 retries or 5 minutes', () => {
+    const tracker = new ReconnectBackoffTracker()
+    let now = 1000
+    for (let i = 0; i < MAX_RECONNECT_ATTEMPTS; i++) {
+      const res = tracker.recordFailure(now)
+      expect(res.exhausted).toBe(false)
+      now += 1000
+    }
+    const res = tracker.recordFailure(now)
+    expect(res.exhausted).toBe(true)
   })
 })

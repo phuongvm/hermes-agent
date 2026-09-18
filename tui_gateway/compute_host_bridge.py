@@ -249,7 +249,10 @@ def _submit_prompt_to_compute_host(
             if session.get("_compute_host_turn_id") == turn_id:
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        code = getattr(exc, "code", 5019)
+        retry_after = getattr(exc, "retry_after_ms", 1000 if "capacity saturated" in str(exc).lower() else None)
+        data = {"reason": "capacity_saturated", "retry_after_ms": retry_after} if retry_after else None
+        return _err(rid, code, f"compute-host dispatch failed: {exc}", data=data)
     with session["history_lock"]:
         session["_compute_host_active"] = True
         if image_paths is None:

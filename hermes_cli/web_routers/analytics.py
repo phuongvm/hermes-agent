@@ -51,6 +51,10 @@ async def get_config_raw(profile: Optional[str] = None):
 
 @router.put("/api/config/raw")
 async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None):
+    raw_bytes = body.yaml_text.encode("utf-8")
+    if len(raw_bytes) > 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Raw config body exceeds 1 MiB limit")
+
     def _run():
         parsed = yaml.safe_load(body.yaml_text)
         if not isinstance(parsed, dict):
@@ -67,7 +71,9 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         return {"ok": True}
 
     try:
-        return await asyncio.to_thread(_run)
+        return await asyncio.wait_for(asyncio.to_thread(_run), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Config update timed out after 5s")
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 

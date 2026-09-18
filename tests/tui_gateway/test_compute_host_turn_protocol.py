@@ -93,9 +93,12 @@ def test_turn_start_streams_deltas_then_turn_end_with_history_identity(turn_env)
 
     frames = _frames(out)
     kinds = [f["type"] for f in frames]
-    assert kinds[0] == "turn.started"
+    assert kinds[0] == "turn.accepted"
+    assert kinds[1] == "turn.started"
     assert kinds[-1] == "turn.end"
-    started = frames[0]
+    accepted = frames[0]
+    assert accepted["sid"] == sid and accepted["request_id"] == "turn" and "accepted_ns" in accepted
+    started = frames[1]
     assert started["sid"] == sid and started["request_id"] == "turn" and "started_ns" in started
 
     # Streamed output rides the host transport as ``rpc`` frames tagged with the sid, each an

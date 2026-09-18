@@ -211,39 +211,42 @@ async def get_elevenlabs_voices(profile: Optional[str] = None):
     The desktop UI uses this for the ``tts.elevenlabs.voice_id`` dropdown.
     Only non-secret voice metadata is returned; the API key stays server-side.
     """
-    # Config-only scope (await-safe): the key lookup reads the requested
-    # profile's .env, matching the profile the settings UI writes to.
-    with _config_profile_scope(profile):
-        api_key = (load_env().get("ELEVENLABS_API_KEY") or "").strip()
-    if not api_key:
-        # Fallback for env-only deployments — scope-aware: under multiplex
-        # os.environ may hold another profile's key, so honor the installed
-        # scope's verdict before touching the env.
-        try:
-            from agent.secret_scope import UnscopedSecretError, get_secret
-
+    def _fetch_voices() -> Dict[str, Any]:
+        # Config-only scope (await-safe): the key lookup reads the requested
+        # profile's .env, matching the profile the settings UI writes to.
+        with _config_profile_scope(profile):
+            api_key = (load_env().get("ELEVENLABS_API_KEY") or "").strip()
+        if not api_key:
+            # Fallback for env-only deployments — scope-aware: under multiplex
+            # os.environ may hold another profile's key, so honor the installed
+            # scope's verdict before touching the env.
             try:
-                api_key = (get_secret("ELEVENLABS_API_KEY") or "").strip()
-            except UnscopedSecretError:
-                api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-        except Exception:
-            api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-    if not api_key:
-        return {"available": False, "voices": []}
+                from agent.secret_scope import UnscopedSecretError, get_secret
 
-    request = urllib.request.Request(
-        "https://api.elevenlabs.io/v1/voices",
-        headers={"Accept": "application/json", "xi-api-key": api_key},
-    )
+                try:
+                    api_key = (get_secret("ELEVENLABS_API_KEY") or "").strip()
+                except UnscopedSecretError:
+                    api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+            except Exception:
+                api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+        if not api_key:
+            return {"available": False, "voices": []}
+
+        request = urllib.request.Request(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"Accept": "application/json", "xi-api-key": api_key},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw_data = response.read(2 * 1024 * 1024 + 1)
+            if len(raw_data) > 2 * 1024 * 1024:
+                raise ValueError("ElevenLabs response exceeded 2 MiB ceiling")
+            return {"available": True, "payload": json.loads(raw_data.decode("utf-8"))}
 
     try:
-        loop = asyncio.get_running_loop()
-
-        def _fetch() -> Dict[str, Any]:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        payload = await loop.run_in_executor(None, _fetch)
+        res = await asyncio.to_thread(_fetch_voices)
+        if not res.get("available"):
+            return {"available": False, "voices": []}
+        payload = res["payload"]
     except urllib.error.HTTPError as exc:
         # An auth failure (bad/expired/scoped key) is a persistent, user-fixable
         # state and the desktop polls this on every settings open/focus, so

@@ -46,15 +46,19 @@ _CONTROL_REPLY_TYPES = frozenset({
     "reload_mcp.ack", "shutdown.ack"})
 
 
+_append_log_lock = threading.Lock()
+
+
 def append_log_record(path: str | Path, record: str) -> None:
     """Append one log record using O_APPEND and exactly one os.write call."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     text = record if record.endswith("\n") else f"{record}\n"
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, text.encode("utf-8", errors="replace"))
-    finally:
-        os.close(fd)
+    with _append_log_lock:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, text.encode("utf-8", errors="replace"))
+        finally:
+            os.close(fd)
 
 
 def _repo_root() -> Path:
@@ -119,6 +123,129 @@ def is_compute_host_identity(pid: int) -> bool:
     return "tui_gateway.compute_host" in _pid_command(pid)
 
 
+def _create_supervisor_job_object() -> int | None:
+    """Create a supervisor-owned Job Object configured with KILL_ON_JOB_CLOSE."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoCounters", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryLimit", ctypes.c_size_t),
+                ("PeakJobMemoryLimit", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        hJob = ctypes.windll.kernel32.CreateJobObjectW(None, None)
+        if not hJob:
+            return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        success = ctypes.windll.kernel32.SetInformationJobObject(
+            hJob,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not success:
+            ctypes.windll.kernel32.CloseHandle(hJob)
+            return None
+        return hJob
+    except Exception as exc:
+        logger.warning("failed to create Job Object: %s", exc)
+        return None
+
+
+def _assign_process_to_job(hJob: int, hProcess: int) -> bool:
+    if sys.platform != "win32" or not hJob or not hProcess:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.AssignProcessToJobObject(hJob, hProcess))
+    except Exception as exc:
+        logger.warning("failed to assign process to Job Object: %s", exc)
+        return False
+
+
+def _is_process_in_job(hProcess: int, hJob: int) -> bool:
+    if sys.platform != "win32" or not hJob or not hProcess:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        in_job = wintypes.BOOL()
+        if ctypes.windll.kernel32.IsProcessInJob(hProcess, hJob, ctypes.byref(in_job)):
+            return bool(in_job.value)
+        return False
+    except Exception:
+        return False
+
+
+def _resume_process(hProcess: int) -> bool:
+    if sys.platform != "win32" or not hProcess:
+        return False
+    try:
+        import ctypes
+        res = ctypes.windll.ntdll.NtResumeProcess(hProcess)
+        return res >= 0
+    except Exception as exc:
+        logger.warning("failed to resume suspended process: %s", exc)
+        return False
+
+
+def _open_process_handle(pid: int) -> int | None:
+    if sys.platform != "win32" or pid <= 0:
+        return None
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        PROCESS_SYNCHRONIZE = 0x00100000
+        PROCESS_TERMINATE = 0x0001
+        flags = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE
+        h = ctypes.windll.kernel32.OpenProcess(flags, False, pid)
+        return h if h else None
+    except Exception:
+        return None
+
+
+class CapacitySaturatedError(RuntimeError):
+    def __init__(self, message: str, code: int = 5019, retry_after_ms: int = 1000):
+        super().__init__(message)
+        self.code = code
+        self.retry_after_ms = retry_after_ms
+
+
 class HostSupervisor:
     """Own one persistent compute-host child and relay its frames."""
 
@@ -156,13 +283,32 @@ class HostSupervisor:
         self._late_control_handlers: dict[str, tuple[float, Callable[[dict], None]]] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
+        self.instance_id = uuid.uuid4().hex
+        self._launcher_pid = 0
+        self._host_pid = 0
+        self._job_handle: int | None = None
+        self._host_handle: int | None = None
+        self._last_heartbeat_time = time.monotonic()
+        self._pending_admissions: dict[str, queue.Queue[dict]] = {}
         if autostart:
             self.start()
 
     @property
-    def pid(self) -> int:
+    def launcher_pid(self) -> int:
         proc = self._proc
-        return int(proc.pid or 0) if proc is not None else 0
+        return int(proc.pid or 0) if proc is not None else self._launcher_pid
+
+    @property
+    def host_pid(self) -> int:
+        if self._host_pid > 0:
+            return self._host_pid
+        if self._hello:
+            return int(self._hello.get("host_pid") or self.launcher_pid)
+        return self.launcher_pid
+
+    @property
+    def pid(self) -> int:
+        return self.host_pid or self.launcher_pid
 
     def is_running(self) -> bool:
         proc = self._proc
@@ -180,6 +326,10 @@ class HostSupervisor:
         with self._lock:
             self._closing = True
             proc = self._proc
+            job_h = self._job_handle
+            self._job_handle = None
+            host_h = self._host_handle
+            self._host_handle = None
         if proc is None:
             return
         try:
@@ -189,6 +339,13 @@ class HostSupervisor:
         except Exception:
             self._terminate_process(proc)
         finally:
+            if sys.platform == "win32":
+                with contextlib.suppress(Exception):
+                    import ctypes
+                    if host_h:
+                        ctypes.windll.kernel32.CloseHandle(host_h)
+                    if job_h:
+                        ctypes.windll.kernel32.CloseHandle(job_h)
             self._remove_registry()
 
     def reconcile_startup_orphan(self) -> str:
@@ -199,13 +356,22 @@ class HostSupervisor:
             return "none"
         except Exception:
             data = None
+        if not isinstance(data, dict):
+            self._remove_registry()
+            return "invalid-registry"
+
+        parent_pid = int(data.get("parent_pid") or 0)
+        # Reject a second live instance without signaling or killing the active instance
+        if parent_pid > 0 and _pid_alive(parent_pid) and parent_pid != os.getpid():
+            raise RuntimeError(
+                f"Active gateway/supervisor instance already running (parent_pid={parent_pid}, instance_id={data.get('instance_id')})"
+            )
+
         try:
             pid = int((data or {}).get("host_pid") or 0)
         except Exception:
             pid = 0
-        if data is None:
-            outcome = "invalid-registry"
-        elif pid <= 0 or not _pid_alive(pid):
+        if pid <= 0 or not _pid_alive(pid):
             outcome = "not-running"
         elif not self._pid_matches_compute_host(pid):
             outcome = "pid-reuse-ignored"  # PID reused by another process: never signal it
@@ -220,17 +386,33 @@ class HostSupervisor:
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
         sid = str(frame.get("sid") or "")
         payload = {**frame, "type": "turn.start", "request_id": request_id}
+        admission_q: queue.Queue[dict] = queue.Queue(maxsize=1)
         with self._lock:
             self._pending_turns[request_id] = (sid, on_complete)
+            self._pending_admissions[request_id] = admission_q
         try:
             self._send_frame(payload)
+            try:
+                ack = admission_q.get(timeout=2.0)
+                if ack.get("type") == "turn.error":
+                    msg = ack.get("message", "capacity saturated")
+                    code = int(ack.get("code") or 5019)
+                    retry_after = int(ack.get("retry_after_ms") or 1000)
+                    raise CapacitySaturatedError(f"Capacity saturated: {msg}", code=code, retry_after_ms=retry_after)
+            except queue.Empty:
+                pass
         except Exception as exc:
             with self._lock:
                 self._pending_turns.pop(request_id, None)
+                self._pending_admissions.pop(request_id, None)
             if on_complete is not None:
                 on_complete({"type": "turn.error", "sid": sid, "request_id": request_id,
-                             "reason": "send_failed", "message": str(exc)})
+                             "reason": "send_failed", "message": str(exc),
+                             "execution_state": "not_started"})
             raise
+        finally:
+            with self._lock:
+                self._pending_admissions.pop(request_id, None)
         return request_id
 
     def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
@@ -290,7 +472,7 @@ class HostSupervisor:
         now = time.monotonic()
         with self._lock:
             handlers = self._late_control_handlers
-            for rid in [r for r, (at, _cb) in handlers.items() if now - at > _LATE_CONTROL_TTL_SECS]:
+            for rid in [r for r, (at, _cb) in handlers.items() if now - at >= _LATE_CONTROL_TTL_SECS]:
                 handlers.pop(rid, None)
             while len(handlers) >= _LATE_CONTROL_MAX:
                 handlers.pop(min(handlers, key=lambda rid: handlers[rid][0]), None)
@@ -311,33 +493,55 @@ class HostSupervisor:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
         self._hello = {}
+        self._last_heartbeat_time = time.monotonic()
         env = {**hermes_subprocess_env(inherit_credentials=True), **os.environ, **(self.env or {})}
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         root = str(_repo_root())
         env.setdefault("PYTHONPATH", root)
         if root not in env["PYTHONPATH"].split(os.pathsep):
             env["PYTHONPATH"] = root + os.pathsep + env["PYTHONPATH"]
+
+        job_handle = None
+        creationflags = 0
+        if sys.platform == "win32":
+            job_handle = _create_supervisor_job_object()
+            if job_handle:
+                creationflags |= 0x00000004  # CREATE_SUSPENDED
+
         # Lossy UTF-8 decode: a locale-mismatched byte must not raise inside the drain threads.
         proc = subprocess.Popen(
             self.argv, cwd=str(self.cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
-            start_new_session=True)
+            start_new_session=(sys.platform != "win32"), creationflags=creationflags)
         self._proc = proc
+        self._launcher_pid = int(proc.pid or 0)
+        self._job_handle = job_handle
+
+        if sys.platform == "win32" and job_handle:
+            _assign_process_to_job(job_handle, int(proc._handle))
+            _is_process_in_job(int(proc._handle), job_handle)
+            _resume_process(int(proc._handle))
+
         for target, name in ((self._drain_stdout, "compute-host-stdout"),
                              (self._drain_stderr, "compute-host-stderr"),
-                             (self._wait_for_exit, "compute-host-wait")):
+                             (self._wait_for_exit, "compute-host-wait"),
+                             (self._heartbeat_watchdog_loop, "compute-host-watchdog")):
             threading.Thread(target=target, args=(proc,), name=name, daemon=True).start()
         if not self._hello_event.wait(timeout=10.0):
             self._terminate_process(proc)
             raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
         self._validate_hello()
         self._persist_registry()
-        logger.info("compute host started pid=%s reason=%s", proc.pid, reason)
+        logger.info("compute host started launcher_pid=%s host_pid=%s reason=%s",
+                    self.launcher_pid, self.host_pid, reason)
 
     def _validate_hello(self) -> None:
         hello = self._hello
         if not hello:
             raise RuntimeError("compute host missing hello")
+        pv = hello.get("protocol_version")
+        if pv is not None and pv != 1:
+            raise RuntimeError(f"compute host protocol version mismatch: {pv} != 1")
         got_home = str(hello.get("hermes_home") or "")
         if got_home and got_home != self.expected_hermes_home:
             raise RuntimeError(
@@ -346,13 +550,32 @@ class HostSupervisor:
         expected = self.expected_build_sha
         if expected != "unknown" and got_sha not in {"", "unknown", expected}:
             raise RuntimeError(f"compute host build mismatch: {got_sha} != {expected}")
+        host_pid = int(hello.get("host_pid") or 0)
+        self._host_pid = host_pid or self.launcher_pid
+        if sys.platform == "win32" and self._job_handle and host_pid > 0:
+            if host_pid != self.launcher_pid:
+                hHost = _open_process_handle(host_pid)
+                if hHost:
+                    if not _is_process_in_job(hHost, self._job_handle):
+                        if self._proc:
+                            self._terminate_process(self._proc)
+                        raise RuntimeError(f"compute host reported pid {host_pid} is not in supervisor Job Object")
+                    self._host_handle = hHost
 
     def _persist_registry(self) -> None:
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.registry_path.with_suffix(self.registry_path.suffix + ".tmp")
-        payload = {"host_pid": self.pid, "boot_id": self._hello.get("boot_id") or "",
-                   "build_sha": self._hello.get("build_sha") or "", "started_at": time.time(),
-                   "argv": self.argv}
+        payload = {
+            "parent_pid": os.getpid(),
+            "launcher_pid": self.launcher_pid,
+            "host_pid": self.host_pid,
+            "boot_id": self._hello.get("boot_id") or "",
+            "resolved_home": self.expected_hermes_home,
+            "instance_id": self.instance_id,
+            "build_sha": self._hello.get("build_sha") or "",
+            "started_at": time.time(),
+            "argv": self.argv,
+        }
         tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         tmp.replace(self.registry_path)
 
@@ -363,6 +586,7 @@ class HostSupervisor:
             logger.debug("failed to remove compute host registry", exc_info=True)
 
     def _send_frame(self, frame: dict[str, Any]) -> None:
+        frame.setdefault("protocol_version", 1)
         with self._lock:
             proc = self._proc
             if proc is None or proc.poll() is not None or proc.stdin is None:
@@ -372,11 +596,24 @@ class HostSupervisor:
 
     def _drain_stdout(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
-        for raw in proc.stdout:
+        stream = proc.stdout
+        max_line_len = 1024 * 1024
+        while True:
+            line = stream.readline(max_line_len + 1)
+            if not line:
+                break
+            if len(line.encode("utf-8", errors="replace")) > max_line_len and not line.endswith("\n"):
+                logger.error("compute host frame exceeded 1 MiB limit")
+                while not line.endswith("\n"):
+                    chunk = stream.readline(max_line_len)
+                    if not chunk:
+                        break
+                    line = chunk
+                continue
             try:
-                frame = json.loads(raw)
+                frame = json.loads(line)
             except json.JSONDecodeError:
-                logger.warning("compute host emitted invalid json: %r", raw[:200])
+                logger.warning("compute host emitted invalid json: %r", line[:200])
                 continue
             if isinstance(frame, dict):
                 self._handle_host_frame(frame)
@@ -396,7 +633,16 @@ class HostSupervisor:
         elif ftype == "hello":
             self._hello = dict(frame)
             self._hello_event.set()
+            with contextlib.suppress(Exception):
+                self._send_frame({"type": "hello.ack", "protocol_version": 1, "boot_id": frame.get("boot_id")})
+        elif ftype == "turn.accepted":
+            with self._lock:
+                q = self._pending_admissions.get(request_id)
+            if q is not None:
+                with contextlib.suppress(queue.Full):
+                    q.put_nowait(frame)
         elif ftype == "hb":
+            self._last_heartbeat_time = time.monotonic()
             self._last_progress_counter = int(frame.get("progress_counter") or self._last_progress_counter)
             logger.debug("compute host heartbeat: %s", frame)
         elif ftype == "rpc":
@@ -404,9 +650,25 @@ class HostSupervisor:
                 self.rpc_sink(frame["message"])
         elif ftype in ("turn.end", "turn.error"):
             with self._lock:
+                q = self._pending_admissions.get(request_id)
+            if q is not None:
+                with contextlib.suppress(queue.Full):
+                    q.put_nowait(frame)
+            with self._lock:
                 pending = self._pending_turns.pop(request_id, None)
             if pending is not None and pending[1] is not None:
                 _call_logged(pending[1], frame, "compute host turn completion callback failed")
+
+    def _heartbeat_watchdog_loop(self, proc: subprocess.Popen[str]) -> None:
+        deadline_secs = 3.0 * self.heartbeat_secs
+        while not self._closing:
+            time.sleep(min(1.0, float(self.heartbeat_secs)))
+            if self._proc is not proc or proc.poll() is not None:
+                break
+            if time.monotonic() - self._last_heartbeat_time > deadline_secs:
+                logger.error("compute host missed heartbeats (deadline %.1fs exceeded); terminating unresponsive host", deadline_secs)
+                self._terminate_process(proc)
+                break
 
     def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
         code = proc.wait()
@@ -424,7 +686,7 @@ class HostSupervisor:
         with self._lock:
             pending = self._pending_turns
             self._pending_turns = {}
-        failure = {"reason": reason, "message": message}
+        failure = {"reason": reason, "message": message, "execution_state": "unknown"}
         for request_id, (sid, cb) in pending.items():
             self.rpc_sink({"jsonrpc": "2.0", "method": "event",
                            "params": {"type": "error", "session_id": sid, "payload": dict(failure)}})
@@ -477,6 +739,10 @@ class HostSupervisor:
             time.sleep(0.05)
 
     def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
+        if sys.platform == "win32" and self._job_handle:
+            with contextlib.suppress(Exception):
+                import ctypes
+                ctypes.windll.kernel32.TerminateJobObject(self._job_handle, 1)
         if proc.poll() is not None:
             return
         with contextlib.suppress(Exception):
