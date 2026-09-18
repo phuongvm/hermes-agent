@@ -142,6 +142,8 @@ def _stub_uvicorn_run(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda host, port: False)
+    monkeypatch.setattr(_web_server_lifecycle, "_port_bind_conflict", lambda host, port: False)
     return captured
 
 
@@ -159,6 +161,8 @@ def _restore_app_state_after_test(monkeypatch, *names):
 def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     """Loopback bind: app.state.auth_required is False after start_server."""
     _stub_uvicorn_run(monkeypatch)
+    import hermes_cli.config
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **kw: {})
     # Force a fresh state to detect that start_server actually set it.
     web_server.app.state.auth_required = None
     web_server.start_server(

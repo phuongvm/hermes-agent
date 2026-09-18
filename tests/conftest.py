@@ -333,6 +333,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # these, so production tests must not see them either.
     "HERMES_DASHBOARD_OAUTH_CLIENT_ID",
     "HERMES_DASHBOARD_PORTAL_URL",
+    "HERMES_DASHBOARD_PUBLIC_URL",
+    "HERMES_DASHBOARD_PORT",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
     "TERMINAL_VERCEL_RUNTIME",
@@ -449,6 +451,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WHATSAPP_REQUIRE_MENTION",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
+    "BUZZ_REPLY_TO_MODE",
+    "BUZZ_REPLY_IN_THREAD",
+    "BUZZ_REQUIRE_MENTION",
 })
 
 
@@ -578,6 +583,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+    web_server_mod = sys.modules.get("hermes_cli.web_server")
+    if web_server_mod is not None and hasattr(web_server_mod, "set_startup_ready"):
+        web_server_mod.set_startup_ready(True)
+
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it

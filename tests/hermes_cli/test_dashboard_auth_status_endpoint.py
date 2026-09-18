@@ -21,6 +21,12 @@ from hermes_cli.dashboard_auth import clear_providers, register_provider
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
+@pytest.fixture(autouse=True)
+def _isolate_status_gateway(monkeypatch):
+    from hermes_cli.web_routers import status as status_router
+    monkeypatch.setattr(status_router, "_load_configured_gateway_platforms", lambda: set())
+
+
 @pytest.fixture
 def gated_client():
     clear_providers()

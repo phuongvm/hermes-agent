@@ -82,6 +82,11 @@
 - **Resolution Strategy**: Explicitly initialized `$gatewayState.set('open')` in test and reset to `'idle'` in `afterEach`.
 - **Verification**: `src/hermes.test.ts` (38/38 passed).
 
+### 3.13. `tests/conftest.py` & `tests/hermes_cli/test_dashboard_auth_gate.py` (QA Isolation Blockers)
+- **Nature of Defect**: Host environment variables `BUZZ_REPLY_TO_MODE=off`, `HERMES_DASHBOARD_PUBLIC_URL`, and bound port `9119` contaminated test runs during zero-trust QA audit.
+- **Resolution Strategy**: Added `BUZZ_*` and `HERMES_DASHBOARD_*` to `_HERMES_BEHAVIORAL_VARS` in `tests/conftest.py`; stubbed `_port_bind_conflict` in `_stub_uvicorn_run` and mocked `load_config` in loopback auth test; isolated status router gateway platforms.
+- **Verification**: `test_buzz_*.py` (266/266 passed without `env -u`), `test_dashboard_auth_*.py` (200/200 passed).
+
 ---
 
 ## 4. Summary of Test Proof & Verification
@@ -96,5 +101,7 @@
 | **MCP Startup Discovery** | `pytest tests/hermes_cli/test_mcp_startup.py::test_background_discovery_skips_when_all_servers_disabled` | **1 passed (100%)** |
 | **Native Auth Flow** | `pytest tests/hermes_cli/test_dashboard_auth_native_flow.py` | **17 passed (100%)** |
 | **OIDC Session Expiry** | `pytest tests/plugins/dashboard_auth/test_oidc_application_sessions.py::test_native_http_refresh_ws_ticket_and_logout_after_id_token_expiry` | **1 passed (100%)** |
-| **Buzz WAN WebSocket** | `pytest tests/gateway/test_buzz_websocket.py` | **24 passed (100%)** |
+| **Buzz Complete Suite (Hermetic)** | `pytest tests/gateway/test_buzz_*.py` | **266 passed (100%)** |
+| **Dashboard Auth Complete Suite (Hermetic)** | `pytest tests/hermes_cli/test_dashboard_auth_*.py` | **200 passed (100%)** |
+| **Dashboard Plugin Auth** | `pytest tests/plugins/dashboard_auth/` | **142 passed (100%)** |
 | **OpenSpec Strict Validation** | `openspec validate sync-upstream-main --strict` | **Change is valid (100%)** |
