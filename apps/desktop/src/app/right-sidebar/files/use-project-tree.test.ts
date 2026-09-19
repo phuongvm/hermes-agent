@@ -602,6 +602,7 @@ describe('useProjectTree', () => {
 
     await waitFor(() => expect(readDir).toHaveBeenCalledTimes(1))
     expect(readDir).toHaveBeenCalledWith('/p')
+  })
 
   // The whole point of the toggle is "show me more files", so the folder the
   // user is looking at must gain rows, not lose them. loadRoot(force) rebuilds
