@@ -68,12 +68,19 @@ export class ReconnectBackoffTracker {
   private firstFailureTime: number | null = null
   private openTime: number | null = null
   private hasPinged = false
+  private readonly maxAttempts: number
+  private readonly maxDurationMs: number
+  private readonly streakResetMs: number
 
   constructor(
-    private readonly maxAttempts = MAX_RECONNECT_ATTEMPTS,
-    private readonly maxDurationMs = MAX_RECONNECT_DURATION_MS,
-    private readonly streakResetMs = STREAK_RESET_WINDOW_MS,
-  ) {}
+    maxAttempts = MAX_RECONNECT_ATTEMPTS,
+    maxDurationMs = MAX_RECONNECT_DURATION_MS,
+    streakResetMs = STREAK_RESET_WINDOW_MS,
+  ) {
+    this.maxAttempts = maxAttempts
+    this.maxDurationMs = maxDurationMs
+    this.streakResetMs = streakResetMs
+  }
 
   get currentAttempt(): number {
     return this.attempt

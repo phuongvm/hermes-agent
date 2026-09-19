@@ -1,6 +1,7 @@
 """Memory-provider dashboard helpers: manifest/schema loading, setup-env and dependency probes, configured-status discovery.
 """
 
+import contextlib
 import logging
 import json
 import os
@@ -173,15 +174,104 @@ def _schema_field_kind(raw: Dict[str, Any], choices: list) -> str:
     return "text"
 
 
+@contextlib.contextmanager
+def _ensure_active_profile_scope():
+    """Ensure a profile secret scope is active on this thread/task if multiplexing is on."""
+    try:
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            current_secret_scope,
+            is_multiplex_active,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+    except ImportError:
+        yield False
+        return
+
+    if not is_multiplex_active():
+        yield True
+        return
+
+    if current_secret_scope() is not None:
+        yield True
+        return
+
+    token = None
+    try:
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+
+        home = Path(get_hermes_home())
+        process_home = Path(get_process_hermes_home())
+        if home.resolve() == process_home.resolve():
+            try:
+                from tui_gateway.launch_profile_policy import launch_secret_scope
+                secrets = launch_secret_scope(process_home)
+            except Exception:
+                secrets = build_profile_secret_scope(home)
+        else:
+            secrets = build_profile_secret_scope(home)
+        if secrets:
+            token = set_secret_scope(secrets)
+    except Exception:
+        _log.debug("Failed to activate profile secret scope for memory provider schema", exc_info=True)
+
+    try:
+        yield token is not None
+    finally:
+        if token is not None:
+            reset_secret_scope(token)
+
+
 def _normalize_memory_provider_schema(name: str, provider: Any) -> List[Dict[str, Any]]:
     raw_schema: List[Dict[str, Any]] = []
     if provider is not None and hasattr(provider, "get_config_schema"):
+        scope_was_active = False
         try:
-            raw = provider.get_config_schema()
+            with _ensure_active_profile_scope() as scope_active:
+                scope_was_active = scope_active
+                raw = provider.get_config_schema()
             if isinstance(raw, list):
                 raw_schema = [field for field in raw if isinstance(field, dict)]
-        except Exception:
-            _log.warning("Failed to read memory provider schema for %s", name, exc_info=True)
+        except Exception as exc:
+            try:
+                from agent.secret_scope import (
+                    UnscopedSecretError,
+                    reset_secret_scope,
+                    set_secret_scope,
+                )
+            except ImportError:
+                UnscopedSecretError = ()
+                set_secret_scope = None
+                reset_secret_scope = None
+
+            if UnscopedSecretError and isinstance(exc, UnscopedSecretError):
+                if not scope_was_active:
+                    _log.debug(
+                        "Memory provider %s schema read hit inactive secret scope under multiplexing; attempting safe fallback: %s",
+                        name,
+                        exc,
+                    )
+                else:
+                    _log.warning(
+                        "Failed to read memory provider schema for %s while secret scope was resolved: %s",
+                        name,
+                        exc,
+                        exc_info=True,
+                    )
+                if set_secret_scope and reset_secret_scope:
+                    try:
+                        fallback_token = set_secret_scope({})
+                        try:
+                            raw = provider.get_config_schema()
+                            if isinstance(raw, list):
+                                raw_schema = [field for field in raw if isinstance(field, dict)]
+                        finally:
+                            reset_secret_scope(fallback_token)
+                    except Exception:
+                        _log.debug("Fallback schema read for %s failed", name, exc_info=True)
+            else:
+                _log.warning("Failed to read memory provider schema for %s", name, exc_info=True)
 
     fields: List[Dict[str, Any]] = []
     for raw in raw_schema:
