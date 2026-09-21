@@ -65,6 +65,20 @@ class DummySession:
         self.messages.extend(messages)
 
 
+_created_managers: list[HonchoSessionManager] = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_topology_managers():
+    yield
+    while _created_managers:
+        mgr = _created_managers.pop()
+        try:
+            mgr.shutdown()
+        except Exception:
+            pass
+
+
 def _make_manager(config: HonchoClientConfig | None = None) -> tuple[HonchoSessionManager, MagicMock, dict[str, DummySession]]:
     mock_sdk = MagicMock(spec=Honcho)
     sessions: dict[str, DummySession] = {}
@@ -84,12 +98,17 @@ def _make_manager(config: HonchoClientConfig | None = None) -> tuple[HonchoSessi
         api_key="test-key",
         write_frequency="turn",
     )
+    if not cfg.api_key:
+        cfg.api_key = "test-key"
+    if not cfg.peer_name:
+        cfg.peer_name = "user"
     mgr = HonchoSessionManager(
         honcho=mock_sdk,
         config=cfg,
     )
     mgr._sdk_session = lambda sid: sessions.setdefault(sid, DummySession(sid))
     mgr._get_or_create_peer = lambda pid: DummyPeer(pid)
+    _created_managers.append(mgr)
     return mgr, mock_sdk, sessions
 
 
@@ -172,24 +191,35 @@ def test_parser_authoritative_resolution(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_bot_author_shared_session_non_observing_join():
-    """Bot author in shared session (a2a disabled) joins with (False, False)."""
-    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=False)
+    """Bot author in shared session (a2a disabled) joins with (False, False) through real pipeline."""
+    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=False, write_frequency="turn")
     mgr, _, sessions = _make_manager(cfg)
 
-    session = HonchoSession(
-        key="main_session",
-        user_peer_id="user",
-        assistant_peer_id="hermes_agent",
-        honcho_session_id="s1",
-    )
-    mgr._sessions_cache["s1"] = DummySession("s1")
+    provider = HonchoMemoryProvider()
+    provider._config = cfg
+    provider._manager = mgr
+    provider._session_key = "test_shared_a"
+    provider._session_initialized = True
 
-    # Author is bot
-    session.add_message("user", "Bot message", author_peer_id="coder", author_is_bot=True)
-    mgr._flush_session(session)
+    # Real pipeline: on_turn_start -> sync_turn -> _flush_session_locked
+    provider.on_turn_start(1, "Bot message", author_id="bot:coder", author_name="coder")
+    provider.sync_turn(user_content="Bot message", assistant_content=None)
+    if provider._sync_thread and provider._sync_thread.is_alive():
+        provider._sync_thread.join(timeout=2.0)
 
-    s1 = mgr._sessions_cache["s1"]
-    coder_joins = [cfg for peer, cfg in s1.added_peers if peer.id == "coder"]
+    # Verify message has author_peer_id="coder" and author_is_bot=True
+    cached_session = mgr._cache.get("test_shared_a")
+    assert cached_session is not None
+    user_msgs = [m for m in cached_session.messages if m.get("role") == "user"]
+    assert len(user_msgs) >= 1
+    assert user_msgs[0].get("author_peer_id") == "coder"
+    assert user_msgs[0].get("author_is_bot") is True
+
+    # Verify backend join: coder added as (False, False)
+    sid = mgr._sanitize_id("test_shared_a")
+    backend_session = sessions.get(sid)
+    assert backend_session is not None
+    coder_joins = [cfg for peer, cfg in backend_session.added_peers if peer.id == "coder"]
     assert len(coder_joins) == 1
     assert coder_joins[0].observe_me is False
     assert coder_joins[0].observe_others is False
@@ -200,27 +230,42 @@ def test_bot_author_shared_session_non_observing_join():
 # ---------------------------------------------------------------------------
 
 def test_human_aliased_author_observing_join():
-    """Human/runtime author aliased to a peer joins with session user flags."""
-    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent")
+    """Human/runtime author aliased to a peer joins with session user flags through real pipeline."""
+    cfg = HonchoClientConfig(
+        host="hermes",
+        ai_peer="hermes_agent",
+        user_peer_aliases={"runtime_human": "coder"},
+        write_frequency="turn",
+    )
     mgr, _, sessions = _make_manager(cfg)
 
-    session = HonchoSession(
-        key="main_session",
-        user_peer_id="user",
-        assistant_peer_id="hermes_agent",
-        honcho_session_id="s2",
-    )
-    mgr._sessions_cache["s2"] = DummySession("s2")
+    provider = HonchoMemoryProvider()
+    provider._config = cfg
+    provider._manager = mgr
+    provider._session_key = "test_shared_b"
+    provider._session_initialized = True
 
-    session.add_message("user", "Human message", author_peer_id="coder", author_is_bot=False)
-    mgr._flush_session(session)
+    # Real pipeline: human/runtime id aliased to peer coder, is_bot=False
+    provider.on_turn_start(1, "Human message", author_id="runtime_human", author_name="coder", author_is_bot=False)
+    provider.sync_turn(user_content="Human message", assistant_content=None)
+    if provider._sync_thread and provider._sync_thread.is_alive():
+        provider._sync_thread.join(timeout=2.0)
 
-    s2 = mgr._sessions_cache["s2"]
-    coder_joins = [cfg for peer, cfg in s2.added_peers if peer.id == "coder"]
+    cached_session = mgr._cache.get("test_shared_b")
+    assert cached_session is not None
+    user_msgs = [m for m in cached_session.messages if m.get("role") == "user"]
+    assert len(user_msgs) >= 1
+    assert user_msgs[0].get("author_peer_id") == "coder"
+    assert user_msgs[0].get("author_is_bot") is False
+
+    sid = mgr._sanitize_id("test_shared_b")
+    backend_session = sessions.get(sid)
+    assert backend_session is not None
+    coder_joins = [c for peer, c in backend_session.added_peers if peer.id == "coder"]
     assert len(coder_joins) == 1
-    # User flags default to (True, True)
-    assert coder_joins[0].observe_me is True
-    assert coder_joins[0].observe_others is True
+    flags = mgr._observation_flags(sid)
+    assert coder_joins[0].observe_me == flags["user_observe_me"]
+    assert coder_joins[0].observe_others == flags["user_observe_others"]
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +274,16 @@ def test_human_aliased_author_observing_join():
 
 def test_bot_prefix_connection_author_join():
     """Prefix bot: triggers author_is_bot in sync_turn and yields (False, False) join."""
-    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", peer_name="user", api_key="test-key", a2a_sessions=False)
-    mgr, _, _ = _make_manager(cfg)
+    cfg = HonchoClientConfig(
+        host="hermes",
+        ai_peer="hermes_agent",
+        peer_name="user",
+        api_key="test-key",
+        a2a_sessions=False,
+        user_peer_aliases={"bot:conn/coder": "coder"},
+        write_frequency="turn",
+    )
+    mgr, _, sessions = _make_manager(cfg)
 
     provider = HonchoMemoryProvider()
     provider._config = cfg
@@ -238,18 +291,33 @@ def test_bot_prefix_connection_author_join():
     provider._session_key = "test_shared"
     provider._session_initialized = True
 
+    # 1. bot:<conn>/specialist
     author = {"id": "bot:matrix/@specialist:homeserver", "name": "specialist"}
+    provider.on_turn_start(1, "Hello from specialist", author_id=author["id"], author_name=author["name"])
     provider.sync_turn(user_content="Hello from specialist", assistant_content=None, turn_author=author)
-
     if provider._sync_thread and provider._sync_thread.is_alive():
         provider._sync_thread.join(timeout=2.0)
 
-    # Inspect sessions
-    for session_obj in mgr._sessions_cache.values():
-        for peer, config in session_obj.added_peers:
-            if "specialist" in peer.id:
-                assert config.observe_me is False
-                assert config.observe_others is False
+    # 2. peerAliases-mapped bot: id
+    author_alias = {"id": "bot:conn/coder", "name": "coder"}
+    provider.on_turn_start(2, "Hello from coder", author_id=author_alias["id"], author_name=author_alias["name"])
+    provider.sync_turn(user_content="Hello from coder", assistant_content=None, turn_author=author_alias)
+    if provider._sync_thread and provider._sync_thread.is_alive():
+        provider._sync_thread.join(timeout=2.0)
+
+    sid = mgr._sanitize_id("test_shared")
+    backend_session = sessions.get(sid)
+    assert backend_session is not None
+
+    specialist_joins = [c for peer, c in backend_session.added_peers if "specialist" in peer.id]
+    assert len(specialist_joins) == 1
+    assert specialist_joins[0].observe_me is False
+    assert specialist_joins[0].observe_others is False
+
+    coder_joins = [c for peer, c in backend_session.added_peers if peer.id == "coder"]
+    assert len(coder_joins) == 1
+    assert coder_joins[0].observe_me is False
+    assert coder_joins[0].observe_others is False
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +326,15 @@ def test_bot_prefix_connection_author_join():
 
 def test_bot_a2a_session_no_shared_add_peers():
     """When a2aSessions is True, bot turn routes to dedicated A2A session without shared add_peers."""
-    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", peer_name="user", api_key="test-key", a2a_sessions=True)
-    mgr, _, _ = _make_manager(cfg)
+    cfg = HonchoClientConfig(
+        host="hermes",
+        ai_peer="hermes_agent",
+        peer_name="user",
+        api_key="test-key",
+        a2a_sessions=True,
+        write_frequency="turn",
+    )
+    mgr, _, sessions = _make_manager(cfg)
 
     provider = HonchoMemoryProvider()
     provider._config = cfg
@@ -267,14 +342,19 @@ def test_bot_a2a_session_no_shared_add_peers():
     provider._session_key = "human_chat"
     provider._session_initialized = True
 
+    # Pre-create the shared session
+    mgr.get_or_create("human_chat")
+
     author = {"id": "bot:coder", "name": "coder", "is_bot": True}
+    provider.on_turn_start(1, "Subtask done", author_id=author["id"], author_name=author["name"], author_is_bot=True)
     provider.sync_turn(user_content="Subtask done", assistant_content=None, turn_author=author)
 
     if provider._sync_thread and provider._sync_thread.is_alive():
         provider._sync_thread.join(timeout=2.0)
 
     # Shared session human_chat was not populated with add_peers for coder
-    shared = mgr._sessions_cache.get("human_chat")
+    shared_sid = mgr._sanitize_id("human_chat")
+    shared = sessions.get(shared_sid)
     if shared:
         coder_joins = [p for p, _ in shared.added_peers if p.id == "coder"]
         assert len(coder_joins) == 0
@@ -287,20 +367,24 @@ def test_bot_a2a_session_no_shared_add_peers():
 def test_bot_author_first_then_specialist_init():
     """Bot author joins with (False, False). Specialist later inits session with observeOthers=False.
     Configuration remains observeOthers=False."""
-    # 1. Bot author joins session s3
-    cfg_bot = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=False)
-    mgr, _, _ = _make_manager(cfg_bot)
-    dummy_s3 = DummySession("s3")
-    mgr._sessions_cache["s3"] = dummy_s3
+    # 1. Bot author joins session s3 through real pipeline
+    cfg_bot = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=False, write_frequency="turn")
+    mgr, _, sessions = _make_manager(cfg_bot)
 
-    session = HonchoSession(
-        key="s3_key",
-        user_peer_id="user",
-        assistant_peer_id="hermes_agent",
-        honcho_session_id="s3",
-    )
-    session.add_message("user", "Work log", author_peer_id="coder", author_is_bot=True)
-    mgr._flush_session(session)
+    provider = HonchoMemoryProvider()
+    provider._config = cfg_bot
+    provider._manager = mgr
+    provider._session_key = "s3_key"
+    provider._session_initialized = True
+
+    author = {"id": "bot:coder", "name": "coder"}
+    provider.on_turn_start(1, "Work log", author_id=author["id"], author_name=author["name"])
+    provider.sync_turn(user_content="Work log", assistant_content=None, turn_author=author)
+    if provider._sync_thread and provider._sync_thread.is_alive():
+        provider._sync_thread.join(timeout=2.0)
+
+    sid = mgr._sanitize_id("s3_key")
+    dummy_s3 = sessions[sid]
 
     # coder is in s3 with (False, False)
     assert dummy_s3.peer_configs["coder"].observe_others is False
@@ -312,12 +396,12 @@ def test_bot_author_first_then_specialist_init():
         ai_authoritative=True,
         ai_observe_me=False,
         ai_observe_others=False,
+        write_frequency="turn",
     )
     mgr_spec, _, _ = _make_manager(cfg_specialist)
-    dummy_s3_spec = dummy_s3  # same backend session
-    mgr_spec._sdk_session = lambda sid: dummy_s3_spec
+    mgr_spec._sdk_session = lambda s: dummy_s3
 
-    synced = mgr_spec._configure_session_peers("s3", DummyPeer("user"), DummyPeer("coder"))
+    synced = mgr_spec._configure_session_peers(sid, DummyPeer("user"), DummyPeer("coder"))
     assert synced["ai_observe_others"] is False
     assert dummy_s3.peer_configs["coder"].observe_others is False
 
