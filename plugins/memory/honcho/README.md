@@ -382,10 +382,16 @@ Maps 1:1 to Honcho's per-peer `SessionPeerConfig`. When present, overrides `obse
 | `user.observeOthers` | `true` | User peer observes AI messages |
 | `ai.observeMe` | `true` | AI peer self-observation (Honcho builds AI representation) |
 | `ai.observeOthers` | `true` | AI peer observes user messages (enables cross-peer dialectic) |
+| `ai.authoritative` | `false` | When `true`, local AI peer observation flags win and are reconciled to the server at session init. When `false` (default), server-side toggles win over local defaults |
 
 Presets:
 - `"directional"` (default): all four `true`
 - `"unified"`: user `observeMe=true`, AI `observeOthers=true`, rest `false`
+
+### Asymmetric Multi-Agent & Fleet Parity
+- **Bot-Author Join Tiering**: When an external bot writes into a shared session, it joins with non-observing flags (`observeMe=false, observeOthers=false`) so participant agents do not exhaust Honcho observer quota.
+- **Fleet Peer ID Parity**: In multi-agent clusters sharing a Honcho workspace, each distinct agent profile must use a unique `aiPeer` (e.g. `coder`, `reviewer`, `leader`) to prevent peer collision and configuration clobbering.
+- **Authoritative Topology**: Set `observation.ai.authoritative: true` across fleet host profiles to guarantee that specialist non-observing configurations (`observeOthers: false`) persist idempotently across sessions.
 
 ### Hardcoded Limits
 

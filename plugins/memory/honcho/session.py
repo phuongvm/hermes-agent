@@ -96,6 +96,7 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
             ("dialectic_max_chars", 600), ("dialectic_max_input_chars", 10000),
             ("user_observe_me", True), ("user_observe_others", True),
             ("ai_observe_me", True), ("ai_observe_others", True),
+            ("ai_authoritative", False),
         ):
             setattr(self, f"_{name}", getattr(config, name) if config else default)
         self._turn_counter: int = 0
@@ -210,6 +211,29 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                 logger.debug("Honcho observation synced from server for session '%s': user(me=%s,others=%s) ai(me=%s,others=%s)",
                              session_id, synced["user_observe_me"], synced["user_observe_others"],
                              synced["ai_observe_me"], synced["ai_observe_others"])
+
+                if self._ai_authoritative:
+                    local_om = flags["ai_observe_me"]
+                    local_oo = flags["ai_observe_others"]
+                    server_om = synced.get("ai_observe_me")
+                    server_oo = synced.get("ai_observe_others")
+                    if server_om != local_om or server_oo != local_oo:
+                        ai_pid = getattr(assistant_peer, "id", str(assistant_peer))
+                        target_cfg = SessionPeerConfig(observe_me=local_om, observe_others=local_oo)
+                        try:
+                            self._authed_call(
+                                "peer configuration update",
+                                lambda: self._sdk_session(session_id).set_peer_configuration(assistant_peer, target_cfg),
+                            )
+                            synced["ai_observe_me"] = local_om
+                            synced["ai_observe_others"] = local_oo
+                            logger.debug("Honcho reconciled AI peer configuration for session '%s', peer '%s': observe_me=%s, observe_others=%s",
+                                         session_id, ai_pid, local_om, local_oo)
+                        except Exception as e:
+                            logger.warning(
+                                "Honcho set_peer_configuration failed for session '%s', peer '%s': %s",
+                                session_id, ai_pid, e
+                            )
 
             self._guarded(_adopt_server_config, None, logging.DEBUG,
                           "Honcho get_peer_configuration failed (using local config): %s")
@@ -369,7 +393,9 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
         flags = self._observation_flags(honcho_session_id)
         return flags["user_observe_me"], flags["user_observe_others"]
 
-    def _author_peer_for_session(self, honcho_session: Any, honcho_session_id: str, author_peer_id: str) -> Any:
+    def _author_peer_for_session(
+        self, honcho_session: Any, honcho_session_id: str, author_peer_id: str, author_is_bot: bool = False
+    ) -> Any:
         """The author's peer, joined to the session the first time it writes.
 
         Joins are remembered per session, so this costs one API call per author."""
@@ -379,12 +405,18 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                 return peer
         try:
             from honcho.session import SessionPeerConfig
-            observe_me, observe_others = self._join_observation_flags(honcho_session_id)
+            if author_is_bot:
+                observe_me, observe_others = (False, False)
+            else:
+                observe_me, observe_others = self._join_observation_flags(honcho_session_id)
             config = SessionPeerConfig(observe_me=observe_me, observe_others=observe_others)
             honcho_session.add_peers([(peer, config)])
         except Exception as e:
             # The write still lands under the right peer. Only the membership (observe config) is missing.
-            logger.debug("Honcho author peer join failed for %s: %s", author_peer_id, e)
+            logger.warning(
+                "Honcho author peer join failed for session '%s', peer '%s': %s",
+                honcho_session_id, author_peer_id, e
+            )
             return peer
         with self._cache_lock:
             self._joined_author_peers.setdefault(honcho_session_id, set()).add(author_peer_id)
@@ -444,7 +476,8 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                     honcho_messages.append(assistant_peer.message(m["content"]))
                     continue
                 author_peer_id = m.get("author_peer_id")
-                peer = (self._author_peer_for_session(honcho_session, session.honcho_session_id, author_peer_id)
+                author_is_bot = bool(m.get("author_is_bot", False))
+                peer = (self._author_peer_for_session(honcho_session, session.honcho_session_id, author_peer_id, author_is_bot=author_is_bot)
                         if author_peer_id else user_peer)
                 honcho_messages.append(peer.message(m["content"]))
             honcho_session.add_messages(honcho_messages)

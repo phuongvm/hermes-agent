@@ -809,15 +809,20 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             # The bot is the a2a session's own user peer, so its messages need no per-message author.
             session_kwargs["user_peer_id"] = bot_peer_id
             author_peer_id = None
+            author_is_bot = False
         else:
             session_key = self._session_key
+            raw_author_id = str(author.get("id") or "").strip() if author else ""
+            author_is_bot = bool(author and author.get("is_bot")) or raw_author_id.startswith("bot:")
             # Resolved before the thread starts so a following turn cannot retag a queued write.
-            author_peer_id = self._manager.resolve_author_peer_id(session_key, author.get("id"), author.get("name"))
+            author_peer_id = self._manager.resolve_author_peer_id(
+                session_key, author.get("id") if author else None, author.get("name") if author else None
+            )
 
         def _sync():
             session = self._manager.get_or_create(session_key, **session_kwargs)
             for chunk in self._chunk_message(clean_user_content, msg_limit) if clean_user_content else ():
-                session.add_message("user", chunk, author_peer_id=author_peer_id)
+                session.add_message("user", chunk, author_peer_id=author_peer_id, author_is_bot=author_is_bot)
             for chunk in self._chunk_message(clean_assistant_content, msg_limit) if clean_assistant_content else ():
                 session.add_message("assistant", chunk)
             # save() (not _flush_session) so writeFrequency batching is honored.
