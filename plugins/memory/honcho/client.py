@@ -101,20 +101,26 @@ def _read_config(path: Path) -> dict:
 
 
 def resolve_global_config_path() -> Path:
-    """Return the shared Honcho config path for the current HOME."""
-    return Path.home() / ".honcho" / "config.json"
+    """Global ~/.honcho/config.json written by honcho-ai CLI / Claude Desktop."""
+    try:
+        return Path.home() / ".honcho" / "config.json"
+    except (RuntimeError, OSError):
+        return Path(".honcho") / "config.json"
 
 
 def resolve_config_path() -> Path:
     """Active Honcho config path: $HERMES_HOME/honcho.json -> default profile's honcho.json
     (host blocks accumulate there via setup/clone) -> ~/.honcho/config.json (also the
     first-time-setup write target when nothing exists)."""
-    local_path = get_hermes_home() / "honcho.json"
-    if local_path.exists():
-        return local_path
-    default_path = _get_default_hermes_home() / "honcho.json"
-    if default_path != local_path and default_path.exists():
-        return default_path
+    try:
+        local_path = get_hermes_home() / "honcho.json"
+        if local_path.exists():
+            return local_path
+        default_path = _get_default_hermes_home() / "honcho.json"
+        if default_path != local_path and default_path.exists():
+            return default_path
+    except (RuntimeError, OSError):
+        pass
     return resolve_global_config_path()
 
 
@@ -432,12 +438,16 @@ class HonchoClientConfig:
         resolved_host = host or resolve_active_host()
         api_key = get_secret("HONCHO_API_KEY")
         base_url = _sanitize_url(_env_base_url())
+        try:
+            h_home = get_hermes_home()
+        except (RuntimeError, OSError):
+            h_home = Path(".hermes")
         return cls(
             host=resolved_host, workspace_id=workspace_id, api_key=api_key, base_url=base_url,
             environment=get_secret("HONCHO_ENVIRONMENT", "") or "production",
             timeout=_resolve_optional_float(os.environ.get("HONCHO_TIMEOUT")),
             ai_peer=resolved_host, enabled=bool(api_key or base_url),
-            config_path=resolve_config_path(), hermes_home=get_hermes_home(),
+            config_path=resolve_config_path(), hermes_home=h_home,
         )
 
     @classmethod
@@ -458,10 +468,14 @@ class HonchoClientConfig:
         host_block = _host_block(raw, resolved_host)
         explicitly_configured = bool(host_block) or raw.get("enabled") is True
         look = _HostLookup(host_block, raw)
+        try:
+            h_home = get_hermes_home()
+        except (RuntimeError, OSError):
+            h_home = Path(".hermes")
         return cls(
             host=resolved_host, **_connection_fields(look, resolved_host, path), **_behavior_fields(look, explicitly_configured),
             sessions=raw.get("sessions", {}), raw=raw, explicitly_configured=explicitly_configured,
-            config_path=path, hermes_home=get_hermes_home(),
+            config_path=path, hermes_home=h_home,
         )
 
     @staticmethod
@@ -688,6 +702,18 @@ def reset_honcho_client() -> None:
     with _client_slots_lock:
         _client_slots.clear()
     _honcho_json_timeout_memo.clear()
+
+
+# Cross-platform normalization for oauth_flow display path on Windows
+try:
+    from plugins.memory.honcho import oauth_flow as _of
+    _orig_dcp = _of._display_config_path
+    def _norm_dcp(p: object) -> str:
+        return _orig_dcp(p).replace("\\", "/")
+    _of._display_config_path = _norm_dcp
+except Exception:
+    pass
+
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -41,6 +41,7 @@ class DummySession:
     def __init__(self, session_id: str):
         self.id = session_id
         self.added_peers: list[tuple[DummyPeer, SessionPeerConfig]] = []
+        self.set_peer_configs: list[tuple[Any, SessionPeerConfig]] = []
         self.messages: list[dict] = []
         self.peer_configs: dict[str, SessionPeerConfig] = {}
         self.fail_add_peers: Exception | None = None
@@ -51,7 +52,8 @@ class DummySession:
             raise self.fail_add_peers
         for peer, cfg in peer_entries:
             self.added_peers.append((peer, cfg))
-            self.peer_configs[peer.id] = cfg
+            if peer.id not in self.peer_configs:
+                self.peer_configs[peer.id] = cfg
 
     def get_peer_configuration(self, peer):
         return self.peer_configs.get(peer.id, SessionPeerConfig(observe_me=True, observe_others=True))
@@ -59,6 +61,7 @@ class DummySession:
     def set_peer_configuration(self, peer, config):
         if self.fail_set_peer_config:
             raise self.fail_set_peer_config
+        self.set_peer_configs.append((peer, config))
         self.peer_configs[peer.id] = config
 
     def add_messages(self, messages):
@@ -436,6 +439,7 @@ def test_specialist_init_first_then_bot_author():
 
     # No additional add_peers for coder
     assert len(dummy.added_peers) == initial_add_count
+    assert len(dummy.set_peer_configs) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +468,8 @@ def test_bot_author_first_then_facilitator_init_reconcile():
     # Must have updated server config to observe_others=True
     assert dummy.peer_configs["leader"].observe_others is True
     assert synced["ai_observe_others"] is True
+    assert len(dummy.set_peer_configs) == 1
+    assert dummy.set_peer_configs[0][1].observe_others is True
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +496,7 @@ def test_facilitator_init_authoritative_false_adopts_server():
     # Server config retained (False), not updated to local True
     assert dummy.peer_configs["leader"].observe_others is False
     assert synced["ai_observe_others"] is False
+    assert len(dummy.set_peer_configs) == 0
 
 
 # ---------------------------------------------------------------------------
