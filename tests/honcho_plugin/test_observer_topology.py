@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import MagicMock, patch
 import pytest
@@ -76,10 +77,19 @@ def _make_manager(config: HonchoClientConfig | None = None) -> tuple[HonchoSessi
     mock_sdk.session.side_effect = get_session
     mock_sdk.peer.side_effect = lambda pid: DummyPeer(pid)
 
+    cfg = config or HonchoClientConfig(
+        host="test_host",
+        ai_peer="hermes_agent",
+        peer_name="user",
+        api_key="test-key",
+        write_frequency="turn",
+    )
     mgr = HonchoSessionManager(
         honcho=mock_sdk,
-        config=config or HonchoClientConfig(host="test_host", ai_peer="hermes_agent"),
+        config=cfg,
     )
+    mgr._sdk_session = lambda sid: sessions.setdefault(sid, DummySession(sid))
+    mgr._get_or_create_peer = lambda pid: DummyPeer(pid)
     return mgr, mock_sdk, sessions
 
 
@@ -87,17 +97,22 @@ def _make_manager(config: HonchoClientConfig | None = None) -> tuple[HonchoSessi
 # Parser tests (Reviewer W-06 part 1)
 # ---------------------------------------------------------------------------
 
-def test_parser_authoritative_resolution():
+def test_parser_authoritative_resolution(tmp_path):
     """Verify host vs root resolution of observation.ai.authoritative, defaulting to False."""
+    def _load(raw: dict, host: str = "hermes"):
+        cfg_file = tmp_path / f"honcho_{len(list(tmp_path.iterdir()))}.json"
+        cfg_file.write_text(json.dumps(raw))
+        return HonchoClientConfig.from_global_config(host=host, config_path=cfg_file)
+
     # 1. Default when absent
-    cfg = HonchoClientConfig.from_dict({}, host="hermes")
+    cfg = _load({}, host="hermes")
     assert cfg.ai_authoritative is False
 
     # 2. Root level authoritative: true
     raw_root = {
         "observation": {"ai": {"authoritative": True}}
     }
-    cfg_root = HonchoClientConfig.from_dict(raw_root, host="hermes")
+    cfg_root = _load(raw_root, host="hermes")
     assert cfg_root.ai_authoritative is True
 
     # 3. Host level authoritative: true
@@ -108,7 +123,7 @@ def test_parser_authoritative_resolution():
             }
         }
     }
-    cfg_host = HonchoClientConfig.from_dict(raw_host, host="coder")
+    cfg_host = _load(raw_host, host="coder")
     assert cfg_host.ai_authoritative is True
     assert cfg_host.ai_observe_others is False
 
@@ -121,7 +136,7 @@ def test_parser_authoritative_resolution():
             }
         }
     }
-    cfg_override = HonchoClientConfig.from_dict(raw_override, host="coder")
+    cfg_override = _load(raw_override, host="coder")
     assert cfg_override.ai_authoritative is False
 
     # 5. Host inherits root (host has observation without authoritative, root has True)
@@ -133,9 +148,23 @@ def test_parser_authoritative_resolution():
             }
         }
     }
-    cfg_inherit = HonchoClientConfig.from_dict(raw_inherit, host="coder")
+    cfg_inherit = _load(raw_inherit, host="coder")
     assert cfg_inherit.ai_authoritative is True
     assert cfg_inherit.ai_observe_others is False
+
+    # 6. Non-bool values rejected/normalised to False per design D2 rule 2
+    raw_non_bool = {
+        "observation": {"ai": {"authoritative": "true"}},
+        "hosts": {
+            "coder": {
+                "observation": {"ai": {"authoritative": 1}}
+            }
+        }
+    }
+    cfg_non_bool_host = _load(raw_non_bool, host="coder")
+    assert cfg_non_bool_host.ai_authoritative is False
+    cfg_non_bool_root = _load(raw_non_bool, host="hermes")
+    assert cfg_non_bool_root.ai_authoritative is False
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +176,12 @@ def test_bot_author_shared_session_non_observing_join():
     cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=False)
     mgr, _, sessions = _make_manager(cfg)
 
-    session = HonchoSession(key="main_session", honcho_session_id="s1")
+    session = HonchoSession(
+        key="main_session",
+        user_peer_id="user",
+        assistant_peer_id="hermes_agent",
+        honcho_session_id="s1",
+    )
     mgr._sessions_cache["s1"] = DummySession("s1")
 
     # Author is bot
@@ -170,7 +204,12 @@ def test_human_aliased_author_observing_join():
     cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent")
     mgr, _, sessions = _make_manager(cfg)
 
-    session = HonchoSession(key="main_session", honcho_session_id="s2")
+    session = HonchoSession(
+        key="main_session",
+        user_peer_id="user",
+        assistant_peer_id="hermes_agent",
+        honcho_session_id="s2",
+    )
     mgr._sessions_cache["s2"] = DummySession("s2")
 
     session.add_message("user", "Human message", author_peer_id="coder", author_is_bot=False)
@@ -190,11 +229,14 @@ def test_human_aliased_author_observing_join():
 
 def test_bot_prefix_connection_author_join():
     """Prefix bot: triggers author_is_bot in sync_turn and yields (False, False) join."""
-    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=False)
+    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", peer_name="user", api_key="test-key", a2a_sessions=False)
     mgr, _, _ = _make_manager(cfg)
 
-    provider = HonchoMemoryProvider(config=cfg, manager=mgr)
+    provider = HonchoMemoryProvider()
+    provider._config = cfg
+    provider._manager = mgr
     provider._session_key = "test_shared"
+    provider._session_initialized = True
 
     author = {"id": "bot:matrix/@specialist:homeserver", "name": "specialist"}
     provider.sync_turn(user_content="Hello from specialist", assistant_content=None, turn_author=author)
@@ -216,11 +258,14 @@ def test_bot_prefix_connection_author_join():
 
 def test_bot_a2a_session_no_shared_add_peers():
     """When a2aSessions is True, bot turn routes to dedicated A2A session without shared add_peers."""
-    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", a2a_sessions=True)
+    cfg = HonchoClientConfig(host="hermes", ai_peer="hermes_agent", peer_name="user", api_key="test-key", a2a_sessions=True)
     mgr, _, _ = _make_manager(cfg)
 
-    provider = HonchoMemoryProvider(config=cfg, manager=mgr)
+    provider = HonchoMemoryProvider()
+    provider._config = cfg
+    provider._manager = mgr
     provider._session_key = "human_chat"
+    provider._session_initialized = True
 
     author = {"id": "bot:coder", "name": "coder", "is_bot": True}
     provider.sync_turn(user_content="Subtask done", assistant_content=None, turn_author=author)
@@ -248,7 +293,12 @@ def test_bot_author_first_then_specialist_init():
     dummy_s3 = DummySession("s3")
     mgr._sessions_cache["s3"] = dummy_s3
 
-    session = HonchoSession(key="s3_key", honcho_session_id="s3")
+    session = HonchoSession(
+        key="s3_key",
+        user_peer_id="user",
+        assistant_peer_id="hermes_agent",
+        honcho_session_id="s3",
+    )
     session.add_message("user", "Work log", author_peer_id="coder", author_is_bot=True)
     mgr._flush_session(session)
 
@@ -289,7 +339,12 @@ def test_specialist_init_first_then_bot_author():
     initial_add_count = len(dummy.added_peers)
 
     # Bot writes as coder
-    session = HonchoSession(key="s4_key", honcho_session_id="s4")
+    session = HonchoSession(
+        key="s4_key",
+        user_peer_id="user",
+        assistant_peer_id="coder",
+        honcho_session_id="s4",
+    )
     # Simulate coder already in _joined_author_peers or joined
     mgr._joined_author_peers.setdefault("s4", set()).add("coder")
     session.add_message("user", "Another task", author_peer_id="coder", author_is_bot=True)
@@ -366,7 +421,12 @@ def test_bot_author_join_cap_rejection_logs_warning_persists_write(caplog):
     dummy.fail_add_peers = RuntimeError("observer quota exceeded (cap 10)")
     mgr._sessions_cache["s7"] = dummy
 
-    session = HonchoSession(key="s7_key", honcho_session_id="s7")
+    session = HonchoSession(
+        key="s7_key",
+        user_peer_id="user",
+        assistant_peer_id="hermes_agent",
+        honcho_session_id="s7",
+    )
     session.add_message("user", "Urgent note", author_peer_id="coder", author_is_bot=True)
 
     with caplog.at_level(logging.WARNING):

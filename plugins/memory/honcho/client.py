@@ -304,7 +304,8 @@ def _behavior_fields(look: _HostLookup, explicitly_configured: bool) -> dict[str
     root_obs = look.raw.get("observation") if isinstance(look.raw.get("observation"), dict) else {}
     host_ai = host_obs.get("ai") if isinstance(host_obs.get("ai"), dict) else {}
     root_ai = root_obs.get("ai") if isinstance(root_obs.get("ai"), dict) else {}
-    ai_authoritative = bool(_first_set(host_ai.get("authoritative"), root_ai.get("authoritative"), default=False))
+    raw_auth = _first_set(host_ai.get("authoritative"), root_ai.get("authoritative"), default=False)
+    ai_authoritative = raw_auth if isinstance(raw_auth, bool) else False
     return {
         "peer_name": look.pick("peerName"),
         # pinUserPeer is the clearer name; the original pinPeerName stays accepted.
@@ -312,16 +313,16 @@ def _behavior_fields(look: _HostLookup, explicitly_configured: bool) -> dict[str
         "user_peer_aliases": look.string_map("userPeerAliases"),
         "runtime_peer_prefix": look.string("runtimePeerPrefix"),
         "save_messages": look.pick_set("saveMessages", True),
-        "recall_after_save": look.pick_set("recallAfterSave", False),
         "write_frequency": write_frequency,
-        "dialectic_depth": depth,
-        "dialectic_reasoning_level": _first_choice(
-            [look.pick("dialecticReasoningLevel"), look.pick("reasoningLevel")],
-            _REASONING_LEVELS,
-            _DEFAULT_DIALECTIC_REASONING_LEVEL,
-        ),
+        "context_tokens": look.parsed("contextTokens", int, None),
+        "dialectic_reasoning_level": look.pick("dialecticReasoningLevel") or "low",
         "dialectic_dynamic": look.flag("dialecticDynamic", default=True),
         "dialectic_max_chars": look.parsed("dialecticMaxChars", int, 600),
+        "dialectic_depth": depth,
+        "dialectic_depth_levels": _parse_dialectic_depth_levels(look.vals("dialecticDepthLevels"), depth),
+        "reasoning_heuristic": look.flag("reasoningHeuristic", default=True),
+        "reasoning_level_cap": look.pick("reasoningLevelCap") or "high",
+        "message_max_chars": look.parsed("messageMaxChars", int, 25000),
         "dialectic_max_input_chars": look.parsed("dialecticMaxInputChars", int, 10000),
         "recall_mode": _normalize_choice(look.pick("recallMode") or "hybrid", _RECALL_MODES),
         "recall_sync": look.flag("recallSync", default=False),
