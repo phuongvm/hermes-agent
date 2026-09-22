@@ -109,7 +109,9 @@ def _make_manager(config: HonchoClientConfig | None = None) -> tuple[HonchoSessi
         honcho=mock_sdk,
         config=cfg,
     )
-    mgr._sdk_session = lambda sid: sessions.setdefault(sid, DummySession(sid))
+    mgr._sdk_session = lambda sid: mgr._cached_sdk_object(
+        mgr._sessions_cache, sid, lambda: sessions.setdefault(sid, DummySession(sid))
+    )
     mgr._get_or_create_peer = lambda pid: DummyPeer(pid)
     _created_managers.append(mgr)
     return mgr, mock_sdk, sessions
@@ -415,60 +417,90 @@ def test_bot_author_first_then_specialist_init():
 
 def test_specialist_init_first_then_bot_author():
     """Row 1 of D2 matrix: Specialist inits session first; later bot write by coder sees coder already joined."""
-    cfg = HonchoClientConfig(host="coder", ai_peer="coder", ai_authoritative=True, ai_observe_others=False)
-    mgr, _, _ = _make_manager(cfg)
-    dummy = DummySession("s4")
-    mgr._sessions_cache["s4"] = dummy
-    mgr._sdk_session = lambda sid: dummy
+    cfg = HonchoClientConfig(
+        host="coder",
+        ai_peer="coder",
+        ai_authoritative=True,
+        ai_observe_me=False,
+        ai_observe_others=False,
+        a2a_sessions=False,
+        write_frequency="turn",
+    )
+    mgr, _, sessions = _make_manager(cfg)
+    sid = "s4"
+    session_key = "s4"
 
     # Specialist inits s4
-    mgr._configure_session_peers("s4", DummyPeer("user"), DummyPeer("coder"))
+    mgr._configure_session_peers(sid, DummyPeer("user"), DummyPeer("coder"))
+    dummy = sessions[sid]
     initial_add_count = len(dummy.added_peers)
+    assert dummy.peer_configs["coder"].observe_others is False
 
-    # Bot writes as coder
-    session = HonchoSession(
-        key="s4_key",
-        user_peer_id="user",
-        assistant_peer_id="coder",
-        honcho_session_id="s4",
-    )
-    session.add_message("user", "Another task", author_peer_id="coder", author_is_bot=True)
-    mgr._flush_session(session)
+    # Bot writes as coder through real pipeline: on_turn_start -> sync_turn -> _flush_session_locked
+    provider = HonchoMemoryProvider()
+    provider._config = cfg
+    provider._manager = mgr
+    provider._session_key = session_key
+    provider._session_initialized = True
 
-    # No additional add_peers for coder
+    author = {"id": "bot:coder", "name": "coder"}
+    provider.on_turn_start(1, "Another task", author_id=author["id"], author_name=author["name"])
+    provider.sync_turn(user_content="Another task", assistant_content=None, turn_author=author)
+    if provider._sync_thread and provider._sync_thread.is_alive():
+        provider._sync_thread.join(timeout=2.0)
+
+    # No additional add_peers for coder, no set_peer_configuration call, server observe_others remains False
     assert len(dummy.added_peers) == initial_add_count
     assert len(dummy.set_peer_configs) == 0
     assert dummy.peer_configs["coder"].observe_others is False
+    assert len(dummy.messages) == 1
+    assert dummy.messages[0]["content"] == "Another task"
+    assert dummy.messages[0]["peer_id"] == "coder"
 
 
 def test_facilitator_init_first_then_bot_author():
     """Row 2 of D2 matrix: Facilitator inits session first with observe_others=True;
     later bot write by leader sees leader already joined -> no additional add_peers call,
     server observe_others remains True."""
-    cfg = HonchoClientConfig(host="leader", ai_peer="leader", ai_authoritative=True, ai_observe_others=True)
-    mgr, _, _ = _make_manager(cfg)
-    dummy = DummySession("s_fac")
-    mgr._sessions_cache["s_fac"] = dummy
-    mgr._sdk_session = lambda sid: dummy
+    cfg = HonchoClientConfig(
+        host="leader",
+        ai_peer="leader",
+        ai_authoritative=True,
+        ai_observe_me=False,
+        ai_observe_others=True,
+        a2a_sessions=False,
+        write_frequency="turn",
+    )
+    mgr, _, sessions = _make_manager(cfg)
+    sid = "s_fac"
+    session_key = "s_fac"
 
     # Facilitator inits s_fac
-    mgr._configure_session_peers("s_fac", DummyPeer("user"), DummyPeer("leader"))
+    mgr._configure_session_peers(sid, DummyPeer("user"), DummyPeer("leader"))
+    dummy = sessions[sid]
     initial_add_count = len(dummy.added_peers)
+    assert dummy.peer_configs["leader"].observe_others is True
 
-    # Bot writes as leader
-    session = HonchoSession(
-        key="s_fac_key",
-        user_peer_id="user",
-        assistant_peer_id="leader",
-        honcho_session_id="s_fac",
-    )
-    session.add_message("user", "Directive", author_peer_id="leader", author_is_bot=True)
-    mgr._flush_session(session)
+    # Bot writes as leader through real pipeline: on_turn_start -> sync_turn -> _flush_session_locked
+    provider = HonchoMemoryProvider()
+    provider._config = cfg
+    provider._manager = mgr
+    provider._session_key = session_key
+    provider._session_initialized = True
+
+    author = {"id": "bot:leader", "name": "leader"}
+    provider.on_turn_start(1, "Directive", author_id=author["id"], author_name=author["name"])
+    provider.sync_turn(user_content="Directive", assistant_content=None, turn_author=author)
+    if provider._sync_thread and provider._sync_thread.is_alive():
+        provider._sync_thread.join(timeout=2.0)
 
     # No additional add_peers for leader, no set_peer_configuration call, server observe_others remains True
     assert len(dummy.added_peers) == initial_add_count
     assert len(dummy.set_peer_configs) == 0
     assert dummy.peer_configs["leader"].observe_others is True
+    assert len(dummy.messages) == 1
+    assert dummy.messages[0]["content"] == "Directive"
+    assert dummy.messages[0]["peer_id"] == "leader"
 
 
 # ---------------------------------------------------------------------------
