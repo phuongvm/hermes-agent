@@ -197,6 +197,16 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                 for kind, peer in peers
             ]
             self._authed_call("session peer setup", lambda: self._sdk_session(session_id).add_peers(peer_entries))
+            joined_cache = getattr(self, "_joined_author_peers", None)
+            if joined_cache is not None:
+                with self._cache_lock:
+                    joined = joined_cache.setdefault(session_id, set())
+                    for _, peer in peers:
+                        pid = getattr(peer, "id", str(peer))
+                        if pid:
+                            joined.add(pid)
+                    while len(joined_cache) > _SESSION_CACHE_MAX_SIZE:
+                        joined_cache.pop(next(iter(joined_cache)))
 
             def _adopt_server_config() -> None:
                 server_cfgs = self._authed_call(

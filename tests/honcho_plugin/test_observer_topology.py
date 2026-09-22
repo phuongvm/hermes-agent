@@ -414,7 +414,7 @@ def test_bot_author_first_then_specialist_init():
 # ---------------------------------------------------------------------------
 
 def test_specialist_init_first_then_bot_author():
-    """Specialist inits session first; later bot write by coder sees coder already joined."""
+    """Row 1 of D2 matrix: Specialist inits session first; later bot write by coder sees coder already joined."""
     cfg = HonchoClientConfig(host="coder", ai_peer="coder", ai_authoritative=True, ai_observe_others=False)
     mgr, _, _ = _make_manager(cfg)
     dummy = DummySession("s4")
@@ -432,14 +432,43 @@ def test_specialist_init_first_then_bot_author():
         assistant_peer_id="coder",
         honcho_session_id="s4",
     )
-    # Simulate coder already in _joined_author_peers or joined
-    mgr._joined_author_peers.setdefault("s4", set()).add("coder")
     session.add_message("user", "Another task", author_peer_id="coder", author_is_bot=True)
     mgr._flush_session(session)
 
     # No additional add_peers for coder
     assert len(dummy.added_peers) == initial_add_count
     assert len(dummy.set_peer_configs) == 0
+    assert dummy.peer_configs["coder"].observe_others is False
+
+
+def test_facilitator_init_first_then_bot_author():
+    """Row 2 of D2 matrix: Facilitator inits session first with observe_others=True;
+    later bot write by leader sees leader already joined -> no additional add_peers call,
+    server observe_others remains True."""
+    cfg = HonchoClientConfig(host="leader", ai_peer="leader", ai_authoritative=True, ai_observe_others=True)
+    mgr, _, _ = _make_manager(cfg)
+    dummy = DummySession("s_fac")
+    mgr._sessions_cache["s_fac"] = dummy
+    mgr._sdk_session = lambda sid: dummy
+
+    # Facilitator inits s_fac
+    mgr._configure_session_peers("s_fac", DummyPeer("user"), DummyPeer("leader"))
+    initial_add_count = len(dummy.added_peers)
+
+    # Bot writes as leader
+    session = HonchoSession(
+        key="s_fac_key",
+        user_peer_id="user",
+        assistant_peer_id="leader",
+        honcho_session_id="s_fac",
+    )
+    session.add_message("user", "Directive", author_peer_id="leader", author_is_bot=True)
+    mgr._flush_session(session)
+
+    # No additional add_peers for leader, no set_peer_configuration call, server observe_others remains True
+    assert len(dummy.added_peers) == initial_add_count
+    assert len(dummy.set_peer_configs) == 0
+    assert dummy.peer_configs["leader"].observe_others is True
 
 
 # ---------------------------------------------------------------------------
