@@ -6,8 +6,13 @@ must still re-sync a venv whose installed distribution lags the checkout.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import types
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 from hermes_cli import main as cli_main
@@ -86,6 +91,23 @@ def test_current_checkout_with_stale_dependency_set_runs_the_sync(monkeypatch, c
     assert calls == ["sync"]
     assert run((False, "")) is True
     assert calls == ["sync", "✓ Already up to date!"]
+
+
+def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: str = ""):
+    proc = MagicMock()
+    proc.info = {
+        "pid": pid,
+        "exe": exe,
+        "name": name,
+    }
+    proc.cmdline.return_value = cmdline or []
+    proc.cwd.return_value = cwd
+    return proc
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
+    import os as _os
 
     venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
     parent = MagicMock()
