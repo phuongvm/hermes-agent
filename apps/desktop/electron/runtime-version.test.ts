@@ -359,4 +359,247 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
       assert.equal(vInvalidSha, '0.17.0')
     })
   })
+
+  describe('Packaged runtime version resolution priority ladder (isPackaged)', () => {
+    test('3.1: Packaged + valid stamp + local source tree declaring an older version -> stamp wins and source is NOT read', () => {
+      let readCount = 0
+      let existsCount = 0
+      const mockFs = {
+        existsSync: () => {
+          existsCount++
+          return true
+        },
+        readFileSync: () => {
+          readCount++
+          return '__version__ = "0.20.0"\n'
+        }
+      }
+
+      const stamp = {
+        schemaVersion: 1,
+        version: '0.21.3',
+        commit: '28e38b39efea6c68bf839c7c4531c92401600c77',
+        shortCommit: '28e38b39',
+        buildNumber: 27745,
+        branch: 'main',
+        builtAt: null,
+        dirty: false,
+        source: 'local' as const,
+        path: '/path'
+      }
+
+      const version = resolveHermesVersionLadder({
+        updateRoot: '/local/appdata/hermes/hermes-agent',
+        installStamp: stamp,
+        appVersion: '0.17.6',
+        isPackaged: true,
+        fsModule: mockFs as any
+      })
+
+      assert.equal(version, '0.21.3 (28e38b39)')
+      assert.equal(readCount, 0, 'Source tree file must NOT be read when packaged and stamp is valid')
+      assert.equal(existsCount, 0, 'Source tree path existence must NOT be checked when packaged and stamp is valid')
+    })
+
+    test('3.2: Packaged + valid dirty stamp -> resolves with [DIRTY] suffix', () => {
+      const dirtyStamp = {
+        schemaVersion: 1,
+        version: '0.21.3',
+        commit: '28e38b39efea6c68bf839c7c4531c92401600c77',
+        shortCommit: '28e38b39',
+        buildNumber: 27745,
+        branch: 'main',
+        builtAt: null,
+        dirty: true,
+        source: 'local' as const,
+        path: '/path'
+      }
+
+      const version = resolveHermesVersionLadder({
+        updateRoot: '/local/source',
+        installStamp: dirtyStamp,
+        appVersion: '0.17.6',
+        isPackaged: true
+      })
+
+      assert.equal(version, '0.21.3 (28e38b39) [DIRTY]')
+    })
+
+    test('3.3: Packaged + no stamp + readable source tree -> resolves to source __version__', () => {
+      const mockFs = {
+        existsSync: () => true,
+        readFileSync: () => '__version__ = "0.20.0"\n'
+      }
+
+      const version = resolveHermesVersionLadder({
+        updateRoot: '/local/appdata/hermes/hermes-agent',
+        installStamp: null,
+        appVersion: '0.17.6',
+        isPackaged: true,
+        fsModule: mockFs as any
+      })
+
+      assert.equal(version, '0.20.0')
+    })
+
+    test('3.4: Packaged + stamp with null version -> falls through to source tree, then appVersion', () => {
+      const invalidVersionStamp = {
+        schemaVersion: 1,
+        version: null,
+        commit: '28e38b39efea6c68bf839c7c4531c92401600c77',
+        shortCommit: '28e38b39',
+        buildNumber: 27745,
+        branch: 'main',
+        builtAt: null,
+        dirty: false,
+        source: 'local' as const,
+        path: '/path'
+      }
+
+      // Falls through to source tree if available
+      const mockFs = {
+        existsSync: () => true,
+        readFileSync: () => '__version__ = "0.20.0"\n'
+      }
+
+      const versionWithSource = resolveHermesVersionLadder({
+        updateRoot: '/local/appdata/hermes/hermes-agent',
+        installStamp: invalidVersionStamp,
+        appVersion: '0.17.6',
+        isPackaged: true,
+        fsModule: mockFs as any
+      })
+
+      assert.equal(versionWithSource, '0.20.0')
+
+      // Falls through to appVersion if source tree unavailable
+      const versionWithAppVersion = resolveHermesVersionLadder({
+        updateRoot: null,
+        installStamp: invalidVersionStamp,
+        appVersion: '0.17.6',
+        isPackaged: true
+      })
+
+      assert.equal(versionWithAppVersion, '0.17.6')
+    })
+
+    test('3.5: Packaged + stamp with null shortCommit -> falls through to source tree, then appVersion', () => {
+      const invalidCommitStamp = {
+        schemaVersion: 1,
+        version: '0.21.3',
+        commit: '28e38b39efea6c68bf839c7c4531c92401600c77',
+        shortCommit: null,
+        buildNumber: 27745,
+        branch: 'main',
+        builtAt: null,
+        dirty: false,
+        source: 'local' as const,
+        path: '/path'
+      }
+
+      // Falls through to source tree if available
+      const mockFs = {
+        existsSync: () => true,
+        readFileSync: () => '__version__ = "0.20.0"\n'
+      }
+
+      const versionWithSource = resolveHermesVersionLadder({
+        updateRoot: '/local/appdata/hermes/hermes-agent',
+        installStamp: invalidCommitStamp,
+        appVersion: '0.17.6',
+        isPackaged: true,
+        fsModule: mockFs as any
+      })
+
+      assert.equal(versionWithSource, '0.20.0')
+
+      // Falls through to appVersion if source tree unavailable
+      const versionWithAppVersion = resolveHermesVersionLadder({
+        updateRoot: null,
+        installStamp: invalidCommitStamp,
+        appVersion: '0.17.6',
+        isPackaged: true
+      })
+
+      assert.equal(versionWithAppVersion, '0.17.6')
+    })
+
+    test('3.6: Packaged + no stamp + unreadable source + no appVersion -> "0.0.0"', () => {
+      const mockFs = {
+        existsSync: () => false,
+        readFileSync: () => {
+          throw new Error('File not found')
+        }
+      }
+
+      const version = resolveHermesVersionLadder({
+        updateRoot: '/unreadable/source',
+        installStamp: null,
+        appVersion: null,
+        isPackaged: true,
+        fsModule: mockFs as any
+      })
+
+      assert.equal(version, '0.0.0')
+    })
+
+    test('3.7: isPackaged: false with source tree and stamp -> source tree wins (dev order unchanged)', () => {
+      const mockFs = {
+        existsSync: () => true,
+        readFileSync: () => '__version__ = "0.21.0.dev1"\n'
+      }
+
+      const stamp = {
+        schemaVersion: 1,
+        version: '0.21.3',
+        commit: '28e38b39efea6c68bf839c7c4531c92401600c77',
+        shortCommit: '28e38b39',
+        buildNumber: 27745,
+        branch: 'main',
+        builtAt: null,
+        dirty: false,
+        source: 'local' as const,
+        path: '/path'
+      }
+
+      const version = resolveHermesVersionLadder({
+        updateRoot: '/repo/root',
+        installStamp: stamp,
+        appVersion: '0.17.6',
+        isPackaged: false,
+        fsModule: mockFs as any
+      })
+
+      assert.equal(version, '0.21.0.dev1')
+    })
+
+    test('3.8: isPackaged omitted with source tree and stamp -> source tree wins (default = dev)', () => {
+      const mockFs = {
+        existsSync: () => true,
+        readFileSync: () => '__version__ = "0.21.0.dev1"\n'
+      }
+
+      const stamp = {
+        schemaVersion: 1,
+        version: '0.21.3',
+        commit: '28e38b39efea6c68bf839c7c4531c92401600c77',
+        shortCommit: '28e38b39',
+        buildNumber: 27745,
+        branch: 'main',
+        builtAt: null,
+        dirty: false,
+        source: 'local' as const,
+        path: '/path'
+      }
+
+      const version = resolveHermesVersionLadder({
+        updateRoot: '/repo/root',
+        installStamp: stamp,
+        appVersion: '0.17.6',
+        fsModule: mockFs as any
+      })
+
+      assert.equal(version, '0.21.0.dev1')
+    })
+  })
 })

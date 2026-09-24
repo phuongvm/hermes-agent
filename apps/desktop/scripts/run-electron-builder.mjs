@@ -9,8 +9,99 @@ import path from "node:path"
 import { spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
 import { isMain } from "./utils.mjs"
+import { validateSemVer, resolveCanonicalVersion } from "./write-build-stamp.mjs"
 
 const require = createRequire(import.meta.url)
+
+export function assertVersionAlignment({
+  packageJsonVersion,
+  pyprojectVersion,
+  stampVersion,
+  allowDrift = false
+} = {}) {
+  let validPy
+  try {
+    validPy = validateSemVer(pyprojectVersion)
+  } catch (err) {
+    throw new Error(
+      `[run-electron-builder] cannot resolve valid canonical version: ${err.message}`
+    )
+  }
+
+  let validPkg = null
+  let pkgErr = null
+  try {
+    validPkg = validateSemVer(packageJsonVersion)
+  } catch (err) {
+    pkgErr = err
+  }
+
+  let validStamp = null
+  let stampErr = null
+  if (stampVersion == null) {
+    stampErr = new Error("missing install-stamp.json version")
+  } else {
+    try {
+      validStamp = validateSemVer(stampVersion)
+    } catch (err) {
+      stampErr = err
+    }
+  }
+
+  if (pkgErr || stampErr || validPkg !== validPy || validStamp !== validPy) {
+    const pkgDisplay =
+      validPkg !== null
+        ? validPkg
+        : packageJsonVersion == null
+          ? "<missing>"
+          : String(packageJsonVersion)
+    const stampDisplay =
+      validStamp !== null
+        ? validStamp
+        : stampVersion == null
+          ? "<missing>"
+          : String(stampVersion)
+
+    let remediation = 'align apps/desktop/package.json "version" with pyproject.toml'
+    if (stampVersion == null) {
+      remediation = "run `npm run build` first"
+    } else if (stampErr) {
+      remediation = "run `npm run build` to regenerate install-stamp.json"
+    } else if (pkgErr) {
+      remediation = 'specify a valid SemVer "version" in apps/desktop/package.json'
+    }
+
+    const message = `[run-electron-builder] version drift: package.json=${pkgDisplay} pyproject.toml=${validPy} install-stamp.json=${stampDisplay} — ${remediation}`
+    if (allowDrift) {
+      console.warn(message)
+      return { ok: false, version: validPy }
+    }
+    throw new Error(message)
+  }
+
+  return { ok: true, version: validPy }
+}
+
+export function loadCanonicalVersionForBuilder(repoRoot = process.env.HERMES_REPO_ROOT) {
+  try {
+    return resolveCanonicalVersion(repoRoot ? { repoRoot } : undefined)
+  } catch (err) {
+    throw new Error(`[run-electron-builder] ${err.message}`)
+  }
+}
+
+export function loadDesktopManifestVersion(
+  desktopRoot = process.env.HERMES_DESKTOP_ROOT || path.resolve(import.meta.dirname, "..")
+) {
+  const pkgPath = path.join(desktopRoot, "package.json")
+  try {
+    const raw = fs.readFileSync(pkgPath, "utf8")
+    const parsed = JSON.parse(raw)
+    return parsed.version
+  } catch (err) {
+    throw new Error(`[run-electron-builder] failed to read ${pkgPath}: ${err.message}`)
+  }
+}
 
 export function electronDistDir() {
   try {
@@ -71,7 +162,9 @@ export function buildElectronBuilderArgs({
   return args
 }
 
-export function loadStampForBuilder(desktopRoot = path.resolve(import.meta.dirname, "..")) {
+export function loadStampForBuilder(
+  desktopRoot = process.env.HERMES_DESKTOP_ROOT || path.resolve(import.meta.dirname, "..")
+) {
   const stampPath = path.join(desktopRoot, "build", "install-stamp.json")
   try {
     if (fs.existsSync(stampPath)) {
@@ -84,8 +177,72 @@ export function loadStampForBuilder(desktopRoot = path.resolve(import.meta.dirna
   return null
 }
 
-function main() {
-  const dist = electronDistDir()
+export function prepareBuilderArgs({
+  desktopRoot = process.env.HERMES_DESKTOP_ROOT || path.resolve(import.meta.dirname, ".."),
+  repoRoot = process.env.HERMES_REPO_ROOT ||
+    (process.env.HERMES_DESKTOP_ROOT ? path.resolve(process.env.HERMES_DESKTOP_ROOT, "..", "..") : undefined),
+  packageJsonVersion,
+  pyprojectVersion,
+  stamp,
+  allowDrift = process.env.HERMES_DESKTOP_ALLOW_VERSION_DRIFT === "1",
+  extraArgs = [],
+  dist = null
+} = {}) {
+  const resolvedStamp = stamp !== undefined ? stamp : loadStampForBuilder(desktopRoot)
+  const resolvedPkgVersion =
+    packageJsonVersion !== undefined ? packageJsonVersion : loadDesktopManifestVersion(desktopRoot)
+  const resolvedPyVersion =
+    pyprojectVersion !== undefined ? pyprojectVersion : loadCanonicalVersionForBuilder(repoRoot)
+  const stampVersion = resolvedStamp ? resolvedStamp.version : null
+
+  const alignment = assertVersionAlignment({
+    packageJsonVersion: resolvedPkgVersion,
+    pyprojectVersion: resolvedPyVersion,
+    stampVersion,
+    allowDrift
+  })
+
+  // Wire canonical version into effective stamp so extraMetadata.version, buildVersion, and artifactName package canonical version
+  const effectiveStamp = resolvedStamp
+    ? { ...resolvedStamp, version: alignment.version }
+    : { version: alignment.version }
+
+  const args = buildElectronBuilderArgs({
+    stamp: effectiveStamp,
+    dist,
+    extraArgs
+  })
+
+  return {
+    alignment,
+    args,
+    effectiveStamp,
+    dist
+  }
+}
+
+export function runBuilder({
+  desktopRoot = process.env.HERMES_DESKTOP_ROOT,
+  repoRoot = process.env.HERMES_REPO_ROOT,
+  allowDrift = process.env.HERMES_DESKTOP_ALLOW_VERSION_DRIFT === "1",
+  extraArgs = process.argv.slice(2),
+  spawnFn = spawnSync,
+  electronBuilderBin = process.env.HERMES_ELECTRON_BUILDER_BIN || electronBuilderCli()
+} = {}) {
+  let prepared
+  try {
+    prepared = prepareBuilderArgs({
+      desktopRoot,
+      repoRoot,
+      allowDrift,
+      extraArgs
+    })
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
+
+  const dist = prepared.dist
   if (!dist || !fs.existsSync(distBinary(dist))) {
     console.warn(
       "[run-electron-builder] no local electron dist; electron-builder will fetch " +
@@ -93,16 +250,9 @@ function main() {
     )
   }
 
-  const stamp = loadStampForBuilder()
-  const args = buildElectronBuilderArgs({
-    stamp,
-    dist,
-    extraArgs: process.argv.slice(2)
-  })
+  console.log(`[run-electron-builder] running electron-builder with args:`, prepared.args)
 
-  console.log(`[run-electron-builder] running electron-builder with args:`, args)
-
-  const result = spawnSync(process.execPath, [electronBuilderCli(), ...args], {
+  const result = spawnFn(process.execPath, [electronBuilderBin, ...prepared.args], {
     stdio: "inherit"
   })
   if (result.error) {
@@ -110,6 +260,10 @@ function main() {
     process.exit(1)
   }
   process.exit(result.status == null ? 1 : result.status)
+}
+
+function main() {
+  runBuilder()
 }
 
 if (isMain(import.meta.url)) {

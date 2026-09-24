@@ -159,50 +159,97 @@ export interface VersionResolutionContext {
   updateRoot?: string | null
   installStamp?: InstallStamp | null
   appVersion?: string | null
+  isPackaged?: boolean
   fsModule?: {
     readFileSync: (p: string, enc: 'utf8') => string
     existsSync?: (p: string) => boolean
   }
 }
 
-/**
- * 3-Rung Version Resolution Ladder:
- *   Rung 1 (Dev / Source): Read hermes_cli/__init__.py if available.
- *   Rung 2 (Packaged Client-Only): Read bundled install stamp. Requires valid version & shortCommit.
- *   Rung 3 (Fallback): app.getVersion().
- */
-export function resolveHermesVersionLadder(ctx: VersionResolutionContext = {}): string {
-  const fileSystem = ctx.fsModule || fs
-
-  // Rung 1: Source tree version
-  if (ctx.updateRoot) {
-    try {
-      const initPath = path.join(ctx.updateRoot, 'hermes_cli', '__init__.py')
-      const exists = fileSystem.existsSync ? fileSystem.existsSync(initPath) : true
-
-      if (exists) {
-        const raw = fileSystem.readFileSync(initPath, 'utf8')
-        const match = raw.match(/__version__\s*=\s*["']([^"']+)["']/)
-
-        if (match && match[1]) {
-          return match[1]
-        }
-      }
-    } catch {
-      // Fall through to next rung
-    }
+function readSourceTreeVersion(
+  ctx: VersionResolutionContext,
+  fileSystem: {
+    readFileSync: (p: string, enc: 'utf8') => string
+    existsSync?: (p: string) => boolean
+  }
+): string | null {
+  if (!ctx.updateRoot) {
+    return null
   }
 
-  // Rung 2: Packaged client-only runtime (requires both valid version and valid shortCommit)
+  try {
+    const initPath = path.join(ctx.updateRoot, 'hermes_cli', '__init__.py')
+    const exists = fileSystem.existsSync ? fileSystem.existsSync(initPath) : true
+
+    if (exists) {
+      const raw = fileSystem.readFileSync(initPath, 'utf8')
+      const match = raw.match(/__version__\s*=\s*["']([^"']+)["']/)
+
+      if (match && match[1]) {
+        return match[1]
+      }
+    }
+  } catch {
+    // Fall through to next rung
+  }
+
+  return null
+}
+
+function readStampVersion(ctx: VersionResolutionContext): string | null {
   const stamp = ctx.installStamp
 
   if (stamp && stamp.version && stamp.shortCommit) {
     return formatClientVersion(stamp)
   }
 
-  // Rung 3: App version fallback
+  return null
+}
+
+function readAppVersion(ctx: VersionResolutionContext): string | null {
   if (ctx.appVersion) {
     return ctx.appVersion
+  }
+
+  return null
+}
+
+/**
+ * Version Resolution Ladder:
+ *
+ * Ordered precedence depends on `ctx.isPackaged`:
+ *   When packaged (`isPackaged === true`):
+ *     1. Bundled install stamp (`ctx.installStamp`: requires valid `version` & `shortCommit`).
+ *     2. Local Python source tree (`ctx.updateRoot/hermes_cli/__init__.py`).
+ *     3. App version fallback (`ctx.appVersion`).
+ *     4. Final fallback: `'0.0.0'`.
+ *
+ *   When unpackaged/dev (`isPackaged !== true`):
+ *     1. Local Python source tree (`ctx.updateRoot/hermes_cli/__init__.py`).
+ *     2. Bundled install stamp (`ctx.installStamp`: requires valid `version` & `shortCommit`).
+ *     3. App version fallback (`ctx.appVersion`).
+ *     4. Final fallback: `'0.0.0'`.
+ */
+export function resolveHermesVersionLadder(ctx: VersionResolutionContext = {}): string {
+  const fileSystem = ctx.fsModule || fs
+
+  const evaluators = ctx.isPackaged === true
+    ? [
+        () => readStampVersion(ctx),
+        () => readSourceTreeVersion(ctx, fileSystem),
+        () => readAppVersion(ctx)
+      ]
+    : [
+        () => readSourceTreeVersion(ctx, fileSystem),
+        () => readStampVersion(ctx),
+        () => readAppVersion(ctx)
+      ]
+
+  for (const evaluate of evaluators) {
+    const version = evaluate()
+    if (version) {
+      return version
+    }
   }
 
   return '0.0.0'

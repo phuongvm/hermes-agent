@@ -17637,15 +17637,15 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   return { branch }
 })
 
-// Resolve the canonical Hermes version via the 3-rung resolution ladder:
-// 1. Local Python source tree (hermes_cli/__init__.py via resolveUpdateRoot())
-// 2. Packaged client-only runtime stamp (INSTALL_STAMP: version + shortCommit + [DIRTY])
-// 3. Fallback to app.getVersion()
+// Resolve the canonical Hermes version via the version resolution ladder:
+// When packaged (IS_PACKAGED): stamp -> source tree -> app.getVersion()
+// When dev (!IS_PACKAGED): source tree -> stamp -> app.getVersion()
 function resolveHermesVersion(): string {
   return resolveHermesVersionLadder({
     updateRoot: resolveUpdateRoot(),
     installStamp: INSTALL_STAMP,
     appVersion: app.getVersion(),
+    isPackaged: IS_PACKAGED,
     fsModule: fs
   })
 }
