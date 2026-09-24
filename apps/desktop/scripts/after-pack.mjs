@@ -1,40 +1,39 @@
 /**
  * after-pack.mjs — electron-builder afterPack hook.
  *
- * Stamps the Hermes icon + identity onto the packed Windows Hermes.exe via
- * rcedit (delegated to set-exe-identity.mjs). This runs for EVERY packed build
- * — first install, `hermes desktop`, the installer's --update rebuild, and a
- * dev's manual `npm run pack` — so the branded exe can never silently revert
- * to the stock "Electron" icon/name.
- *
- * Windows-only: rcedit edits PE resources, irrelevant on macOS/Linux where the
- * app identity comes from the bundle Info.plist / desktop entry.
- *
- * Fail-closed policy (C-1R2):
- * A stamp failure MUST abort packaging with a non-zero exit code. We do NOT
- * catch and swallow errors here; version stamping and executable branding
- * are mandatory release gates.
- *
- * electron-builder passes a context with:
- *   - electronPlatformName: 'win32' | 'darwin' | 'linux'
- *   - appOutDir:            the unpacked app directory for this target
- *   - packager.appInfo.productFilename: the exe basename (e.g. 'Hermes')
+ * Windows: stamps the Hermes icon + identity onto the packed Windows Hermes.exe via
+ * rcedit (delegated to set-exe-identity.mjs).
+ * macOS: restores the empty app-level localizations dropped during Electron extraction.
  */
-
+import { mkdir, readdir } from 'node:fs/promises'
 import path from "node:path"
-
 import { stampExeIdentity } from "./set-exe-identity.mjs"
 
 export default async function afterPack(context) {
-  if (context.electronPlatformName !== "win32") {
+  const { electronPlatformName, appOutDir, packager } = context
+  if (electronPlatformName === "win32") {
+    const productName = packager?.appInfo?.productFilename || "Hermes"
+    const exe = path.join(appOutDir, `${productName}.exe`)
+    const desktopRoot = path.resolve(import.meta.dirname, "..")
+    await stampExeIdentity(exe, desktopRoot)
     return
   }
 
-  const productName = context.packager?.appInfo?.productFilename || "Hermes"
-  const exe = path.join(context.appOutDir, `${productName}.exe`)
-  const desktopRoot = path.resolve(import.meta.dirname, "..")
-
-  // Fail-closed: version and identity stamping is mandatory for release integrity.
-  // Any failure here must propagate to abort electron-builder packaging.
-  await stampExeIdentity(exe, desktopRoot)
+  if (electronPlatformName === 'darwin') {
+    try {
+      const resources = packager.getResourcesDir(appOutDir)
+      const framework = packager.getMacOsElectronFrameworkResourcesDir(appOutDir)
+      const entries = await readdir(framework, { withFileTypes: true })
+      const locales = entries.filter(
+        entry =>
+          entry.isDirectory() && entry.name.endsWith('.lproj') && !/_(FEMININE|MASCULINE|NEUTER)\.lproj$/.test(entry.name)
+      )
+      await Promise.all(locales.map(entry => mkdir(path.join(resources, entry.name), { recursive: true })))
+    } catch (error) {
+      console.warn(
+        `[after-pack] macOS locale markers were not restored: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+}
 }

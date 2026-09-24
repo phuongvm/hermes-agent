@@ -27,7 +27,6 @@ export type {
   UsageBarData,
   UsageModelData
 } from './billing-types'
-export { pluginCatalogInstallUrl, skillCatalogInstallIdentifier, skillCatalogInstallUrl } from './catalog-install'
 export {
   driveChargeSettlement,
   SETTLEMENT_MAX_RETRY_AFTER_MS,
@@ -114,7 +113,9 @@ export {
   reconnectBackoffDelayMs,
   type ReconnectBackoffOptions,
   ReconnectBackoffTracker,
-  STREAK_RESET_WINDOW_MS
+  STREAK_RESET_WINDOW_MS,
+  isStableOpen,
+  RECONNECT_STABLE_OPEN_MS
 } from './reconnect-backoff'
 export { skillInvocationText } from './skill-scaffold'
 export {

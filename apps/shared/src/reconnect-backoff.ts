@@ -33,6 +33,20 @@ export const MAX_RECONNECT_DURATION_MS = 5 * 60 * 1_000 // 5 minutes
 export const STREAK_RESET_WINDOW_MS = 30_000 // 30 seconds
 
 /**
+ * A socket that opens and dies inside this window (an accept-then-close proxy, a gateway that
+ * refuses the first frame) counts as a FAILED attempt: resetting the ladder on every such
+ * "open" redials at attempt 0 forever (#83134: 55 sockets in 12 s).
+ */
+export const RECONNECT_STABLE_OPEN_MS = 5_000
+
+/** True when a socket opened at `openedAt` stayed up long enough to reset the backoff ladder. */
+export function isStableOpen(openedAt: number | null, now = Date.now()): boolean {
+  return openedAt !== null && now - openedAt >= RECONNECT_STABLE_OPEN_MS
+}
+
+const MAX_EXPONENT = 32
+
+/**
  * Returns delay in milliseconds for reconnect attempt `attempt` (0-indexed).
  * delay = ceiling / 2 + random * (ceiling / 2)
  */

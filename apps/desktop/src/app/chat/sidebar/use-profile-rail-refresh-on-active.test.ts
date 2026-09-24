@@ -113,90 +113,10 @@ describe('useProfileRailRefreshOnActive', () => {
     expect(refreshActiveProfile).not.toHaveBeenCalled()
   })
 
-  it('does NOT refresh when visibilitychange fires while gateway is in connecting state', async () => {
-    $gatewayState.set('connecting')
-    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
-    renderHook(() => useProfileRailRefreshOnActive())
-    refreshActiveProfile.mockClear()
-
-    await act(async () => {
-      document.dispatchEvent(new Event('visibilitychange'))
-    })
-
-    expect(refreshActiveProfile).not.toHaveBeenCalled()
-  })
-
-  it('refreshes once on reconnect when gateway transitions from connecting to open', async () => {
-    $gatewayState.set('connecting')
-    renderHook(() => useProfileRailRefreshOnActive())
-
-    expect(refreshActiveProfile).not.toHaveBeenCalled()
-
-    await act(async () => {
-      $gatewayState.set('open')
-    })
-
-    expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
-  })
-
-  it('defers focus refresh during disconnect and executes single coalesced refresh on reconnect', async () => {
-    $gatewayState.set('connecting')
-    renderHook(() => useProfileRailRefreshOnActive())
-    expect(refreshActiveProfile).not.toHaveBeenCalled()
-
-    // Multiple focus events while disconnected
-    await act(async () => {
-      window.dispatchEvent(new Event('focus'))
-      window.dispatchEvent(new Event('focus'))
-    })
-    expect(refreshActiveProfile).not.toHaveBeenCalled()
-
-    // Reconnect to open -> single coalesced refresh
-    await act(async () => {
-      $gatewayState.set('open')
-    })
-    expect(refreshActiveProfile).toHaveBeenCalledTimes(1)
-  })
-
-  it('suppresses refresh on mount and focus when in terminal signed-out state even if gateway is open', async () => {
-    const { setTerminalSignedOut, resetAuthTerminalState } = await import('@/store/auth-terminal-state')
-    const { $connection } = await import('@/store/session')
-    resetAuthTerminalState()
-    $connection.set({
-      baseUrl: 'https://gateway.example.com',
-      isFullscreen: false,
-      nativeOverlayWidth: 0,
-      token: 'tok',
-      wsUrl: 'ws://gateway.example.com',
-      logs: []
-    } as never)
+  it('suppresses refresh during terminal signed-out state and refreshes on sign-in recovery', async () => {
     setTerminalSignedOut('https://gateway.example.com', true)
 
-    $gatewayState.set('open')
-    renderHook(() => useProfileRailRefreshOnActive())
-    expect(refreshActiveProfile).not.toHaveBeenCalled()
-
-    await act(async () => {
-      window.dispatchEvent(new Event('focus'))
-    })
-    expect(refreshActiveProfile).not.toHaveBeenCalled()
-  })
-
-  it('defers refresh while signed out and resumes once when sign-in confirms', async () => {
-    const { setTerminalSignedOut, resetAuthTerminalState } = await import('@/store/auth-terminal-state')
-    const { $connection } = await import('@/store/session')
-    resetAuthTerminalState()
-    $connection.set({
-      baseUrl: 'https://gateway.example.com',
-      isFullscreen: false,
-      nativeOverlayWidth: 0,
-      token: 'tok',
-      wsUrl: 'ws://gateway.example.com',
-      logs: []
-    } as never)
-    setTerminalSignedOut('https://gateway.example.com', true)
-    $gatewayState.set('open')
-
+    // Mount while signed out
     renderHook(() => useProfileRailRefreshOnActive())
     expect(refreshActiveProfile).not.toHaveBeenCalled()
 

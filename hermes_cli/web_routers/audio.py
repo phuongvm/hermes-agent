@@ -211,42 +211,40 @@ async def get_elevenlabs_voices(profile: Optional[str] = None):
     The desktop UI uses this for the ``tts.elevenlabs.voice_id`` dropdown.
     Only non-secret voice metadata is returned; the API key stays server-side.
     """
-    def _fetch_voices() -> Dict[str, Any]:
-        # Config-only scope (await-safe): the key lookup reads the requested
-        # profile's .env, matching the profile the settings UI writes to.
-        with _config_profile_scope(profile):
-            api_key = (load_env().get("ELEVENLABS_API_KEY") or "").strip()
-        if not api_key:
-            # Fallback for env-only deployments — scope-aware: under multiplex
-            # os.environ may hold another profile's key, so honor the installed
-            # scope's verdict before touching the env.
+    # Config-only scope (await-safe): the key lookup reads the requested
+    # profile's .env, matching the profile the settings UI writes to.
+    with _config_profile_scope(profile):
+        api_key = (load_env().get("ELEVENLABS_API_KEY") or "").strip()
+    if not api_key:
+        # Fallback for env-only deployments — scope-aware: under multiplex
+        # os.environ may hold another profile's key, so honor the installed
+        # scope's verdict. Only the unscoped default-profile path
+        # (UnscopedSecretError) reads the env; any other failure stays empty.
+        try:
+            from agent.secret_scope import UnscopedSecretError, get_secret
+
             try:
-                from agent.secret_scope import UnscopedSecretError, get_secret
-
-                try:
-                    api_key = (get_secret("ELEVENLABS_API_KEY") or "").strip()
-                except UnscopedSecretError:
-                    api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-            except Exception:
+                api_key = (get_secret("ELEVENLABS_API_KEY") or "").strip()
+            except UnscopedSecretError:
                 api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
-        if not api_key:
-            return {"available": False, "voices": []}
+        except Exception:
+            pass
+    if not api_key:
+        return {"available": False, "voices": []}
 
-        request = urllib.request.Request(
-            "https://api.elevenlabs.io/v1/voices",
-            headers={"Accept": "application/json", "xi-api-key": api_key},
-        )
-        with urllib.request.urlopen(request, timeout=10) as response:
-            raw_data = response.read(2 * 1024 * 1024 + 1)
-            if len(raw_data) > 2 * 1024 * 1024:
-                raise ValueError("ElevenLabs response exceeded 2 MiB ceiling")
-            return {"available": True, "payload": json.loads(raw_data.decode("utf-8"))}
+    request = urllib.request.Request(
+        "https://api.elevenlabs.io/v1/voices",
+        headers={"Accept": "application/json", "xi-api-key": api_key},
+    )
 
     try:
-        res = await asyncio.to_thread(_fetch_voices)
-        if not res.get("available"):
-            return {"available": False, "voices": []}
-        payload = res["payload"]
+        loop = asyncio.get_running_loop()
+
+        def _fetch() -> Dict[str, Any]:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        payload = await loop.run_in_executor(None, _fetch)
     except urllib.error.HTTPError as exc:
         # An auth failure (bad/expired/scoped key) is a persistent, user-fixable
         # state and the desktop polls this on every settings open/focus, so
@@ -360,7 +358,13 @@ async def tts_lease(payload: TTSLeaseRequest, profile: Optional[str] = None):
         if payload.active:
             with _config_profile_scope(profile):
                 return acquire_tts_lease(lease)
-        return release_tts_lease(lease)
+        # Release reads the requester's keep_warm_seconds, but must drop the lease even when
+        # that profile is gone — a stuck lease pins the local model in memory.
+        try:
+            with _config_profile_scope(profile):
+                return release_tts_lease(lease)
+        except HTTPException:
+            return release_tts_lease(lease)
 
     try:
         result = await asyncio.get_running_loop().run_in_executor(None, _apply)
@@ -385,7 +389,8 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
       client → ``{"text": "..."}`` frames (incremental; may combine with done),
                ``{"done": true}`` when the reply is complete,
                ``{"stop": true}`` or disconnect = barge-in
-      server → ``{"type": "start", "sample_rate": N, "channels": 1}``,
+      server → ``{"type": "start", "sample_rate": N, "channels": 1}`` (sent
+               with the first PCM frame, once the provider's rate is final),
                binary PCM frames, then ``{"type": "end"}``
       server → ``{"type": "fallback"}`` when the configured provider has no
                chunked API — the client uses the POST endpoint instead.
@@ -412,10 +417,10 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             cfg = _load_tts_config()
             streamer = resolve_streaming_provider(cfg)
             cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
-        return streamer, cap
+        return streamer, cap, cfg
 
     try:
-        streamer, cap = await loop.run_in_executor(None, _resolve)
+        streamer, cap, cfg = await loop.run_in_executor(None, _resolve)
     except Exception:
         _log.exception("speak-stream provider resolution failed")
         streamer, cap = None, 0
@@ -425,9 +430,20 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             await ws.close()
         return
 
-    await ws.send_json(
-        {"type": "start", "sample_rate": streamer.sample_rate, "channels": streamer.channels}
-    )
+    # The start frame is deferred until the first PCM chunk (or end-of-speech):
+    # the OpenAI-compatible streamer only learns the endpoint's real rate from
+    # the response headers inside stream(), and the client opens its
+    # AudioContext at whatever rate the start frame carries.
+    start_sent = False
+
+    async def _send_start():
+        nonlocal start_sent
+        if start_sent:
+            return
+        start_sent = True
+        await ws.send_json(
+            {"type": "start", "sample_rate": streamer.sample_rate, "channels": streamer.channels}
+        )
 
     stop = threading.Event()
     text_q: queue.Queue = queue.Queue()  # str deltas; None = end-of-text
@@ -444,7 +460,7 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         from tools.tts_streaming import SentenceChunker
         from tools.tts_text_normalize import _strip_markdown_for_tts
 
-        chunker = SentenceChunker()
+        chunker = SentenceChunker.from_config(cfg)  # the requesting profile's tts.streaming.min_len
 
         # The session stays open for a whole agent turn and no text arrives
         # during tool execution, so without an idle flush a narration line with
@@ -514,8 +530,10 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             chunk = await chunks.get()
             if chunk is None:
                 break
+            await _send_start()
             await ws.send_bytes(chunk)
         if not stop.is_set():
+            await _send_start()
             await ws.send_json({"type": "end"})
     except (WebSocketDisconnect, RuntimeError):
         pass

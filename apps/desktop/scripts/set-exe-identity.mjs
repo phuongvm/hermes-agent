@@ -20,7 +20,7 @@
 //
 // HOW IT RUNS
 // -----------
-// Primarily as an electron-builder `afterPack` hook (scripts/after-pack.mjs),
+// Primarily as an electron-builder `afterExtract` hook (scripts/after-extract.mjs),
 // so EVERY packed build — first install, `hermes desktop`, the installer's
 // --update rebuild, or a dev's manual `npm run pack` — gets a branded exe from
 // one place.
@@ -29,6 +29,9 @@
 // stampExeIdentity() throws/rejects on failure. after-pack.mjs awaits this
 // without swallowing, ensuring packaging terminates with a non-zero exit code
 // if version or icon stamping fails.
+//
+// Also runnable standalone for ad-hoc re-stamping:
+//   node scripts/set-exe-identity.mjs <path-to-Hermes.exe>
 
 import { resolve, join } from "node:path"
 import { existsSync, readFileSync } from "node:fs"
@@ -97,7 +100,7 @@ export function buildRceditOptions(stamp, iconPath) {
 const RCEDIT_COMMIT_RETRY_DELAYS_MS = [500, 1000, 2000]
 
 // A failure to spawn the rcedit binary itself (missing or not executable) is
-// permanent; waiting 3.5 s on it only delays after-pack.mjs's warning. The npm
+// permanent; waiting 3.5 s on it only delays after-extract.mjs's warning. The npm
 // rcedit wrapper surfaces the spawn error as `originalError` on its rejection,
 // while a non-zero rcedit exit carries a numeric `code`.
 const RCEDIT_PERMANENT_SPAWN_CODES = new Set(['ENOENT', 'EACCES'])

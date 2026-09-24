@@ -79,7 +79,6 @@ describe('reconnectBackoffDelayMs', () => {
       randomSpy.mockRestore()
     }
   })
-
   it('treats negative attempt numbers as attempt 0 rather than throwing or returning a negative delay', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(1)
 
@@ -100,7 +99,6 @@ describe('reconnectBackoffDelayMs', () => {
       randomSpy.mockRestore()
     }
   })
-
   it('jitter: false returns the exact ceiling — the ladder web prints in its banner', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.1)
 
