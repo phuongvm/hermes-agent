@@ -154,6 +154,8 @@ _WS_READ_IDLE_TIMEOUT = 300.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+_WS_KEEPALIVE_SUB_ID = "hermes-buzz-keepalive"
+_DEFAULT_WS_APP_KEEPALIVE_INTERVAL = 60.0
 # Credentials JSON fallback when BUZZ_PRIVATE_KEY is not set; module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
 # Buzz-hosted media is private to the community: same-relay URLs must be authenticated + localised for vision.
@@ -567,6 +569,14 @@ class BuzzAdapter(BasePlatformAdapter):
             self.ws_ping_timeout = max(5.0, float(_ping_to_raw if _ping_to_raw is not None else _DEFAULT_WS_PING_TIMEOUT))
         except (TypeError, ValueError):
             self.ws_ping_timeout = _DEFAULT_WS_PING_TIMEOUT
+
+        _app_keepalive_raw = _setting_or("BUZZ_WS_APP_KEEPALIVE_INTERVAL", extra, "ws_app_keepalive_interval", None)
+        if _app_keepalive_raw is None:
+            _app_keepalive_raw = extra.get("app_keepalive_interval")
+        try:
+            self.ws_app_keepalive_interval = max(10.0, float(_app_keepalive_raw if _app_keepalive_raw is not None else _DEFAULT_WS_APP_KEEPALIVE_INTERVAL))
+        except (TypeError, ValueError):
+            self.ws_app_keepalive_interval = _DEFAULT_WS_APP_KEEPALIVE_INTERVAL
         # Entries may be hex or npub (normalized to hex). Reaction-only identities get a 👀 on explicit tags but
         # never dispatch; allowed_users wins on overlap.
         self._allowed_pubkeys: set = _pubkey_set(_setting_or("BUZZ_ALLOWED_USERS", extra, "allowed_users", []))
@@ -1158,6 +1168,26 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("Buzz: WebSocket discovery sweep failed", exc_info=True)
 
+    async def _ws_keepalive_loop(self, websocket) -> None:
+        """Periodic application-level data frame keepalive.
+
+        Cloudflare Tunnel and edge proxies idle-timeout WebSocket connections after 300s of inactivity,
+        treating control frames (Ping/Pong) as non-data. Sending a lightweight Nostr REQ frame periodically
+        resets proxy idle counters and prevents spurious disconnects (#112049).
+        """
+        from websockets.exceptions import ConnectionClosed
+
+        while True:
+            await asyncio.sleep(self.ws_app_keepalive_interval)
+            try:
+                await websocket.send(json.dumps(["REQ", _WS_KEEPALIVE_SUB_ID, {"kinds": [0], "limit": 0}], separators=(",", ":")))
+                await asyncio.sleep(0.5)
+                await websocket.send(json.dumps(["CLOSE", _WS_KEEPALIVE_SUB_ID], separators=(",", ":")))
+            except (asyncio.CancelledError, ConnectionClosed):
+                raise
+            except Exception as e:
+                logger.debug("Buzz: application keepalive frame failed: %s", e)
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect backoff; `since` filters resume on reconnect."""
         import websockets
@@ -1183,6 +1213,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     tasks = {
                         asyncio.create_task(self._ws_read_loop(websocket, subscriptions)),
                         asyncio.create_task(self._ws_discovery_loop(websocket, subscriptions)),
+                        asyncio.create_task(self._ws_keepalive_loop(websocket)),
                     }
                     try:
                         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1255,8 +1286,10 @@ class BuzzAdapter(BasePlatformAdapter):
             if channel_id and state is not None:
                 await self._handle_events(channel_id, state, [event])
         elif message[0] == "CLOSED":
-            detail = message[-1] if len(message) > 2 else "subscription closed"
             sub_id = str(message[1]) if len(message) > 1 else ""
+            if sub_id == _WS_KEEPALIVE_SUB_ID:
+                return
+            detail = message[-1] if len(message) > 2 else "subscription closed"
             closed_channel = subscriptions.get(sub_id)
             # A membership rejection is permanent — drop the channel instead of reconnect-looping.
             rejected = any(m in str(detail).lower() for m in ("restricted", "not a channel member", "auth-required"))
@@ -1266,6 +1299,8 @@ class BuzzAdapter(BasePlatformAdapter):
             self._restricted_channels.add(closed_channel)
             del subscriptions[sub_id]
             self._channel_state.pop(closed_channel, None)
+        elif message[0] in ("EOSE", "OK"):
+            return
         elif message[0] == "NOTICE":
             logger.warning("Buzz: relay notice: %s", message[-1])
 

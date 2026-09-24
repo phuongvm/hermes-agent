@@ -966,3 +966,46 @@ async def test_websocket_loop_passes_configured_keepalive_to_connect(monkeypatch
     assert captured_kwargs[0]["ping_timeout"] == 84.0
     assert captured_kwargs[0]["open_timeout"] == 48.0
 
+
+@pytest.mark.asyncio
+async def test_websocket_app_keepalive_loop_sends_req_and_close():
+    """_ws_keepalive_loop must periodically emit a lightweight REQ and CLOSE frame to reset Cloudflare idle timers."""
+    adapter = _make_adapter(extra={"ws_app_keepalive_interval": 15.0})
+    assert adapter.ws_app_keepalive_interval == 15.0
+
+    # Shorten interval for the test loop
+    adapter.ws_app_keepalive_interval = 0.02
+
+    sent = []
+
+    class MockWs:
+        async def send(self, raw):
+            sent.append(json.loads(raw))
+
+    ws = MockWs()
+    task = asyncio.create_task(adapter._ws_keepalive_loop(ws))
+    try:
+        deadline = time.monotonic() + 1.0
+        while len(sent) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(sent) >= 2
+    assert sent[0] == ["REQ", _buzz_mod._WS_KEEPALIVE_SUB_ID, {"kinds": [0], "limit": 0}]
+    assert sent[1] == ["CLOSE", _buzz_mod._WS_KEEPALIVE_SUB_ID]
+
+
+@pytest.mark.asyncio
+async def test_websocket_app_keepalive_closed_frame_ignored():
+    """_handle_ws_message must not treat keepalive sub CLOSED frame as unexpected connection drop."""
+    adapter = _make_adapter()
+    subscriptions = {}
+
+    # Must return cleanly without raising ConnectionError
+    await adapter._handle_ws_message(None, subscriptions, ["CLOSED", _buzz_mod._WS_KEEPALIVE_SUB_ID, ""])
+    await adapter._handle_ws_message(None, subscriptions, ["EOSE", _buzz_mod._WS_KEEPALIVE_SUB_ID])
+
+
