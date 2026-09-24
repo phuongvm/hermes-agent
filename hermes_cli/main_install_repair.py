@@ -1091,6 +1091,24 @@ def _verify_console_scripts_installed(
         _missing(), "Workaround: python -m hermes_cli.main <command>",
         ok="  ✓ All console entry points restored")
 
+    # If hermes-acp shim exists, verify that the 'acp' module is importable in the target venv.
+    if scripts_dir and ((scripts_dir / "hermes-acp.exe").is_file() or (scripts_dir / "hermes-acp").is_file()):
+        venv_python = _resolve_install_target_python(install_cmd_prefix, env)
+        if venv_python:
+            try:
+                res = subprocess.run(
+                    [venv_python, "-c", "import acp"],
+                    capture_output=True, env=env, timeout=5)
+                if res.returncode != 0:
+                    print("  ⚠ hermes-acp entry point found but 'acp' module missing — repairing...")
+                    _run_repair_step(
+                        _run_quarantined_install, install_cmd_prefix + ["install", "-e", ".[acp]"],
+                        env=env, scripts_dir=scripts_dir,
+                        log_msg="acp verification: repair install failed: %s",
+                        fail_msg="  ⚠ acp repair failed; check `hermes update` output above.")
+            except Exception:
+                pass
+
 
 def _applicable_dependency_names(raw_deps: list[str]) -> list[str]:
     """Declared dep names whose ``;`` markers apply here (else ``ptyprocess ; sys_platform !=

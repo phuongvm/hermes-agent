@@ -28,7 +28,12 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
-from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
+from hermes_constants import (
+    get_hermes_home,
+    get_hermes_home_override,
+    get_process_hermes_home,
+    hermes_home_key,
+)
 from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled
 from hermes_cli.config import load_config_readonly
@@ -774,7 +779,6 @@ class PluginContext:
         # The auth registry is process-global (lifetime = web server). Disposing it on a routine
         # per-home manager teardown emptied it for the WHOLE process and disabled sign-in until
         # restart — so upsert and keep it out of reverse-order teardown (``persistent=True``).
-        from hermes_constants import get_hermes_home_override, get_process_hermes_home, hermes_home_key
         active = snapshot_registration(registry_name)
         if active is not None:
             is_scoped = False

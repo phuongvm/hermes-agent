@@ -1026,6 +1026,45 @@ def _refuse_update_if_venv_foreign_owned(project_root) -> None:
     sys.exit(1)
 
 
+def _sanitize_corrupted_dist_info_directories(project_root) -> list[str]:
+    """Scan the venv's site-packages for broken *.dist-info directories lacking METADATA.
+
+    Interrupted updates or Windows file locks can leave half-deleted .dist-info folders without
+    METADATA, which causes `uv pip install` to fail unconditionally during environment inspection.
+    Removes corrupted .dist-info directories so dependency sync can proceed cleanly.
+    """
+    venv_dir = project_venv_dir(project_root) or Path(project_root) / "venv"
+    if not venv_dir or not venv_dir.is_dir():
+        return []
+    sp_candidates = [
+        venv_dir / "Lib" / "site-packages",
+        venv_dir / "lib" / "site-packages",
+    ]
+    lib_dir = venv_dir / "lib"
+    if lib_dir.is_dir():
+        for pydir in lib_dir.glob("python*"):
+            if pydir.is_dir():
+                sp_candidates.append(pydir / "site-packages")
+
+    cleaned = []
+    for sp in sp_candidates:
+        if not sp.is_dir():
+            continue
+        try:
+            for item in sp.glob("*.dist-info"):
+                if item.is_dir() and not (item / "METADATA").is_file():
+                    try:
+                        shutil.rmtree(item, ignore_errors=True)
+                        cleaned.append(item.name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if cleaned:
+        print(f"  ⚠ Healed {len(cleaned)} corrupted .dist-info director{'ies' if len(cleaned) > 1 else 'y'}: {', '.join(cleaned)}")
+    return cleaned
+
+
 def _sync_python_dependencies_after_pull(
     git_cmd, branch, pre_pull_sha, *, active_lazy_features, active_tool_dependencies,
     _windows_gateway_resume):
@@ -1046,7 +1085,10 @@ def _sync_python_dependencies_after_pull(
     # Drop the core-install breadcrumb BEFORE touching the venv so a killed install is finished
     # by the next launch (``_recover_from_interrupted_install``). Lazy refresh uses its own marker.
     _write_update_incomplete_marker()
+    corrupted_dist_info = _sanitize_corrupted_dist_info_directories(_m().PROJECT_ROOT)
     deps_current = _editable_install_is_current(git_cmd, _m().PROJECT_ROOT, pre_pull_sha)
+    if corrupted_dist_info:
+        deps_current = False
     print(
         "→ Python dependencies unchanged — skipping reinstall" if deps_current
         else "→ Updating Python dependencies...")

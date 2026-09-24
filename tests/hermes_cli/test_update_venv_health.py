@@ -241,3 +241,28 @@ def _run_update_until_guard(args):
 def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
     result = _run_update_until_guard(_update_args(force=force, force_venv=force_venv))
     assert result == expected, capsys.readouterr().out
+
+
+def test_sanitize_corrupted_dist_info_directories(tmp_path):
+    from hermes_cli.update_cmd_deps import _sanitize_corrupted_dist_info_directories
+
+    venv_dir = tmp_path / "venv"
+    sp = venv_dir / "Lib" / "site-packages"
+    sp.mkdir(parents=True)
+
+    # 1. Valid dist-info with METADATA
+    valid_dir = sp / "valid_pkg-1.0.0.dist-info"
+    valid_dir.mkdir()
+    (valid_dir / "METADATA").write_text("Metadata-Version: 2.1\nName: valid_pkg\nVersion: 1.0.0\n")
+
+    # 2. Corrupted dist-info lacking METADATA
+    corrupted_dir = sp / "broken_pkg-0.8.4.dist-info"
+    corrupted_dir.mkdir()
+    (corrupted_dir / "licenses").mkdir()
+
+    cleaned = _sanitize_corrupted_dist_info_directories(tmp_path)
+    assert "broken_pkg-0.8.4.dist-info" in cleaned
+    assert not corrupted_dir.exists()
+    assert valid_dir.exists()
+    assert (valid_dir / "METADATA").exists()
+
