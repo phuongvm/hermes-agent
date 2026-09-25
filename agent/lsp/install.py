@@ -105,9 +105,17 @@ def _first_existing(*bases: Path) -> Optional[Path]:
 
 def _existing_binary(name: str) -> Optional[str]:
     """Probe the staging dir + PATH for a binary named ``name``."""
+    if _is_windows():
+        nm_bin = hermes_lsp_bin_dir().parent / "node_modules" / ".bin"
+        for staged in _native_binary_candidates(nm_bin / name):
+            if staged.exists() and staged.suffix.lower() in _WINDOWS_WRAPPER_SUFFIXES:
+                return str(staged)
     for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
-        if staged.exists() and os.access(staged, os.X_OK):
-            return str(staged)
+        if staged.exists():
+            if _is_windows() and staged.suffix.lower() not in _WINDOWS_WRAPPER_SUFFIXES:
+                continue
+            if os.access(staged, os.X_OK):
+                return str(staged)
     suffixes = ("", *_WINDOWS_WRAPPER_SUFFIXES) if _is_windows() else ("",)
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)
 

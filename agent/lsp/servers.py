@@ -155,8 +155,11 @@ def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     if bin_path is None:
         return None
     # If we got the cli ``pyright``, the langserver is its sibling.
-    if os.path.basename(bin_path) in {"pyright", "pyright.exe"}:
-        sibling = os.path.join(os.path.dirname(bin_path), "pyright-langserver")
+    if os.path.basename(bin_path).lower() in {"pyright", "pyright.exe", "pyright.cmd"}:
+        ext = os.path.splitext(bin_path)[1]
+        sibling = os.path.join(os.path.dirname(bin_path), f"pyright-langserver{ext}")
+        if not os.path.exists(sibling) and ext:
+            sibling = os.path.join(os.path.dirname(bin_path), "pyright-langserver")
         if os.path.exists(sibling):
             bin_path = sibling
     # Point pyright at the project venv; its default "python on PATH" rarely is.

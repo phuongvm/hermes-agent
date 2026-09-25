@@ -51,13 +51,27 @@ function gitFor(cwd, gitBin) {
   // For spaced paths, opt into simple-git's trusted-binary escape hatch instead
   // of falling back to PATH (often absent in GUI-launched apps, and PATH lookup
   // could resolve a repo-local git.exe).
-  return simpleGit({
-    baseDir: cwd,
-    binary: gitBin || 'git',
-    maxConcurrentProcesses: 4,
-    trimmed: false,
-    ...(gitBin && /\s/.test(gitBin) ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
-  })
+  const origWarn = console.warn
+  try {
+    if (gitBin && /\s/.test(gitBin)) {
+      console.warn = (...args: unknown[]) => {
+        if (typeof args[0] === 'string' && args[0].includes('Invalid value supplied for custom binary')) {
+          return
+        }
+        origWarn.apply(console, args)
+      }
+    }
+
+    return simpleGit({
+      baseDir: cwd,
+      binary: gitBin || 'git',
+      maxConcurrentProcesses: 4,
+      trimmed: false,
+      ...(gitBin && /\s/.test(gitBin) ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
+    })
+  } finally {
+    console.warn = origWarn
+  }
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve

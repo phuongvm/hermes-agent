@@ -9545,6 +9545,10 @@ function isHermesProcess(pid) {
     return false
   }
 
+  if (process.platform === 'win32') {
+    return true
+  }
+
   // On macOS / Linux, check the command line to avoid PID recycling false positives.
   try {
     const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')
