@@ -245,8 +245,17 @@ class LSPClient:
     async def _spawn(self) -> None:
         from agent.delegation_context import delegated_child_subprocess_env
         cmd = self._command
-        if sys.platform == "win32" and cmd[0].lower().endswith((".cmd", ".bat")):
-            cmd = ["cmd.exe", "/c", *cmd]  # CreateProcess can't run .cmd/.bat shims directly
+        if sys.platform == "win32":
+            exe = cmd[0]
+            if not exe.lower().endswith((".exe", ".cmd", ".bat")):
+                for sfx in (".cmd", ".bat", ".exe"):
+                    if os.path.exists(exe + sfx):
+                        exe = exe + sfx
+                        break
+            if exe.lower().endswith((".cmd", ".bat")):
+                cmd = ["cmd.exe", "/c", exe, *cmd[1:]]  # CreateProcess can't run .cmd/.bat shims directly
+            elif exe != cmd[0]:
+                cmd = [exe, *cmd[1:]]
         try:
             # start_new_session=True gives the server its own process group; otherwise it inherits
             # the gateway's pgid and mcp_tool's orphan sweeper can killpg() the TUI parent with it.

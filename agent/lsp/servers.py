@@ -165,8 +165,10 @@ def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     # If we got the cli ``pyright``, the langserver is its sibling — same suffix, since on Windows
     # the bare sibling is npm's unrunnable POSIX shim.
     stem, suffix = os.path.splitext(os.path.basename(bin_path))
-    if stem == "pyright":
+    if stem.lower() == "pyright":
         sibling = os.path.join(os.path.dirname(bin_path), f"pyright-langserver{suffix}")
+        if not os.path.exists(sibling) and suffix:
+            sibling = os.path.join(os.path.dirname(bin_path), "pyright-langserver")
         if os.path.exists(sibling):
             bin_path = sibling
     # Point pyright at the project venv; its default "python on PATH" rarely is.
