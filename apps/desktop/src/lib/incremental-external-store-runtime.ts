@@ -16,6 +16,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 
 const EMPTY_ARRAY = Object.freeze([])
+const EMPTY_OBJECT = Object.freeze({})
 
 const shallowEqual = (a: object, b: object): boolean => {
   const aKeys = Object.keys(a)
@@ -33,7 +34,7 @@ const shallowEqual = (a: object, b: object): boolean => {
   return true
 }
 
-const getThreadListAdapter = (store: ExternalStoreAdapter) => store.adapters?.threadList ?? {}
+const getThreadListAdapter = (store: ExternalStoreAdapter) => store.adapters?.threadList ?? EMPTY_OBJECT
 
 /**
  * Write only the items whose (message, parentId) pair actually moved.
@@ -178,6 +179,7 @@ class IncrementalExternalStoreThreadRuntimeCore extends ExternalStoreThreadRunti
       switchToBranch: store.setMessages !== undefined,
       switchBranchDuringRun: false,
       edit: store.onEdit !== undefined,
+      delete: store.setMessages !== undefined || (store as any).onDelete !== undefined,
       reload: store.onReload !== undefined,
       cancel: store.onCancel !== undefined,
       speech: store.adapters?.speech !== undefined,

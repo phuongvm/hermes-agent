@@ -43,6 +43,7 @@
     "typescript-eslint": "8.64.0"
   },
   "overrides": {
+    "@assistant-ui/tap": "0.9.8",
     "lodash": "4.18.1",
     "yauzl": "^3.3.1",
     "protobufjs": "^8.7.1",
@@ -72,5 +73,8 @@
     "fsevents@2.3.2": true,
     "fsevents@2.3.3": true,
     "get-windows@9.3.0": true
+  },
+  "dependencies": {
+    "@assistant-ui/tap": "0.9.8"
   }
 }
