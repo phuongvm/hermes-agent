@@ -331,7 +331,22 @@ def _query_windows_pipe(home: Path, request: bytes, timeout: float) -> Optional[
             time.sleep(0.05)
     try:
         handle.write(request)
-        return _read_response_line(lambda: handle.read(65536), deadline)
+        def _read_chunk():
+            try:
+                import ctypes
+                import msvcrt
+                h_file = msvcrt.get_osfhandle(handle.fileno())
+                avail = ctypes.c_ulong(0)
+                while time.monotonic() < deadline:
+                    if not ctypes.windll.kernel32.PeekNamedPipe(h_file, None, 0, None, ctypes.byref(avail), None):
+                        return b""
+                    if avail.value > 0:
+                        return handle.read(min(avail.value, 65536))
+                    time.sleep(0.02)
+                return b""
+            except Exception:
+                return handle.read(65536)
+        return _read_response_line(_read_chunk, deadline)
     finally:
         with contextlib.suppress(Exception):
             handle.close()

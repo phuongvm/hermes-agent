@@ -175,6 +175,21 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
     if not hr.liveness_is_proven(record):
         return None
     home = _record_home(record)
+    if record.pid == os.getpid():
+        from gateway.status import read_runtime_status
+        status = (
+            read_runtime_status(home / "gateway_state.json")
+            or read_runtime_status(home / "state" / "gateway_state.json")
+            or read_runtime_status()
+            or {}
+        )
+        served = status.get("served_profiles")
+        if isinstance(served, list) and served:
+            served_tuple = tuple(str(p) for p in served)
+        else:
+            from hermes_cli.profiles import get_active_profile
+            served_tuple = (get_active_profile() or "default",)
+        return HostGateway(record.pid, home, served_tuple)
     deadline = time.monotonic() + max(0.0, wait_for_channel)
     while True:
         identity = _identify(home)

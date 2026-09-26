@@ -294,3 +294,25 @@ def test_the_default_profile_arriving_second_starts_beside_a_standalone_named_ow
     assert host_attach.profile_name_for_home(root) == "default"
     assert decision.outcome == host_attach.START
     assert asyncio.run(gateway_run._host_attach_or_none(replace=False)) is None
+
+
+def test_probe_host_gateway_self_probe_does_not_dial_control_socket(tmp_path, monkeypatch):
+    """When the running process IS the host gateway, host_gateway() must resolve served
+    profiles directly without dialing identify over the control socket (deadlock prevention)."""
+    root = tmp_path / "root"
+    _publish(os.getpid(), root, ("default", "coder"))
+    status_file = root / "state" / "gateway_state.json"
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    status_file.write_text(json.dumps({"served_profiles": ["default", "coder"]}))
+
+    dial_called = []
+    monkeypatch.setattr("gateway.control_socket.identify_gateway",
+                        lambda *a, **k: dial_called.append(True) or None)
+
+    owner = host_attach.host_gateway()
+    assert owner is not None
+    assert owner.pid == os.getpid()
+    assert owner.profiles == ("default", "coder")
+    assert owner.serves("coder")
+    assert not dial_called
+
