@@ -1423,7 +1423,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return web.json_response(
             {"error": {"message": "Invalid gateway API key (API_SERVER_KEY)", "type": "gateway_auth_error",
                        "code": "gateway_auth_failed"}},
-            status=401)
+            status=401,
+            headers={"Connection": "close"})
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """Validate the Bearer token; None when OK, else a 401. The no-key branch (connect()

@@ -282,6 +282,13 @@ class TestAuth:
         result = adapter._check_auth(mock_request)  # must not raise
         assert result is not None
         assert result.status == 401
+        assert result.headers.get("Connection") == "close"
+
+    def test_auth_failed_response_sets_connection_close_header(self):
+        """Authentication failure must return Connection: close to prevent lingering CLOSE_WAIT sockets."""
+        resp = APIServerAdapter._auth_failed_response()
+        assert resp.status == 401
+        assert resp.headers.get("Connection") == "close"
 
 
 # ---------------------------------------------------------------------------
