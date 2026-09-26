@@ -55,3 +55,18 @@ def test_existing_binary_resolves_runnable_cmd_over_posix_shim(tmp_path: Path, m
     out = subprocess.run([str(resolved)], capture_output=True, text=True, encoding="utf-8", errors="replace",
                          check=True, stdin=subprocess.DEVNULL)
     assert "wrapper-ran" in out.stdout
+
+
+def test_existing_binary_prefers_npm_wrapper_over_bare_staging_shim(tmp_path: Path, monkeypatch):
+    """When hermes_lsp_bin_dir has a bare POSIX shim and npm bin dir has .cmd, Windows must pick .cmd."""
+    staging_bin = tmp_path / "bin"
+    staging_bin.mkdir(parents=True)
+    bare_shim = staging_bin / "pyright-langserver"
+    bare_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+
+    npm_bin = tmp_path / "node_modules" / ".bin"
+    cmd_wrapper = _npm_shim_pair(npm_bin, "pyright-langserver")
+
+    monkeypatch.setattr(install, "hermes_lsp_bin_dir", lambda: staging_bin)
+    resolved = install._existing_binary("pyright-langserver", is_windows=True)
+    assert resolved == str(cmd_wrapper)

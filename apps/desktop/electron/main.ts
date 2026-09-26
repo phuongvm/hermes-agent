@@ -16748,46 +16748,60 @@ async function fetchJsonForBackend(
 ) {
   const url = `${descriptor.baseUrl}${path}`
 
-  if (descriptor.authMode === 'oauth') {
-    if (ensureNativeAccessToken.isTerminalSignedOut?.(descriptor.baseUrl)) {
-      const err = new Error('Authentication required (signed-out)')
-      Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
-      throw err
-    }
-    // The OAuth cookie path rides electron.net with JSON headers; multipart
-    // isn't wired there. Fail loudly rather than corrupting the upload.
-    if (opts.upload) {
-      throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+  try {
+    if (descriptor.authMode === 'oauth') {
+      if (ensureNativeAccessToken.isTerminalSignedOut?.(descriptor.baseUrl)) {
+        const err = new Error('Authentication required (signed-out)')
+        Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
+        throw err
+      }
+      // The OAuth cookie path rides electron.net with JSON headers; multipart
+      // isn't wired there. Fail loudly rather than corrupting the upload.
+      if (opts.upload) {
+        throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+      }
+
+      const options = {
+        method: opts.method,
+        body: opts.body,
+        timeoutMs: opts.timeoutMs,
+        headers: descriptor.headers
+      }
+
+      return await requestWithOauthFallback(descriptor.baseUrl, {
+        ensureNativeAccessToken,
+        requestWithBearer: bearer =>
+          executeWithNativeBearerSingleReplay(
+            descriptor.baseUrl,
+            bearer,
+            activeBearer => fetchJson(url, null, { ...options, bearer: activeBearer }),
+            (rejectedBaseUrl, rejectedBearer) =>
+              ensureNativeAccessToken(rejectedBaseUrl, { forceRefresh: true, rejectedAccessToken: rejectedBearer })
+          ),
+        requestWithCookie: () => fetchJsonViaOauthSession(url, options)
+      })
     }
 
-    const options = {
+    return await fetchJson(url, descriptor.token, {
       method: opts.method,
       body: opts.body,
+      upload: opts.upload,
       timeoutMs: opts.timeoutMs,
       headers: descriptor.headers
-    }
-
-    return requestWithOauthFallback(descriptor.baseUrl, {
-      ensureNativeAccessToken,
-      requestWithBearer: bearer =>
-        executeWithNativeBearerSingleReplay(
-          descriptor.baseUrl,
-          bearer,
-          activeBearer => fetchJson(url, null, { ...options, bearer: activeBearer }),
-          (rejectedBaseUrl, rejectedBearer) =>
-            ensureNativeAccessToken(rejectedBaseUrl, { forceRefresh: true, rejectedAccessToken: rejectedBearer })
-        ),
-      requestWithCookie: () => fetchJsonViaOauthSession(url, options)
     })
+  } catch (error: any) {
+    // Graceful backward-compatibility fallback for optional capability probe endpoints
+    // on older remote backends that return 404 "No such API endpoint" (e.g. 0.21.1 backends).
+    if (error?.statusCode === 404 && typeof error?.message === 'string' && error.message.includes('No such API endpoint')) {
+      if (path.startsWith('/api/audio/voice-live/status')) {
+        return { ok: true, available: false, mode: 'chained', reason: 'Endpoint not supported on remote backend' }
+      }
+      if (path.includes('/timeline')) {
+        return { session_id: '', profile: '', entries: [], pagination: { limit: 500, offset: 0, has_more: false, next_cursor: null } }
+      }
+    }
+    throw error
   }
-
-  return fetchJson(url, descriptor.token, {
-    method: opts.method,
-    body: opts.body,
-    upload: opts.upload,
-    timeoutMs: opts.timeoutMs,
-    headers: descriptor.headers
-  })
 }
 
 reauthModalLatch.setAuthStateResolver(async (connectionKey, _outcome) => {
