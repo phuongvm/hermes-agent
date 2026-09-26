@@ -44,7 +44,7 @@ export function isStableOpen(openedAt: number | null, now = Date.now()): boolean
   return openedAt !== null && now - openedAt >= RECONNECT_STABLE_OPEN_MS
 }
 
-const MAX_EXPONENT = 32
+const MAX_EXPONENT = 15
 
 /**
  * Returns delay in milliseconds for reconnect attempt `attempt` (0-indexed).
@@ -53,7 +53,7 @@ const MAX_EXPONENT = 32
 export function reconnectBackoffDelayMs(attempt: number, options: ReconnectBackoffOptions = {}): number {
   const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS
   const capMs = options.capMs ?? DEFAULT_CAP_MS
-  const safeAttempt = Math.min(Math.max(0, Math.trunc(attempt)), 15)
+  const safeAttempt = Math.min(Math.max(0, Math.trunc(attempt)), MAX_EXPONENT)
 
   const ceiling = Math.min(capMs, baseDelayMs * 2 ** safeAttempt)
 
