@@ -684,7 +684,7 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
     return {"pull_requests": found, "scanned": wanted}
 
 
-@functools.partial(coalesced_read, thread_runner=lambda func: run_in_threadpool(func))
+@functools.partial(coalesced_read, thread_runner=lambda func: run_in_threadpool(func), timeout=10.0)
 def _read_profiles():
     from hermes_cli import profiles as profiles_mod
     try:
@@ -698,7 +698,12 @@ def _read_profiles():
 
 @router.get("/api/profiles")
 async def list_profiles_endpoint():
-    return await _read_profiles()
+    try:
+        return await _read_profiles()
+    except TimeoutError:
+        _log.warning("GET /api/profiles timed out after 10s; falling back to profile directory scan")
+        from hermes_cli import profiles as profiles_mod
+        return {"profiles": _fallback_profile_dicts(profiles_mod)}
 
 
 @router.post("/api/profiles")

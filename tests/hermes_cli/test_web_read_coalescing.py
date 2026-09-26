@@ -66,3 +66,43 @@ async def test_profiles_burst_leaves_threadpool_status_responsive(monkeypatch):
             assert all(r.json() == {"profiles": [{"name": "example"}]} for r in responses)
     finally:
         limiter.total_tokens = previous
+
+
+@async_test
+async def test_profiles_timeout_falls_back_cleanly(monkeypatch):
+    import time
+    import httpx
+    from fastapi import FastAPI
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.web_routers import profiles
+    from starlette.concurrency import run_in_threadpool
+
+    def hung_profiles(**_kwargs):
+        time.sleep(2)
+        return ["hung"]
+
+    monkeypatch.setattr(profiles_mod, "list_profiles", hung_profiles)
+    monkeypatch.setattr(profiles, "_fallback_profile_dicts", lambda _mod: [{"name": "fallback"}])
+    monkeypatch.setattr(profiles, "run_in_threadpool", run_in_threadpool)
+
+    # Wrap with small timeout for fast test execution
+    from hermes_cli.web_read_coalescing import coalesced_read
+    import functools
+    test_read = functools.partial(coalesced_read, thread_runner=lambda func: run_in_threadpool(func), timeout=0.05)(
+        profiles._read_profiles.__wrapped__
+    )
+    monkeypatch.setattr(profiles, "_read_profiles", test_read)
+
+    app = FastAPI()
+    app.include_router(profiles.router)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # First request times out and uses fallback
+        resp1 = await client.get("/api/profiles")
+        assert resp1.status_code == 200
+        assert resp1.json() == {"profiles": [{"name": "fallback"}]}
+
+        # Second request must not deadlock in coalesced_read
+        resp2 = await client.get("/api/profiles")
+        assert resp2.status_code == 200
+        assert resp2.json() == {"profiles": [{"name": "fallback"}]}

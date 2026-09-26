@@ -19,7 +19,7 @@ def _freeze(value):
     return (type(value), value)
 
 
-def coalesced_read(func, *, thread_runner=run_sync):
+def coalesced_read(func, *, thread_runner=run_sync, timeout=None):
     """Return an async, in-flight-only wrapper around a synchronous read.
 
     One worker per decorated function/event loop; identical home + bound
@@ -49,7 +49,10 @@ def coalesced_read(func, *, thread_runner=run_sync):
             async def execute():
                 try:
                     async with admission:
-                        return await thread_runner(partial(func, *args, **kwargs))
+                        coro = thread_runner(partial(func, *args, **kwargs))
+                        if timeout is not None:
+                            return await asyncio.wait_for(coro, timeout=timeout)
+                        return await coro
                 finally:
                     pending.pop(key, None)
                     if not pending:
