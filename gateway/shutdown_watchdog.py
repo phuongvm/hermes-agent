@@ -129,6 +129,14 @@ def start_loop_liveness_watchdog(
                     "stacks and exiting with code %d so the service supervisor can restart it.",
                     strikes, exit_code)
             try:
+                dump_path = get_shutdown_watchdog_dump_path()
+                dump_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(dump_path, "a", encoding="utf-8") as dump_file:
+                    dump_file.write(f"\n=== Loop liveness watchdog dump (strikes={strikes}, exit={exit_code}) ===\n")
+                    faulthandler.dump_traceback(file=dump_file, all_threads=True)
+            except Exception:
+                logger.debug("Loop liveness faulthandler dump to file failed", exc_info=True)
+            try:
                 faulthandler.dump_traceback(all_threads=True)
             except Exception:
                 logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
