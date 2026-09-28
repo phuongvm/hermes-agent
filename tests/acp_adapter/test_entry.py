@@ -4,7 +4,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-
 import acp
 import pytest
 
@@ -60,7 +59,7 @@ def test_prewarm_imports_run_agent(monkeypatch):
     assert imported_modules == ["run_agent"]
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_prewarm_loads_enabled_plugin_native_dependencies(tmp_path):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
@@ -111,7 +110,7 @@ def test_prewarm_loads_enabled_plugin_native_dependencies(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_main_prewarms_before_background_threads(monkeypatch):
     events = []
 
@@ -175,11 +174,24 @@ def test_main_setup_offers_browser_install_when_tty(monkeypatch):
 
 def test_main_setup_browser_propagates_browser_failure(monkeypatch):
     """If browser install fails, exit code is 1."""
-    def fake_ensure(dep, interactive=True):
-        return dep != "browser"  # browser fails
+    import pm
 
-    monkeypatch.setattr("hermes_cli.dep_ensure.ensure_dependency", fake_ensure)
+    def refuse(name, **kwargs):
+        raise pm.InstallError(name, "download failed")
+
+    monkeypatch.setattr(pm, "ensure", refuse)
 
     with pytest.raises(SystemExit) as excinfo:
         entry.main(["--setup-browser"])
     assert excinfo.value.code == 1
+
+
+def test_setup_browser_is_one_explicit_package_request(monkeypatch):
+    import pm
+
+    calls = []
+    monkeypatch.setattr(pm, "ensure", lambda name, **kwargs: calls.append((name, kwargs)))
+
+    entry.main(["--setup-browser", "--yes"])
+
+    assert calls == [("agent-browser", {"explicit": True})]

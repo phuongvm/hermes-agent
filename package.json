@@ -44,6 +44,9 @@
   },
   "overrides": {
     "@assistant-ui/tap": "0.9.8",
+    "@electron/osx-sign": {
+      "isbinaryfile": "5.0.7"
+    },
     "lodash": "4.18.1",
     "yauzl": "^3.3.1",
     "protobufjs": "^8.7.1",
@@ -75,6 +78,8 @@
     "get-windows@9.3.0": true
   },
   "dependencies": {
-    "@assistant-ui/tap": "0.9.8"
+    "@assistant-ui/tap": "0.9.8",
+    "js-yaml": "4.3.1",
+    "semver": "7.7.4"
   }
 }

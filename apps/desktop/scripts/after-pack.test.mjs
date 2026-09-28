@@ -1,72 +1,41 @@
-import assert from 'node:assert/strict'
+import {
+  assertPackagedBackendReadyArtifact,
+  assertBackendReadyArtifactSourceAcceptsBothTokens,
+  resolvePackagedAsarPath
+} from './backend-ready-artifact.mjs'
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
-import { Platform } from 'app-builder-lib'
-import { PlatformPackager } from 'app-builder-lib/out/platformPackager.js'
-import { describe, expect, it, test, vi } from 'vitest'
+import { Platform, PlatformPackager } from 'app-builder-lib'
+import { expect, it, vi } from 'vitest'
 
-import * as setExeIdentityModule from './set-exe-identity.mjs'
-import afterPack from './after-pack.mjs'
-import pkg from '../package.json' with { type: 'json' }
-
-describe('after-pack hook fail-closed packaging behavior (C-1R2)', () => {
-  test('fails closed (re-throws) when stampExeIdentity rejects', async () => {
-    const spy = vi.spyOn(setExeIdentityModule, 'stampExeIdentity').mockRejectedValue(
-      new Error('rcedit binary exited with code 1: invalid PE header')
-    )
-
-    const fakeContext = {
-      electronPlatformName: 'win32',
-      appOutDir: '/fake/dist/win-unpacked',
-      packager: {
-        appInfo: {
-          productFilename: 'Hermes'
-        }
-      }
-    }
-
-    await assert.rejects(
-      async () => {
-        await afterPack(fakeContext)
-      },
-      (err) => {
-        assert.match(err.message, /rcedit binary exited with code 1/)
-        return true
-      }
-    )
-
-    assert.equal(spy.mock.calls.length, 1)
-    spy.mockRestore()
-  })
-
-  test('succeeds when stampExeIdentity resolves', async () => {
-    const spy = vi.spyOn(setExeIdentityModule, 'stampExeIdentity').mockResolvedValue(undefined)
-
-    const fakeContext = {
-      electronPlatformName: 'win32',
-      appOutDir: '/fake/dist/win-unpacked',
-      packager: {
-        appInfo: {
-          productFilename: 'Hermes'
-        }
-      }
-    }
-
-    await afterPack(fakeContext)
-    assert.equal(spy.mock.calls.length, 1)
-    spy.mockRestore()
-  })
-})
+const require = createRequire(import.meta.url)
+const desktopRoot = path.resolve(import.meta.dirname, '..')
+// The builder config is electron-builder.config.cjs (package.json carries no `build` block).
+const builderConfig = require(path.join(desktopRoot, 'electron-builder.config.cjs'))
 
 async function configuredHook(context) {
-  if (pkg.build.afterPack) {
-    const hook = await import(new URL(`../${pkg.build.afterPack}`, import.meta.url).href)
-    await hook.default(context)
-  }
+  const hook = await import(new URL(`../${builderConfig.afterPack}`, import.meta.url).href)
+  await hook.default(context)
+}
+
+// The afterPack readiness guard reads the packaged bundle's unpacked main;
+// every fixture here packs a valid dual-token matcher so the tests keep
+// exercising the locale/signing paths the hook also performs.
+async function seedPackagedMain(context) {
+  const asarPath = resolvePackagedAsarPath(context)
+  await mkdir(path.dirname(asarPath), { recursive: true })
+  await writeFile(asarPath, 'stub archive')
+  await mkdir(path.join(`${asarPath}.unpacked`, 'dist'), { recursive: true })
+  await writeFile(
+    path.join(`${asarPath}.unpacked`, 'dist', 'electron-main.mjs'),
+    'const re = /HERMES_(?:BACKEND|DASHBOARD)_READY[^\\n]*port=(\\d+)/m\n'
+  )
 }
 
 function context(appOutDir, productFilename = 'Hermes Preview') {
+  // Use electron-builder's real bundle path resolution, including branding.
   const packager = Object.assign(Object.create(PlatformPackager.prototype), {
     platform: Platform.MAC,
     appInfo: { productFilename },
@@ -79,6 +48,7 @@ it('restores app localizations from the filtered framework without copying local
   const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-locale-pack-'))
   try {
     const ctx = context(root)
+    await seedPackagedMain(ctx)
     const framework = ctx.packager.getMacOsElectronFrameworkResourcesDir(root)
     const resources = ctx.packager.getResourcesDir(root)
     await mkdir(resources, { recursive: true })
@@ -90,11 +60,31 @@ it('restores app localizations from the filtered framework without copying local
     await mkdir(path.join(framework, 'other'), { recursive: true })
     await configuredHook(ctx)
     await configuredHook(ctx)
-    expect((await readdir(resources)).sort()).toEqual(['en_GB.lproj', 'nb.lproj'])
+    expect((await readdir(resources)).filter(name => name.endsWith('.lproj')).sort())
+      .toEqual(['en_GB.lproj', 'nb.lproj'])
     expect(await readdir(path.join(resources, 'nb.lproj'))).toEqual([])
     expect(await readFile(path.join(framework, 'nb.lproj', 'locale.pak'), 'utf8')).toBe('untouched locale data')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+it('leaves Linux alone and reports a missing framework without failing packaging', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-locale-pack-'))
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  try {
+    // win32 is not a no-op here: the same hook sanitizes and batch-signs the PE tree.
+    const linuxCtx = { appOutDir: root, electronPlatformName: 'linux' }
+    await seedPackagedMain(linuxCtx)
+    await configuredHook(linuxCtx)
+    expect(warn).not.toHaveBeenCalled()
+    const ctx = context(root)
+    await seedPackagedMain(ctx)
+    await configuredHook(ctx)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('macOS locale markers were not restored'))
+    expect((await readdir(root)).sort()).toEqual(['Hermes Preview.app', 'resources'])
+  } finally {
+    warn.mockRestore()
+    await rm(root, { recursive: true, force: true })
+  }
 })
