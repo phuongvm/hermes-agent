@@ -18,7 +18,21 @@ export function buildReconnectOwnerKey(key: ReconnectOwnerKey): string {
   return `${conn}::${endpoint}::${prof}::${win}::${owner}`
 }
 
-type GatewayReconnectHandler = () => Promise<void> | void
+export type GatewayReconnectSource = 'manual' | 'restart-followthrough'
+
+export interface GatewayReconnectOptions {
+  /**
+   * Why the reconnect is running. `'manual'` (default) is an explicit user
+   * recovery — the handler may unconditionally re-dial, including retrying a
+   * credential that requires sign-in. `'restart-followthrough'` is the
+   * automatic hand-off after a gateway restart: the socket often SURVIVED
+   * (the restart targets the messaging gateway, not this client's backend),
+   * so the handler probes first instead of force-closing a healthy socket.
+   */
+  source?: GatewayReconnectSource
+}
+
+type GatewayReconnectHandler = (options?: GatewayReconnectOptions) => Promise<void> | void
 
 const activeHandlers = new Map<string, GatewayReconnectHandler>()
 const inFlightPromises = new Map<string, Promise<void>>()
@@ -37,7 +51,8 @@ export function registerGatewayReconnect(
   }
 }
 
-export function reconnectGateway(key: ReconnectOwnerKey = {}): Promise<void> {
+export function reconnectGateway(options: GatewayReconnectOptions & ReconnectOwnerKey = {}): Promise<void> {
+  const key = options
   if (isTerminalSignedOut(key.basePath)) {
     const err = new Error('Authentication required (signed-out)')
     Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
@@ -56,7 +71,7 @@ export function reconnectGateway(key: ReconnectOwnerKey = {}): Promise<void> {
   }
 
   const promise = Promise.resolve()
-    .then(handler)
+    .then(() => handler({ source: options.source }))
     .finally(() => {
       if (inFlightPromises.get(ownerKey) === promise) {
         inFlightPromises.delete(ownerKey)

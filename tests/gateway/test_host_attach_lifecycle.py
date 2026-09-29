@@ -315,3 +315,22 @@ def test_probe_host_gateway_self_probe_does_not_dial_control_socket(tmp_path, mo
     assert owner.serves("coder")
     assert not dial_called
 
+
+def test_another_tenants_host_gateway_never_yields_attach_or_the_lock_refusal(tmp_path, monkeypatch, owner_pid):
+    """#121352: two Hermes roots on one host (one OS user) each expose a profile named ``default``.
+    Tenant A's live multiplexer serves A's ``default`` + ``coder``; tenant B's ``default`` must START,
+    not ATTACH (exit 0 with nothing running), and losing the per-OS-user host lock to A must not
+    refuse 75 (a race B can never win, so its gateway would never start)."""
+    root_a, root_b = tmp_path / "hermes-a", tmp_path / "hermes-b"
+    _publish(owner_pid, root_a, ("default", "coder"))
+    _answer_identify(monkeypatch, owner_pid, root_a, ["default", "coder"])
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: root_b)
+
+    assert host_attach.host_gateway_serving("default") is not None  # A's record is live and names default
+    assert host_attach.decide(root_b).outcome == host_attach.START
+    assert host_attach.decide(root_a / "profiles" / "coder").outcome == host_attach.ATTACH  # control: A's own
+
+    monkeypatch.setattr(hr, "claim_host_lock", lambda role: (hr.HostLockOutcome.HELD_BY_OTHER, None))
+    monkeypatch.setattr("gateway.control_socket.rescan_gateway_profiles",
+                        lambda *a, **k: pytest.fail("B must not ask A's gateway to rescan"))
+    gateway_run._claim_host_gateway_role()  # no SystemExit(75)

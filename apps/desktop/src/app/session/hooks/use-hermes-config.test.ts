@@ -20,6 +20,7 @@ import {
   setCurrentReasoningEffort,
   setDefaultReasoningEffort
 } from '@/store/session'
+import { $showToolActivity, setShowToolActivityFromConfig } from '@/store/tool-activity'
 
 import { deferred } from '../../../test/deferred'
 
@@ -45,6 +46,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
     $gatewayState.set('open')
     // Reset atoms and localStorage between tests
     setShowReasoningFromConfig(undefined)
+    setShowToolActivityFromConfig(undefined)
     setCurrentCwd('')
     setCurrentFastMode(false)
     setCurrentModelSource('')
@@ -71,6 +73,22 @@ describe('useHermesConfig refreshHermesConfig', () => {
       await result.current.refreshHermesConfig()
     })
     expect($showReasoning.get()).toBe(true)
+  })
+
+  it('mirrors display.tool_progress independently of show_reasoning', async () => {
+    mockConfig({ display: { show_reasoning: false, tool_progress: 'off' } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+    expect($showToolActivity.get()).toBe(false)
+
+    mockConfig({ display: { show_reasoning: false } })
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+    expect($showToolActivity.get()).toBe(true)
   })
 
   // Regression: the composer keeps a manual model pick sticky, which skips the

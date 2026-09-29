@@ -13,6 +13,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from gateway.config import PlatformConfig
+from agent.i18n import t
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 
 import httpx
@@ -30,7 +31,10 @@ def _parse_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
-_LIST_SECTIONS = (("Key decisions", "key_decisions"), ("Action items", "action_items"), ("Risks", "risks"))
+# (catalog key of the heading, payload attr); headings resolve through ``t()`` at render time.
+_LIST_SECTIONS = (("platform.teams.summary.key_decisions", "key_decisions"),
+                  ("platform.teams.summary.action_items", "action_items"),
+                  ("platform.teams.summary.risks", "risks"))
 # Env fallbacks for delivery config keys, applied only where nothing else set the key (access_token is a scoped secret).
 _ENV_KEYS = {"delivery_mode": "TEAMS_DELIVERY_MODE", "incoming_webhook_url": "TEAMS_INCOMING_WEBHOOK_URL",
              "access_token": "TEAMS_GRAPH_ACCESS_TOKEN", "team_id": "TEAMS_TEAM_ID", "channel_id": "TEAMS_CHANNEL_ID", "chat_id": "TEAMS_CHAT_ID"}
@@ -376,20 +380,10 @@ class TeamsSummaryWriter:
         )
 
     def _render_summary_markdown(self, payload: Any) -> str:
-        lines = [
-            f"**{self._title(payload)}**",
-            "",
-            f"Summary: {self._text(getattr(payload, 'summary', None), 'No summary available.')}",
-            "",
-            "Key decisions:",
-            *self._bullet_lines(getattr(payload, "key_decisions", None)),
-            "",
-            "Action items:",
-            *self._bullet_lines(getattr(payload, "action_items", None)),
-            "",
-            "Risks:",
-            *self._bullet_lines(getattr(payload, "risks", None)),
-        ]
+        summary = self._text(getattr(payload, "summary", None), t("platform.teams.summary.empty"))
+        lines = [f"**{self._title(payload)}**", "", t("platform.teams.summary.summary_line", summary=summary)]
+        for heading_key, attr in _LIST_SECTIONS:
+            lines += ["", f"{t(heading_key)}:", *self._bullet_lines(getattr(payload, attr, None))]
         return "\n".join(lines)
 
     def _render_summary_html(self, payload: Any) -> str:
@@ -398,24 +392,13 @@ class TeamsSummaryWriter:
         if rendered and isinstance(rendered, str) and rendered.strip():
             return rendered
 
-        # Fallback: hardcoded HTML renderer (original behavior)
-        sections = [
-            ("Summary", [self._text(getattr(payload, "summary", None), "No summary available.")]),
-            ("Key decisions", list(getattr(payload, "key_decisions", None) or [])),
-            ("Action items", list(getattr(payload, "action_items", None) or [])),
-            ("Risks", list(getattr(payload, "risks", None) or [])),
-        ]
-        blocks = [f"<h2>{html.escape(self._title(payload))}</h2>"]
-        for heading, items in sections:
-            blocks.append(f"<h3>{html.escape(heading)}</h3>")
-            if len(items) == 1 and heading == "Summary":
-                blocks.append(f"<p>{html.escape(str(items[0]))}</p>")
-                continue
-            if items:
-                rendered = "".join(f"<li>{html.escape(str(item))}</li>" for item in items if str(item).strip())
-                blocks.append(rendered and f"<ul>{rendered}</ul>" or "<p>None</p>")
-            else:
-                blocks.append("<p>None</p>")
+        summary = html.escape(self._text(getattr(payload, "summary", None), t("platform.teams.summary.empty")))
+        blocks = [f"<h2>{html.escape(self._title(payload))}</h2>",
+                  f"<h3>{html.escape(t('platform.teams.summary.heading'))}</h3>", f"<p>{summary}</p>"]
+        for heading_key, attr in _LIST_SECTIONS:
+            rendered = "".join(f"<li>{html.escape(str(item))}</li>" for item in (getattr(payload, attr, None) or []) if str(item).strip())
+            blocks += [f"<h3>{html.escape(t(heading_key))}</h3>",
+                       f"<ul>{rendered}</ul>" if rendered else f"<p>{html.escape(t('platform.teams.summary.none_item'))}</p>"]
         return "".join(blocks)
 
     @staticmethod
@@ -424,8 +407,8 @@ class TeamsSummaryWriter:
         if title:
             return str(title)
         meeting_ref = getattr(payload, "meeting_ref", None)
-        meeting_id = getattr(meeting_ref, "meeting_id", None) if meeting_ref else None
-        return f"Meeting {meeting_id or 'summary'}"
+        meeting_id = (getattr(meeting_ref, "meeting_id", None) if meeting_ref else None)
+        return t("platform.teams.summary.title", meeting_id=meeting_id or t("platform.teams.summary.title_fallback"))
 
     @staticmethod
     def _text(value: Any, default: str) -> str:

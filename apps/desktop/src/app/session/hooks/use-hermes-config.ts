@@ -19,6 +19,7 @@ import {
   setDefaultReasoningEffort,
   setIntroPersonality
 } from '@/store/session'
+import { setShowToolActivityFromConfig } from '@/store/tool-activity'
 import { refreshVoiceLiveStatus } from '@/store/voice-live'
 import {
   applyAutoSpeakFromConfig,
@@ -195,6 +196,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
         setDisplayTimestampsFromConfig(config.display?.timestamps)
         setShowReasoningFromConfig(config.display?.show_reasoning)
+        setShowToolActivityFromConfig(config.display?.tool_progress)
         setTerminalFontFamilyFromConfig(config.terminal?.font_family)
         setChatFontFamilyFromConfig(config.desktop?.font_family)
 
