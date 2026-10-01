@@ -54,8 +54,14 @@ class Finding:
 
 
 def _discover_venv() -> list[Component]:
-    """Every dist installed in the running Python's import path."""
+    """Every dist installed in the running Python's import path.
+
+    Hermes' own dist carries the committed 0.0.0 placeholder version, which
+    OSV matches against every historical advisory. Report the runtime release
+    version instead, or skip it when no release is known.
+    """
     from importlib.metadata import distributions
+    from hermes_cli.version_info import get_version_info
 
     out: dict[tuple[str, str], Component] = {}
     for dist in distributions():
@@ -64,6 +70,10 @@ def _discover_venv() -> list[Component]:
         except Exception:
             continue
         version = (dist.version or "").strip()
+        if name.lower() == "hermes-agent":
+            version = get_version_info().base_version
+            if version == "unknown":
+                continue
         if name and version:
             out.setdefault((name.lower(), version), Component(name=name, version=version, ecosystem="PyPI", source="venv"))
     return list(out.values())

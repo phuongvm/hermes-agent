@@ -92,10 +92,12 @@ dependencies = [
   # it out of the lazy-install path that exists only for the heavy matrix deps.
   "Markdown==3.10.2; python_version >= '3.14'",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
-  "PyJWT[crypto]==2.13.0; python_version >= '3.14'",  # PYSEC-2026-175/177/178/179
+  # 2.15.1: GHSA-ffc3-869f-jxw9 (critical), GHSA-42vr-xj54-vc7v, GHSA-gvp8-978c-rx2q and 2.14.0's set.
+  "PyJWT[crypto]==2.15.1; python_version >= '3.14'",  # PYSEC-2026-175/177/178/179, GHSA-ffc3-869f-jxw9
   # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)
-  # and GHSA-qccp-gfcp-xxvc (header leak across origins).
-  "urllib3>=2.7.0,<3; python_version >= '3.14'",
+  # and GHSA-qccp-gfcp-xxvc (header leak across origins). 2.8.0 fixes
+  # GHSA-8988-9cw3-xx77, GHSA-vxq7-64xx-v4gw and GHSA-gh4c-6fx4-qh6g.
+  "urllib3>=2.8.0,<3; python_version >= '3.14'",
   # PyJWT[crypto] pulls cryptography in transitively. Pin it here as well, so
   # that the WeCom and Weixin crypto paths cannot fall below the patched
   # version. 50.0.0 is the floor: it fixes CVE-2026-69247, a Bleichenbacher
@@ -451,7 +453,8 @@ azure-identity = ["azure-identity==1.25.3"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.8",
-  "tornado==6.5.8",
+  # 6.5.9+: GHSA-c2m8-h5v5-343r, GHSA-chx6-46f5-w4vp, GHSA-3hv7-mjh2-fv65.
+  "tornado==6.5.10",
   "hermes-agent[cron]",
   "hermes-agent[mcp]",
   "hermes-agent[honcho]",
@@ -644,6 +647,11 @@ override-dependencies = [
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
 ]
+# oauthlib arrives only through google-auth-oauthlib -> requests-oauthlib
+# (>=3.0.0). 4.0.0 fixes GHSA-hj66-6f7g-4r5v and GHSA-xpv3-w29h-x7cv; its two
+# breaking changes are server-side (revocation JSONP, grant validation order),
+# and Hermes only runs client flows.
+constraint-dependencies = ["oauthlib>=4.0.0"]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
 # request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
@@ -753,6 +761,7 @@ modal = false
 nemo-relay = false
 neutts = "2026-07-22T14:54:23Z"
 numpy = false
+oauthlib = false
 openai = false
 opentelemetry-exporter-otlp-proto-http = false
 opentelemetry-sdk = false

@@ -50,6 +50,35 @@ class TestMCPComponentExtraction:
         assert sa._extract_mcp_component("x", "npx", []) is None
 
 
+# ─── Venv discovery ───────────────────────────────────────────────────────────
+
+
+class _FakeDist:
+    def __init__(self, name: str, version: str):
+        self.metadata = {"Name": name}
+        self.version = version
+
+
+class TestVenvDiscovery:
+    """The committed hermes-agent version is a 0.0.0 placeholder; OSV must see the real one."""
+
+    def _discover(self, monkeypatch, base_version: str):
+        from types import SimpleNamespace
+        import importlib.metadata
+        import hermes_cli.version_info as vi
+
+        dists = [_FakeDist("hermes-agent", "0.0.0"), _FakeDist("requests", "2.20.0")]
+        monkeypatch.setattr(importlib.metadata, "distributions", lambda: dists)
+        monkeypatch.setattr(vi, "get_version_info", lambda: SimpleNamespace(base_version=base_version))
+        return {c.name: c.version for c in sa._discover_venv()}
+
+    def test_self_reported_with_runtime_release_version(self, monkeypatch):
+        assert self._discover(monkeypatch, "0.21.5") == {"hermes-agent": "0.21.5", "requests": "2.20.0"}
+
+    def test_self_skipped_when_release_unknown(self, monkeypatch):
+        assert self._discover(monkeypatch, "unknown") == {"requests": "2.20.0"}
+
+
 # ─── Plugin discovery ─────────────────────────────────────────────────────────
 
 
