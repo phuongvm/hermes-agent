@@ -18,6 +18,7 @@ export function buildSourceDesktop({ source = repoRoot, icons, run = execFileSyn
     cpSync(join(icons, 'apps/desktop/assets'), join(app, 'assets'), { recursive: true })
   }
   step('apps/desktop/scripts/write-build-stamp.mjs')
+  step('apps/desktop/scripts/stage-gateway-connection.mjs')
   // locales/_keys.desktop.json is a committed artifact (i18n-keys.test.mjs pins it to en.ts);
   // the build must not write into the checkout — a dirty tree breaks `hermes update`.
   step('apps/desktop/scripts/stage-native-deps.mjs')

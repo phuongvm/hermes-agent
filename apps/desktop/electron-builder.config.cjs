@@ -217,8 +217,17 @@ module.exports = {
   win: {
     executableName: windowsExecutableName,
     legalTrademarks: displayName,
-    target: ['msix'],
+    target: ['msix', 'nsis'],
     ...windowsSigning()
+  },
+  nsis: {
+    include: 'resources/installer.nsh',
+    oneClick: false,
+    allowToChangeInstallationDirectory: true,
+    perMachine: false,
+    shortcutName: displayName,
+    uninstallDisplayName: displayName,
+    warningsAsErrors: false
   },
   msix: {
     // A store build uses the Partner Center packaging identity (the Store
