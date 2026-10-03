@@ -101,6 +101,12 @@ def _prewarm_agent_runtime() -> None:
     loader-lock deadlock with ACP's blocking stdin feeder thread.
     """
     importlib.import_module("run_agent")
+    if getattr(importlib.import_module, "__name__", "") == "import_module":
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            get_plugin_manager().discover_and_load()
+        except Exception:
+            pass
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

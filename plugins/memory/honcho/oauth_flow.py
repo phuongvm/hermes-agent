@@ -48,8 +48,8 @@ def _display_config_path(path: object) -> str:
     """Home-relative display string for the consent screen (never the write path); outside ``$HOME``, the bare name."""
     p = Path(str(path))
     try:
-        return "~/" + str(p.relative_to(Path.home()))
-    except ValueError:
+        return "~/" + p.relative_to(Path.home()).as_posix()
+    except (ValueError, RuntimeError):
         return p.name
 
 @dataclass(frozen=True)

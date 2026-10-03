@@ -53,9 +53,16 @@ def _get_platform_default_hermes_home() -> Path:
     suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        try:
+            home = Path.home()
+        except RuntimeError:
+            home = Path("C:/Users/Default")
+        base = Path(local_appdata) if local_appdata else home / "AppData" / "Local"
         return base / ("hermes" + suffix)
-    return Path.home() / (".hermes" + suffix)
+    try:
+        return Path.home() / (".hermes" + suffix)
+    except RuntimeError:
+        return Path("/tmp/.hermes" + suffix)
 
 
 def sudo_invoker_default_home() -> Path | None:

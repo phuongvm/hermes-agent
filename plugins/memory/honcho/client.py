@@ -14,6 +14,7 @@ import ipaddress
 import json
 import logging
 import os
+import sys
 import threading as _threading
 import time
 import weakref
@@ -102,7 +103,11 @@ def _read_config(path: Path) -> dict:
 
 def resolve_global_config_path() -> Path:
     """Return the shared Honcho config path for the current HOME."""
-    return Path.home() / ".honcho" / "config.json"
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = Path("C:/Users/Default") if sys.platform == "win32" else Path("/tmp")
+    return home / ".honcho" / "config.json"
 
 
 def resolve_config_path() -> Path:
