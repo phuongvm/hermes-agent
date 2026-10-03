@@ -75,6 +75,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
     const connection = (getApiRequestConnection() ?? '').trim()
     const profile = normalizeProfileKey(getApiRequestProfile() ?? $activeGatewayProfile.get())
     const generation = getProfileFetchGeneration()
+
     return {
       connection,
       profile,
@@ -227,6 +228,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
   useEffect(() => {
     return registerResumeSyncHandler(baseUrl => {
       const currentBaseUrl = normalizeBaseUrl(getApiRequestConnection() ?? '')
+
       if ((!currentBaseUrl || currentBaseUrl === normalizeBaseUrl(baseUrl)) && isGatewayOpen()) {
         void refreshHermesConfig(true)
       }

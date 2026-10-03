@@ -6,7 +6,6 @@ import {
   getQueuedReauthConnections,
   isReauthModalActive,
   ReauthModalLatch,
-  reauthModalLatch,
   resetReauthModalLatch,
   triggerReauth
 } from './reauth-modal-latch'
@@ -36,6 +35,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
 
     const openModal = vi.fn().mockImplementation(() => {
       modalCallCount += 1
+
       return modalPromise
     })
 
@@ -70,6 +70,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
 
   it('successful reauth resolves auth state for all queued/waiting connections', async () => {
     let resolveModal: (val: any) => void
+
     const openModal = vi.fn().mockImplementation(
       () =>
         new Promise(resolve => {
@@ -126,6 +127,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
 
     const openModal = vi.fn().mockImplementation(() => {
       modalCallCount += 1
+
       return new Promise((_resolve, reject) => {
         rejectModal = reject
       })
@@ -174,10 +176,13 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
 
     const openModal1 = vi.fn().mockImplementation(async () => {
       modalCallCount += 1
+
       return { ok: true, connected: true }
     })
+
     const openModal2 = vi.fn().mockImplementation(async () => {
       modalCallCount += 1
+
       return { ok: true, connected: true }
     })
 
@@ -195,6 +200,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
     assert.equal(isReauthModalActive(), false)
 
     let resolveModal: (val: any) => void
+
     const p1 = triggerReauth(
       'conn:default::a',
       () =>
@@ -202,6 +208,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
           resolveModal = r
         })
     )
+
     const p2 = triggerReauth('conn:default::b', async () => ({ ok: true }))
 
     assert.equal(isReauthModalActive(), true)
@@ -240,6 +247,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
 
     const pB = latch.triggerReauth('https://b.invalid', async () => {
       loginBCalls += 1
+
       return { ok: true, connected: true, baseUrl: 'https://b.invalid' }
     })
 
@@ -285,6 +293,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
           finishModal = resolve
         })
     )
+
     const second = latch.triggerReauth('conn:alpha::2', async () => ({ ok: true, connected: true }))
 
     finishModal!({ ok: true, connected: true })
@@ -323,6 +332,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
     })
 
     let resolveFirst: (val: any) => void
+
     const p1 = latch.triggerReauth(
       'conn:fail::1',
       () =>
@@ -330,6 +340,7 @@ describe('ReauthModalLatch (Singleton Process-Wide Latch)', () => {
           resolveFirst = resolve
         })
     )
+
     const p2 = latch.triggerReauth('conn:fail::2', async () => ({ ok: true, connected: true }))
     const p3 = latch.triggerReauth('conn:other::1', async () => ({ ok: true, connected: true, other: true }))
 
