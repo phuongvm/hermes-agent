@@ -9,6 +9,7 @@ vi.mock('@/store/profile', () => ({ refreshActiveProfile }))
 
 import { setTerminalSignedOut } from '@/store/auth-terminal-state'
 import { $gatewayState } from '@/store/session'
+
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
 describe('useProfileRailRefreshOnActive', () => {

@@ -390,12 +390,6 @@ import {
 import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { isMediaCapturePermission } from './media-capture-permission'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
-import {
-  executeWithNativeBearerSingleReplay,
-  oauthSessionIsLive,
-  resolveJsonBody,
-  resolveReadinessProbeAuth
-} from './native-auth-decisions'
 import { fetchLocalMedia } from './media-range'
 import { createMinimizeToTray } from './minimize-to-tray'
 import {
@@ -403,6 +397,12 @@ import {
   type NativeAccessTokenOptions,
   NativeAuthChangedError
 } from './native-access-token'
+import {
+  executeWithNativeBearerSingleReplay,
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -514,13 +514,13 @@ import {
   quitPromptFor,
   shouldGuardWindowClose
 } from './quit-guard'
-import { reauthModalLatch } from './reauth-modal-latch'
 import {
   backendQuitNeedsWait,
   backendTeardownOptions,
   createQuitTeardownCoordinator,
   type QuitTeardownTask
 } from './quit-teardown'
+import { reauthModalLatch } from './reauth-modal-latch'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
@@ -548,9 +548,9 @@ import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle
 import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
-import { loadInstallStamp as loadInstallStampInternal, resolveHermesVersionLadder } from './runtime-version'
 import { fetchRosterSourceData } from './roster-source-fetch'
 import { rosterSourceStatus } from './roster-source-status'
+import { resolveHermesVersionLadder } from './runtime-version'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -6466,6 +6466,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
 // that is not that exact case surfaces unchanged.
 async function waitForRemoteHermes(remote) {
   const previousGatewayState = getEndpointConnectionState(remote.baseUrl)
+
   try {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers, {
       previousGatewayState
@@ -16903,6 +16904,7 @@ async function fetchJsonForBackend(
         Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
         throw err
       }
+
       // The OAuth cookie path rides electron.net with JSON headers; multipart
       // isn't wired there. Fail loudly rather than corrupting the upload.
       if (opts.upload) {
@@ -16944,16 +16946,19 @@ async function fetchJsonForBackend(
       if (path.startsWith('/api/audio/voice-live/status')) {
         return { ok: true, available: false, mode: 'chained', reason: 'Endpoint not supported on remote backend' }
       }
+
       if (path.includes('/timeline')) {
         return { session_id: '', profile: '', entries: [], pagination: { limit: 500, offset: 0, has_more: false, next_cursor: null } }
       }
     }
+
     throw error
   }
 }
 
 reauthModalLatch.setAuthStateResolver(async (connectionKey, _outcome) => {
   rememberLog(`[reauth] connection ${connectionKey} authenticated; revalidating pool`)
+
   try {
     await revalidatePool()
   } catch (error) {
