@@ -60,6 +60,10 @@ class PluginRegistration:
 
 
 class PluginLedgerMixin:
+    _ownership_ledger: dict[str, list[PluginRegistration]]
+    _registration_order: list[PluginRegistration]
+    _persistent_carryover: list[PluginRegistration]
+
     def _track_registration(
         self, manifest: PluginManifest, kind: str, key: str, release: Callable[[], None], *,
         persistent: bool = False,
@@ -108,8 +112,22 @@ class PluginLedgerMixin:
         """
         if not self._persistent_carryover:
             return
+        from hermes_constants import get_process_hermes_home, hermes_home_key, get_hermes_home_override
+        launch_scope = hermes_home_key(get_process_hermes_home())
+        is_scoped = (get_hermes_home_override() is not None) or (getattr(self, "scope_key", None) != launch_scope)
+
         parked, self._persistent_carryover = self._persistent_carryover, []
         current = {(r.kind, r.key) for r in self._active_persistent()}
+
+        if is_scoped:
+            # A profile/request-scoped discovery pass cannot re-register host-owned persistent
+            # registrations (they are rejected by host ownership guards). Preserve active parked
+            # registrations back into the ledger so future sweeps retain them.
+            for r in parked:
+                if r.active and (r.kind, r.key) not in current:
+                    self._ownership_ledger.setdefault(r.plugin_key, []).append(r)
+            return
+
         stale = [r for r in parked if r.active and (r.kind, r.key) not in current]
         for registration in stale:
             logger.info(
