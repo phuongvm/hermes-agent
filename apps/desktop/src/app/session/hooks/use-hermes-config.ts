@@ -3,6 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 
 import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getApiRequestConnection, getApiRequestProfile, getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
+import { composerServiceTier } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import { isTerminalSignedOut, normalizeBaseUrl, registerResumeSyncHandler } from '@/store/auth-terminal-state'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
@@ -32,7 +33,6 @@ import {
 import { setChatFontFamilyFromConfig } from '@/themes/chat-font'
 
 const DEFAULT_VOICE_SECONDS = 120
-const FAST_TIERS = new Set(['fast', 'priority', 'on'])
 
 function recordingLimit(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : DEFAULT_VOICE_SECONDS
@@ -152,7 +152,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         ])
 
         const reasoning = normalizeConfigEffort(config.agent?.reasoning_effort)
-        const tier = (config.agent?.service_tier ?? '').trim()
+        const tier = composerServiceTier(config.agent?.service_tier)
 
         // Publish the profile default regardless of whether the composer is
         // reseeded below: picker rows and preset application resolve "the
@@ -175,14 +175,13 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
           }
 
           setCurrentReasoningEffort(reasoning)
-          setCurrentFastMode(FAST_TIERS.has(tier.toLowerCase()))
+          setCurrentFastMode(tier === 'priority' || tier === 'ultrafast')
+          setCurrentServiceTier(tier)
         }
 
         if (!canPublish()) {
           return
         }
-
-        setCurrentServiceTier(prev => (activeSessionIdRef.current ? prev : tier))
 
         if (!canPublish()) {
           return

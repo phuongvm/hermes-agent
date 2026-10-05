@@ -16,6 +16,7 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 
 import hashlib
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -554,6 +555,7 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "old"}}}))
         sig_old = provider.identity_signature()["workspace"]
+        time.sleep(0.02)
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
         sig_new = provider.identity_signature()["workspace"]
 

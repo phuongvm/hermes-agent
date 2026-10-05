@@ -57,7 +57,9 @@ _ENV_VARS = (
     "BUZZ_AUTH_TAG",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
-    "BUZZ_AUTH_TAG",
+    "BUZZ_REPLY_TO_MODE",
+    "BUZZ_REPLY_IN_THREAD",
+    "BUZZ_REQUIRE_MENTION",
 )
 
 @pytest.fixture(autouse=True)
