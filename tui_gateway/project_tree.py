@@ -85,11 +85,21 @@ def _path_key(path: str) -> str:
 
 def _lane_key(path_or_lane: str) -> str:
     """Canonicalize only the path portion of a lane id (branch labels stay byte-preserved)."""
-    marker = next((m for m in ("::branch::", "::kanban") if m in path_or_lane), None)
+    marker = next((m for m in ("::branch::", "::kanban", "::folder::") if m in path_or_lane), None)
     if marker is None:
         return _path_key(path_or_lane)
     root, suffix = path_or_lane.split(marker, 1)
     return f"{_path_key(root)}{marker}{suffix}"
+
+
+def _folder_lane_id(repo_root: str, folder_name: str) -> str:
+    return f"{repo_root}::folder::{folder_name}"
+
+
+def _folder_placement(repo_root: str, folder_path: str, folder_name: str) -> dict:
+    return _placement(
+        repo_root, _folder_lane_id(repo_root, folder_name), f"folder: {folder_name}",
+        folder_path, is_main=False, is_kanban=False, is_git=False)
 
 
 def base_name(path: str) -> str:
@@ -175,12 +185,30 @@ def _place_by_heuristic(path: str) -> Optional[dict]:
     return _placement(path, _branch_lane_id(path, DEFAULT_BRANCH_LABEL), base, path, True, False, is_git=False)
 
 
+def _subfolder_under(cwd: str, root: str) -> Optional[tuple[str, str]]:
+    """If cwd is a subfolder of root (and not root itself or internal .git/.worktrees),
+    return (folder_path, subfolder_name)."""
+    cwd_segs = _comparison_segments(cwd)
+    root_segs = _comparison_segments(root)
+    if len(cwd_segs) > len(root_segs) and cwd_segs[:len(root_segs)] == root_segs:
+        raw_segs = _segments(cwd)
+        subfolder = raw_segs[len(root_segs)]
+        if subfolder not in (".git", ".worktrees"):
+            folder_path = (cwd.rstrip("/\\") if len(raw_segs) == len(root_segs) + 1
+                           else "/".join(raw_segs[:len(root_segs) + 1]))
+            return folder_path, subfolder
+    return None
+
+
 def _place(
         cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: str) -> Optional[dict]:
     info = resolve(cwd) if resolve else None
     if info and info.get("repo_root") and info.get("worktree_root"):
         repo_root, worktree_root = info["repo_root"], info["worktree_root"]
         if _path_key(worktree_root) == _path_key(repo_root) or info.get("is_main"):
+            sub = _subfolder_under(cwd, repo_root)
+            if sub:
+                return _folder_placement(repo_root, sub[0], sub[1])
             return _trunk_placement(repo_root, branch)
         kanban_dir = kanban_worktree_dir(worktree_root)
         if kanban_dir:
@@ -433,6 +461,17 @@ def build_tree(
         owner = _project_for_session(session, folder_index, resolve)
         (by_project.setdefault(owner["id"], []) if owner else unowned).append(session)
 
+    # Absorb unowned sessions whose auto_root belongs to an explicit project!
+    by_auto_root, homeless = _auto_buckets(unowned, resolve, _junk, _junk_cwd, _exists)
+    still_auto_buckets: dict[str, dict] = {}
+    for auto_key, bucket in by_auto_root.items():
+        auto_root, auto_sessions = bucket["root"], bucket["sessions"]
+        owner = folder_index.match(auto_root)[0]
+        if owner:
+            by_project.setdefault(owner["id"], []).extend(auto_sessions)
+        else:
+            still_auto_buckets[auto_key] = bucket
+
     scoped_ids: list[str] = []
     result: list[dict] = []
 
@@ -454,12 +493,24 @@ def build_tree(
             len(psessions), _last_active(psessions), _previews(psessions), psessions,
             color=project.get("color"), icon=project.get("icon")))
 
+    # Pre-populate seen with all explicit project folders and primary paths!
+    seen: set[str] = {
+        _path_key(f["path"])
+        for p in active_projects
+        for f in p.get("folders") or []
+        if f.get("path")
+    } | {
+        _path_key(p["primary_path"])
+        for p in active_projects
+        if p.get("primary_path")
+    }
+
     # Tier 2: auto projects from leftover sessions.
-    by_auto_root, homeless = _auto_buckets(unowned, resolve, _junk, _junk_cwd, _exists)
-    seen: set[str] = set()
-    for bucket in by_auto_root.values():
+    for bucket in still_auto_buckets.values():
         auto_root, auto_sessions = bucket["root"], bucket["sessions"]
         auto_key = _path_key(auto_root)
+        if auto_key in seen:
+            continue
         repos = _build_repos(auto_sessions, resolve, hydrate)
         repo_node = next(
             (r for r in repos if _path_key(r.get("id") or r.get("path") or "") == auto_key), None)
@@ -490,7 +541,11 @@ def build_tree(
             float(repo.get("last_active") or 0), [], isAuto=True))
 
     # Auto-project basename labels can collide; explicit projects keep their user-chosen names.
-    _disambiguate_labels([p for p in result if p.get("isAuto")])
+    explicit_labels = {id(p): p["label"] for p in result if not p.get("isAuto")}
+    _disambiguate_labels(result)
+    for p in result:
+        if id(p) in explicit_labels:
+            p["label"] = explicit_labels[id(p)]
 
     # Tier 0: whatever the tiers above could not place. Leads the list; omitted when empty.
     if homeless:

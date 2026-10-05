@@ -738,3 +738,61 @@ def test_cwdless_session_with_repo_root_stays_in_its_explicit_project():
     assert owned["id"] in explicit["sessionIds"]
     assert owned["id"] in [s["id"] for s in _sessions_of(explicit)]
     assert _home_session_ids(tree) == [detached["id"]]
+
+
+def test_auto_project_absorbed_into_explicit_project():
+    """An unowned session whose auto_root matches an explicit project folder
+    must be absorbed into the explicit project rather than creating a duplicate auto-project."""
+    project = _project("p_ws", "workspaces", ["/workspaces"])
+    resolve = _resolver({
+        "/workspaces": ("/workspaces", "/workspaces"),
+        "/workspaces/docker-compose": ("/workspaces", "/workspaces"),
+    })
+    # One session in root, one in subfolder
+    s1 = _session("/workspaces", branch="main")
+    s2 = _session("/workspaces/docker-compose", branch="main")
+
+    tree = pt.build_tree([project], [s1, s2], [], resolve=resolve, hydrate=True)
+
+    # Must contain ONLY the explicit project p_ws, no duplicate auto-project
+    real_ids = _real_project_ids(tree)
+    assert real_ids == ["p_ws"]
+    p_ws = next(p for p in tree["projects"] if p["id"] == "p_ws")
+    assert p_ws["isAuto"] is False
+    assert len(_sessions_of(p_ws)) == 2
+
+
+def test_subfolder_synthesizes_non_git_lane():
+    """A session in a non-git subfolder under a repository root synthesizes a dedicated folder lane."""
+    resolve = _resolver({
+        "/repo": ("/repo", "/repo"),
+        "/repo/docker-compose": ("/repo", "/repo"),
+    })
+    s_sub = _session("/repo/docker-compose", branch="main")
+
+    tree = pt.build_tree([], [s_sub], [], resolve=resolve, hydrate=True)
+
+    project = next(p for p in tree["projects"] if p["id"] == "/repo")
+    lane_ids = _lane_ids(project)
+    assert "/repo::folder::docker-compose" in lane_ids
+    folder_lane = next(g for repo in project["repos"] for g in repo["groups"] if g["id"] == "/repo::folder::docker-compose")
+    assert folder_lane["label"] == "folder: docker-compose"
+    assert folder_lane["isMain"] is False
+    assert folder_lane["isGit"] is False
+
+
+def test_discovered_repo_suppressed_when_inside_explicit_project():
+    """Discovered repos that fall under an explicit project folder are suppressed from Tier 3."""
+    project = _project("p_ws", "workspaces", ["/workspaces"])
+    discovered = [{"root": "/workspaces", "label": "workspaces"}, {"root": "/workspaces/oss/buzz", "label": "buzz"}]
+    resolve = _resolver({
+        "/workspaces": ("/workspaces", "/workspaces"),
+        "/workspaces/oss/buzz": ("/workspaces/oss/buzz", "/workspaces/oss/buzz"),
+    })
+
+    tree = pt.build_tree([project], [], discovered, resolve=resolve, hydrate=True)
+
+    # Neither /workspaces nor /workspaces/oss/buzz should become separate auto-projects
+    real_ids = _real_project_ids(tree)
+    assert real_ids == ["p_ws"]
+

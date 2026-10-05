@@ -476,6 +476,19 @@ export function liveSessionProjectId(
     return projectId
   }
 
+  // Absorb: check if repoRoot itself falls under any explicit project folder before falling back to auto-project
+  for (const project of explicitProjects) {
+    if (project.archived) {
+      continue
+    }
+
+    for (const folder of project.folders) {
+      if (isPathUnder(folder.path, repoRoot) || isPathUnder(repoRoot, folder.path)) {
+        return project.id
+      }
+    }
+  }
+
   // AUTO-project fallback (the repo root itself): with a cwd present it must
   // sit under the repo root (a sibling worktree outside the root can't be
   // placed from the row alone); a root-only session skips this — the root IS

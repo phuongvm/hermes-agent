@@ -650,19 +650,38 @@ def get_profiles_sessions_sidebar(
     return body
 
 
+def _canon_path_key(val: Optional[str]) -> str:
+    if not val:
+        return ""
+    from tui_gateway.project_tree import _path_key
+    return _path_key(val)
+
+
+def _is_subpath_of(sub: str, parent: str) -> bool:
+    from tui_gateway.project_tree import _comparison_segments
+    s = _comparison_segments(sub)
+    p = _comparison_segments(parent)
+    return len(s) >= len(p) and s[:len(p)] == p
+
+
 def _merge_by_id(into: Dict[str, Dict[str, Any]], entries: List[Dict[str, Any]], child_key: str) -> None:
     """Fold ``entries`` into ``into`` by id, recursing through one child list (repos merge
     their lanes, lanes merge their sessions). Counts add up; everything else is
     first-writer, since the entries describe the same path either way."""
     for entry in entries:
-        existing = into.get(entry["id"])
+        raw_id = entry.get("id") or ""
+        key = _canon_path_key(raw_id) if (entry.get("path") or "/" in raw_id or "\\" in raw_id or ":" in raw_id) else raw_id
+        existing = into.get(key)
         if existing is None:
-            into[entry["id"]] = entry
+            into[key] = entry
             continue
         if child_key == "sessions":
             existing["sessions"].extend(entry.get("sessions") or [])
         else:
-            children: Dict[str, Dict[str, Any]] = {c["id"]: c for c in existing.get(child_key) or []}
+            children: Dict[str, Dict[str, Any]] = {
+                (_canon_path_key(c["id"]) if (c.get("path") or "/" in c.get("id", "") or "\\" in c.get("id", "")) else c["id"]): c
+                for c in existing.get(child_key) or []
+            }
             _merge_by_id(children, entry.get(child_key) or [], "sessions")
             existing[child_key] = list(children.values())
         if "sessionCount" in existing:
@@ -684,8 +703,15 @@ def _merge_profile_tree(
             session["profile"] = profile
             session["is_default_profile"] = profile == "default"
 
-        key = project.get("path") or project["id"]
+        path = project.get("path")
+        key = _canon_path_key(path) if path else project["id"]
         existing = merged.get(key)
+        if existing is None and project.get("isAuto") and path:
+            target_key = next((k for k, p in merged.items() if not p.get("isAuto") and p.get("path") and _is_subpath_of(path, p["path"])), None)
+            if target_key:
+                key = target_key
+                existing = merged[key]
+
         if existing is None:
             merged[key] = project
             continue
@@ -696,7 +722,10 @@ def _merge_profile_tree(
             existing, project = project, existing
             merged[key] = existing
 
-        repos: Dict[str, Dict[str, Any]] = {r["id"]: r for r in existing.get("repos") or []}
+        repos: Dict[str, Dict[str, Any]] = {
+            (_canon_path_key(r["id"]) if (r.get("path") or "/" in r.get("id", "") or "\\" in r.get("id", "")) else r["id"]): r
+            for r in existing.get("repos") or []
+        }
         _merge_by_id(repos, project.get("repos") or [], "groups")
         existing["repos"] = list(repos.values())
         for total_key in ("sessionCount", "totalTokens", "totalCostUsd"):
