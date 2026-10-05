@@ -54,9 +54,11 @@ export function extractAuthOrigin(connectionKey: string): string {
   } catch {
     // fall through
   }
+
   if (connectionKey.includes('::')) {
     return connectionKey.split('::')[0].trim().toLowerCase()
   }
+
   return connectionKey.trim().toLowerCase()
 }
 
@@ -106,6 +108,7 @@ export class ReauthModalLatch {
    */
   getAuthState(connectionKey: string): ConnectionAuthState | undefined {
     const state = this.#authStates.get(connectionKey)
+
     return state ? { ...state } : undefined
   }
 
@@ -117,12 +120,15 @@ export class ReauthModalLatch {
       connectionKey,
       status: 'unauthenticated'
     }
+
     const updated: ConnectionAuthState = {
       ...existing,
       ...state,
       connectionKey
     }
+
     this.#authStates.set(connectionKey, updated)
+
     return { ...updated }
   }
 
@@ -169,6 +175,7 @@ export class ReauthModalLatch {
     openModal: () => Promise<T>
   ): Promise<T> {
     let modalPromise: Promise<T>
+
     try {
       modalPromise = openModal()
     } catch (err) {
@@ -205,6 +212,7 @@ export class ReauthModalLatch {
             remainingQueue.push(item)
           }
         }
+
         this.#waitingQueue = remainingQueue
 
         for (const item of compatibleWaiters) {
@@ -251,6 +259,7 @@ export class ReauthModalLatch {
             remainingQueue.push(item)
           }
         }
+
         this.#waitingQueue = remainingQueue
 
         for (const item of compatibleWaiters) {
@@ -280,6 +289,7 @@ export class ReauthModalLatch {
           remainingQueue.push(item)
         }
       }
+
       this.#waitingQueue = remainingQueue
 
       for (const item of compatibleWaiters) {
@@ -320,9 +330,11 @@ export class ReauthModalLatch {
   reset(): void {
     const queue = [...this.#waitingQueue]
     this.#waitingQueue = []
+
     for (const item of queue) {
       item.reject(new Error('Reauth latch reset'))
     }
+
     this.#activeModal = null
     this.#authStates.clear()
     this.#authStateResolver = undefined
