@@ -78,6 +78,10 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
     for name in ("transcript.txt", "status.json"):
         with contextlib.suppress(OSError):
             (out / name).unlink()
+    if not auth_state:
+        default_auth = _root() / "auth.json"
+        if default_auth.is_file():
+            auth_state = str(default_auth)
     env = {**os.environ, "HERMES_MEET_URL": url, "HERMES_MEET_OUT_DIR": str(out),
            "HERMES_MEET_GUEST_NAME": guest_name}
     for value, var in (

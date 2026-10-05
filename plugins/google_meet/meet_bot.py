@@ -110,6 +110,8 @@ _CAPTION_OBSERVER_JS = r"""
   window.__hermesMeetQueue = [];
 
   const captionSelector = '[role="region"][aria-label*="aption" i], ' +
+                          '[role="region"][aria-label*="phụ đề" i], ' +
+                          'div.vNKgIf, ' +
                           'div[jsname="YSxPC"], ' +  // legacy
                           'div[jsname="tgaKEf"]';    // current (Apr 2026)
 
@@ -146,13 +148,28 @@ _CAPTION_OBSERVER_JS = r"""
     return true;
   }
 
+  function scanChat() {
+    for (const msgEl of document.querySelectorAll('div[data-message-text], div[jsname="YBNBfd"], div[class*="message" i]')) {
+      if (msgEl.__hermesSeen) continue;
+      msgEl.__hermesSeen = true;
+      const text = (msgEl.getAttribute('data-message-text') || msgEl.innerText || '').trim();
+      if (!text) continue;
+      const parent = msgEl.closest('[data-sender-name]');
+      const sender = parent ? (parent.getAttribute('data-sender-name') || '').trim() : '';
+      pushEntry(sender ? `${sender} (chat)` : 'Chat', text);
+    }
+  }
+
   // Retry on interval — the caption region only appears after captions are
   // enabled and someone speaks.
   if (!attach()) {
-    const iv = setInterval(() => { if (attach()) clearInterval(iv); }, 1500);
+    const iv = setInterval(() => { if (attach()) clearInterval(iv); scanChat(); }, 1500);
+  } else {
+    setInterval(scanChat, 1500);
   }
 
   window.__hermesMeetDrain = () => {
+    scanChat();
     const out = window.__hermesMeetQueue.slice();
     window.__hermesMeetQueue = [];
     return out;
@@ -160,10 +177,18 @@ _CAPTION_OBSERVER_JS = r"""
 })();
 """
 
-# Best-effort caption toggle: Meet binds it to the ``c`` key; click targeting is too brittle.
+# Best-effort caption toggle: click the caption button or dispatch 'c' shortcut.
 _ENABLE_CAPTIONS_JS = (
-    "(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', "
-    "{ key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true })); return true; })();")
+    "(() => { "
+    "const b = document.querySelector('button[jsname=\"RrG0hf\"]') || "
+    "Array.from(document.querySelectorAll('button')).find(el => { "
+    "  const a = (el.getAttribute('aria-label') || '').toLowerCase(); "
+    "  return a.includes('caption') || a.includes('phụ đề'); "
+    "}); "
+    "if (b) { b.click(); return true; } "
+    "document.body.dispatchEvent(new KeyboardEvent('keydown', "
+    "{ key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true })); "
+    "return true; })()")
 
 _LEAVE_CALL_JS = (
     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
@@ -197,6 +222,25 @@ def _probe(page, js: str) -> bool:
 def _visible(locator):
     """``locator.first`` if it exists and is visible, else None (swallows Playwright errors)."""
     return _quiet(lambda: locator.first if locator.first.count() and locator.first.is_visible() else None)
+
+
+def _enable_captions(page) -> bool:
+    """Turn on captions in Google Meet via the in-call button or shortcut."""
+    try:
+        btn = page.locator("button[jsname='RrG0hf'], button[aria-label*='caption' i], button[aria-label*='phụ đề' i]").first
+        if btn.count():
+            aria = (btn.get_attribute("aria-label") or "").lower()
+            if "turn on" in aria or "bật" in aria:
+                btn.click(force=True, timeout=2_000)
+                return True
+    except Exception:
+        pass
+    try:
+        page.keyboard.press("c")
+        return True
+    except Exception:
+        pass
+    return False
 
 
 def _pcm_tail_loop(proc, pcm_path: Path, stop_flag: dict, poll_interval: float = 0.05) -> None:
@@ -358,18 +402,52 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
     *timeout* seconds instead of checking once — a single miss leaves the bot silently in the lobby."""
     deadline = time.time() + timeout
     while True:
+        # Dismiss any permission dialog if present
+        for dismiss_sel in ('button:has-text("Continue without microphone")', 'button:has-text("Got it")'):
+            btn = _visible(page.locator(dismiss_sel))
+            if btn is not None:
+                _quiet(btn.click, timeout=2_000)
+
+        # Mute microphone and turn off camera on pre-join
+        if not cfg.realtime:
+            _ensure_mic_muted(page)
+
         name_box = _visible(page.locator('input[aria-label*="name" i]'))
         if name_box is not None:
             _quiet(name_box.fill, cfg.guest_name, timeout=2_000)
-        for label in ("Join now", "Ask to join"):
+        for label in ("Join now", "Ask to join", "Join here too"):
             btn = _visible(page.get_by_role("button", name=label, exact=False))
+            if btn is None:
+                btn = _visible(page.locator(f'button:has-text("{label}")'))
             if btn is not None and _quiet(lambda: (btn.click(timeout=3_000), True)):
                 if label == "Ask to join":
                     state.set(lobby_waiting=True)
                 return
+        join_too = _visible(page.locator('button[jsname="Qx7uuf"]'))
+        if join_too is not None:
+            _quiet(join_too.click, timeout=3_000)
+            return
+        # Direct JS click for zero-dimension buttons (e.g. Join here too before accordion opens)
+        if _quiet(page.evaluate, "() => { const b = document.querySelector('button[jsname=\"Qx7uuf\"]'); if (b) { b.click(); return true; } return false; }"):
+            return
         if time.time() >= deadline:
             return
         time.sleep(0.5)
+
+
+def _ensure_mic_muted(page) -> str:
+    """Mute the bot so it never emits noise into the meeting, and ensure camera is off for a clean static avatar."""
+    try:
+        page.evaluate("""() => {
+            for (const b of document.querySelectorAll('button')) {
+                const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (a.includes('turn off microphone') || a.includes('tắt mic')) b.click();
+                if (a.includes('turn off camera') || a.includes('tắt máy ảnh')) b.click();
+            }
+        }""")
+    except Exception:
+        pass
+    return "muted"
 
 
 def _ensure_mic_on(page) -> str:
@@ -399,7 +477,10 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
             if _probe(page, _ADMISSION_PROBE_JS):
-                state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
+                mic_state = _ensure_mic_on(page) if rt["enabled"] else _ensure_mic_muted(page)
+                state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=mic_state)
+                _enable_captions(page)
+                _quiet(page.evaluate, _CAPTION_OBSERVER_JS)
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
                 state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
@@ -485,7 +566,7 @@ def run_bot() -> int:
                 state.set(error=f"navigate failed: {e}", exited=True)
                 return 4
             _join(page, cfg, state)
-            if _quiet(page.evaluate, _ENABLE_CAPTIONS_JS):
+            if _enable_captions(page):
                 state.set(captions_enabled_attempted=True)
             try:
                 page.evaluate(_CAPTION_OBSERVER_JS)

@@ -41,11 +41,7 @@ def _on_session_end(**kwargs) -> None:
 
 def register(ctx) -> None:
     """Register tools, CLI, and lifecycle hooks (called once by the plugin loader)."""
-    # Windows: no tested audio-routing path and flaky guest-join Chromium — refuse rather than half-work.
-    system = platform.system().lower()
-    if system not in {"linux", "darwin"}:
-        logger.info("google_meet plugin: platform=%s not supported (linux/macos only)", system)
-        return
+    # Windows: local bot running is unsupported, but remote node client is supported.
     for name, schema, handler, emoji in _TOOLS:
         ctx.register_tool(name=name, toolset="google_meet", schema=schema, handler=handler,
                           check_fn=check_meet_requirements, emoji=emoji)

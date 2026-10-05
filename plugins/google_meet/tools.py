@@ -16,10 +16,16 @@ from plugins.google_meet import process_manager as pm
 
 
 def check_meet_requirements() -> bool:
-    """True when the plugin can run LOCALLY: Linux/macOS + importable ``playwright``.
-    Remote-node operation only needs ``websockets``; handlers relax this gate when a node is addressed."""
+    """True when the plugin can run LOCALLY: Linux/macOS + importable ``playwright``,
+    or REMOTELY: ``websockets`` + at least one registered remote node."""
     import importlib.util
     import platform as _p
+    try:
+        from plugins.google_meet.node.registry import NodeRegistry
+        if importlib.util.find_spec("websockets") is not None and bool(NodeRegistry().list_all()):
+            return True
+    except Exception:
+        pass
     return (_p.system().lower() in {"linux", "darwin"}
             and importlib.util.find_spec("playwright") is not None)
 
