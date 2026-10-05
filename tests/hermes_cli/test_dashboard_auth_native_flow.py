@@ -250,23 +250,55 @@ def _native_authorize_params(challenge, **overrides):
     return params
 
 
-def test_native_authorize_empty_provider_auto_selects_oauth_with_password_also_registered(
-    gated_client,
-):
-    """Regression for #78906: a password provider is a session provider but
-    can never be the target of the native OAuth broker flow, so it must not
-    count toward the empty-provider auto-select. With one OAuth provider +
-    one password provider (the normal SSO-with-password-fallback setup) the
-    desktop's empty-provider request must auto-select the OAuth provider
-    (302), not fail with ``Unknown provider: ''`` (404)."""
+@pytest.mark.parametrize("forwarded_template", ["198.51.100.{i}", ", 198.51.100.{i}"],
+                         ids=["rotated-address", "empty-first-hop"])
+def test_native_authorize_spoofed_forwarded_headers_cannot_bypass_pending_cap(
+    gated_client: TestClient, forwarded_template: str,
+) -> None:
+    # The public OAuth entry point must limit one peer before allocating the
+    # global pending store, even when XFF rotates or has an empty first hop.
+    _verifier, challenge = _make_pkce()
+    params = _native_authorize_params(challenge, provider="stub")
+    for i in range(native_flow._MAX_PENDING_PER_IP):
+        response = gated_client.get(
+            "/auth/native/authorize", params=params,
+            headers={"X-Forwarded-For": forwarded_template.format(i=i)},
+        )
+        assert response.status_code == 302
+
+    blocked = gated_client.get(
+        "/auth/native/authorize", params=params,
+        headers={"X-Forwarded-For": forwarded_template.format(i=native_flow._MAX_PENDING_PER_IP)},
+    )
+    assert blocked.status_code == 503
+    assert "too many pending" in blocked.json()["detail"]
+
+    # Exhausting one peer's allowance must leave room for another real peer.
+    other_client = TestClient(
+        web_server.app, base_url=str(gated_client.base_url),
+        client=("203.0.113.10", 50000), follow_redirects=False,
+    )
+    assert other_client.get("/auth/native/authorize", params=params).status_code == 302
+
+
+def test_native_authorize_mixed_providers_offers_both_choices(gated_client):
+    """SSO-with-password-fallback (one OAuth + the bundled password provider): the desktop
+    sends no ``provider``, so BOTH configured methods must stay reachable. #78906's symptom
+    (a misleading ``Unknown provider: ''`` 404) stays fixed; the password option is no longer
+    silently dropped by auto-selecting OAuth."""
     register_provider(_PasswordOnlyProvider())
     _verifier, challenge = _make_pkce()
     r = gated_client.get(
-        "/auth/native/authorize",
-        params=_native_authorize_params(challenge),
-    )
-    assert r.status_code == 302, r.text
-    assert "code=stub_code" in r.headers["location"]
+        "/auth/native/authorize", params=_native_authorize_params(challenge))
+    assert r.status_code == 200, r.text
+    hrefs = re.findall(r'<a class="provider-btn" href="([^"]+)"', r.text)
+    assert {parse_qs(urlparse(html.unescape(h)).query)["provider"][0] for h in hrefs} == {
+        "stub", "pwonly"}
+    # Each link carries the desktop's PKCE inputs unchanged, and the chooser itself
+    # allocates no broker state / sets no cookie.
+    q = parse_qs(urlparse(html.unescape(hrefs[0])).query)
+    assert q["code_challenge"] == [challenge] and q["code_challenge_method"] == ["S256"]
+    assert "set-cookie" not in r.headers
 
 
 def test_native_authorize_chooser_link_completes_the_native_flow(gated_client):

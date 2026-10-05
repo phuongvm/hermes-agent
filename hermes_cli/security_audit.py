@@ -61,7 +61,6 @@ def _discover_venv() -> list[Component]:
     version instead, or skip it when no release is known.
     """
     from importlib.metadata import distributions
-    from hermes_cli.version_info import get_version_info
 
     out: dict[tuple[str, str], Component] = {}
     for dist in distributions():
@@ -70,7 +69,11 @@ def _discover_venv() -> list[Component]:
         except Exception:
             continue
         version = (dist.version or "").strip()
-        if name.lower() == "hermes-agent":
+        if name.lower().replace("_", "-") == "hermes-agent" and version == "0.0.0":
+            # pyproject declares 0.0.0 in source trees, which matches every advisory ever filed:
+            # audit the running release instead, and skip the dist when no release is known.
+            from hermes_cli.version_info import get_version_info
+
             version = get_version_info().base_version
             if version == "unknown":
                 continue
