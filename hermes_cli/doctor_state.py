@@ -634,7 +634,7 @@ _MEMORY_PROVIDER_CHECKS = {
 
 
 def _memory_provider_generic(name: str) -> None:
-    """Generic check for every other memory provider (openviking, honcho, hindsight, ...)."""
+    """Generic check for every memory provider (openviking, mem0, honcho, hindsight, ...)."""
     from plugins.memory import load_memory_provider
     _provider = load_memory_provider(name)
     if _provider and _provider.is_available():

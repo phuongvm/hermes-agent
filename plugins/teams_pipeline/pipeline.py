@@ -572,6 +572,7 @@ class TeamsMeetingPipeline:
             "-i",
             str(recording_path),
             str(audio_path),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
