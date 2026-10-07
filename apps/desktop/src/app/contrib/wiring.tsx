@@ -163,9 +163,9 @@ import {
   resolveActiveTranscriptSession,
   useBackgroundSync
 } from './hooks/use-background-sync'
-import { useGatewayScopeRefresh } from './hooks/use-gateway-scope-refresh'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { useDesktopMetrics } from './hooks/use-desktop-metrics'
+import { useGatewayScopeRefresh } from './hooks/use-gateway-scope-refresh'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'

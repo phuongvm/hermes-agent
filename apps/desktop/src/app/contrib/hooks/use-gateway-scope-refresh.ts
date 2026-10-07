@@ -46,6 +46,7 @@ export function useGatewayScopeRefresh({
 
     if (gatewayState !== 'open') {
       pendingGatewayScopeRefreshRef.current = true
+
       return
     }
 

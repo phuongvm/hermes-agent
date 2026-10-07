@@ -15,6 +15,7 @@ export function buildReconnectOwnerKey(key: ReconnectOwnerKey): string {
   const prof = key.profile || 'default'
   const win = key.windowId || 'main'
   const owner = key.logicalOwner || 'primary'
+
   return `${conn}::${endpoint}::${prof}::${win}::${owner}`
 }
 
@@ -53,19 +54,23 @@ export function registerGatewayReconnect(
 
 export function reconnectGateway(options: GatewayReconnectOptions & ReconnectOwnerKey = {}): Promise<void> {
   const key = options
+
   if (isTerminalSignedOut(key.basePath)) {
     const err = new Error('Authentication required (signed-out)')
     Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
+
     return Promise.reject(err)
   }
 
   const ownerKey = buildReconnectOwnerKey(key)
   const existing = inFlightPromises.get(ownerKey)
+
   if (existing) {
     return existing
   }
 
   const handler = activeHandlers.get(ownerKey)
+
   if (!handler) {
     return Promise.reject(new Error(`Gateway reconnect is unavailable for ${ownerKey}`))
   }
@@ -79,6 +84,7 @@ export function reconnectGateway(options: GatewayReconnectOptions & ReconnectOwn
     })
 
   inFlightPromises.set(ownerKey, promise)
+
   return promise
 }
 
