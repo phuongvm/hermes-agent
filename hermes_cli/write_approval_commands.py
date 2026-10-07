@@ -227,11 +227,15 @@ def _dispose_pending_native(
     payload = record.get("payload") or {}
     result["target"] = payload.get("name") or payload.get("target")
     if replay:
-        ok, message = _apply_one(subsystem, record, memory_store)
+        ok, message, applier_result = _apply_one(subsystem, record, memory_store)
         if not ok:
             result["error"] = message or "native replay failed"
             return result
         result["replayed"] = True
+        if isinstance(applier_result, dict):
+            for k in ("replaced_entry", "replaced_entries", "removed_entry", "removed_entries"):
+                if k in applier_result:
+                    result[k] = applier_result[k]
     result["discarded"] = wa.discard_pending(subsystem, pending_id)
     if not result["discarded"]:
         result["error"] = (
