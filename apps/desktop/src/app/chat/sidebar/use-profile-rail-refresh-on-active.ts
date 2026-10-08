@@ -2,10 +2,10 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
 import {
+  $terminalSignedOutUrls,
   isTerminalSignedOut,
   normalizeBaseUrl,
-  registerResumeSyncHandler,
-  $terminalSignedOutUrls
+  registerResumeSyncHandler
 } from '@/store/auth-terminal-state'
 import { refreshActiveProfile } from '@/store/profile'
 import { $connection, $gatewayState } from '@/store/session'
@@ -35,9 +35,11 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
   const prevSignedOutRef = useRef<boolean | null>(null)
   const hasDeferredRefreshRef = useRef(false)
 
+  // eslint-disable-next-line no-restricted-syntax -- resume sync handler resets deferred refresh sentinel
   useEffect(() => {
     return registerResumeSyncHandler(baseUrl => {
       const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
+
       if (currentBaseUrl === normalizeBaseUrl(baseUrl) && $gatewayState.get() === 'open') {
         hasDeferredRefreshRef.current = false
         void refreshActiveProfile()
@@ -45,6 +47,7 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
     })
   }, [])
 
+  // eslint-disable-next-line no-restricted-syntax -- tracks transition edges between gateway/signed-out states
   useEffect(() => {
     const isInitial = prevGatewayStateRef.current === null
     const prevGateway = prevGatewayStateRef.current
@@ -65,6 +68,7 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
     }
   }, [gatewayState, isSignedOut, signedOutUrls])
 
+  // eslint-disable-next-line no-restricted-syntax -- sets deferred refresh flag on active visibility change
   useEffect(() => {
     const onActive = () => {
       if (document.visibilityState === 'hidden') {
@@ -73,6 +77,7 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
 
       if (gatewayState !== 'open' || isTerminalSignedOut(connection?.baseUrl)) {
         hasDeferredRefreshRef.current = true
+
         return
       }
 

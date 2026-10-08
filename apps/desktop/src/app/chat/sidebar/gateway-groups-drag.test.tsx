@@ -73,7 +73,7 @@ const arrange = () => {
   })
 
   const sectionIds = () =>
-    [...document.querySelectorAll('[data-gateway-section]')].map(node => node.getAttribute('data-gateway-section'))
+    [...window.document.querySelectorAll('[data-gateway-section]')].map(node => node.getAttribute('data-gateway-section'))
 
   const device = screen.getByText('This device').closest('[data-gateway-section]') as HTMLElement
   expect(sectionIds()).toEqual([JSON.stringify(['gateway', 'remote-1']), JSON.stringify(['gateway', 'local'])])
@@ -89,12 +89,12 @@ it('arms the reorder from a pointer press on the header label', async () => {
   const label = within(device).getByRole('button', { expanded: true, name: 'This device' })
   await act(async () => {
     fireEvent.pointerDown(label, { button: 0, clientX: 10, clientY: 10, isPrimary: true, pointerId: 1 })
-    fireEvent.pointerMove(document, { clientX: 10, clientY: 30, pointerId: 1 })
+    fireEvent.pointerMove(window.document, { clientX: 10, clientY: 30, pointerId: 1 })
     await Promise.resolve()
   })
   expect(device.querySelector('[data-glass-opaque]')).not.toBeNull()
   await act(async () => {
-    fireEvent.pointerUp(document, { clientX: 10, clientY: 30, pointerId: 1 })
+    fireEvent.pointerUp(window.document, { clientX: 10, clientY: 30, pointerId: 1 })
     await Promise.resolve()
   })
   expect(device.querySelector('[data-glass-opaque]')).toBeNull()

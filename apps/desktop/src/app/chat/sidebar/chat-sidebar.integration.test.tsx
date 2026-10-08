@@ -41,7 +41,12 @@ const sessionRows = [
   makeSessionInfo({ id: 'tile-two', last_active: 2, profile: 'default', started_at: 1, title: 'Tile two' })
 ]
 
-const renderSidebar = (pathname: string, currentView: AppView, onRetrySessions: () => Promise<void> = noopAsync) =>
+const renderSidebar = (
+  pathname: string,
+  currentView: AppView,
+  onRetrySessions: () => Promise<void> = noopAsync,
+  handlers: Partial<Pick<React.ComponentProps<typeof ChatSidebar>, 'onNavigate' | 'onResumeSession'>> = {}
+) =>
   render(
     <MemoryRouter initialEntries={[pathname]}>
       <SidebarProvider>
@@ -52,10 +57,10 @@ const renderSidebar = (pathname: string, currentView: AppView, onRetrySessions: 
           onDeleteSession={noop}
           onLoadMoreSessions={noop}
           onManageCronJob={noop}
-          onNavigate={noop}
+          onNavigate={handlers.onNavigate ?? noop}
           onNewSessionInWorkspace={noop}
           onNewSessionSplit={noop}
-          onResumeSession={noop}
+          onResumeSession={handlers.onResumeSession ?? noop}
           onRetrySessions={onRetrySessions}
           onTriggerCronJob={noopAsync}
         />
@@ -120,6 +125,7 @@ describe('ChatSidebar navigation activity', () => {
 
   it('keeps navigation and session activity coherent with the focused pane', () => {
     renderSidebar('/kanban', 'extension')
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }))
     expectOnlyCurrent('Kanban')
     expectOnlySelectedSession(null)
 
@@ -157,6 +163,7 @@ describe('ChatSidebar navigation activity', () => {
       cleanup()
       focus('workspace-group')
       renderSidebar(pathname, currentView)
+      fireEvent.click(screen.getByRole('button', { name: 'Tools' }))
       expectOnlyCurrent(label)
       expectOnlySelectedSession(null)
 
@@ -168,6 +175,7 @@ describe('ChatSidebar navigation activity', () => {
     cleanup()
     focus('workspace-group')
     renderSidebar('/reports', 'extension')
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }))
     expectOnlyCurrent('Reports')
 
     cleanup()
@@ -180,10 +188,121 @@ describe('ChatSidebar navigation activity', () => {
     expectOnlySelectedSession(null)
   })
 
+  it('keeps daily navigation above a default-collapsed Tools group', () => {
+    const { container } = renderSidebar('/', 'chat')
+    const tools = screen.getByRole('button', { name: 'Tools' })
+    expect(tools.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByRole('button', { name: 'Capabilities' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Kanban' })).toBeNull()
+
+    const newSession = container.querySelector('[data-tour="sidebar-nav-new-session"]')!
+    const search = screen.getByRole('textbox', { name: 'Search sessions' })
+    const sessions = screen.getByText('Sessions')
+    const pinned = screen.getByText('Pinned')
+
+    expect(search.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(pinned.compareDocumentPosition(sessions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+    for (const primary of [search, sessions, pinned]) {
+      expect(newSession.compareDocumentPosition(primary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(primary.compareDocumentPosition(tools) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    }
+
+    fireEvent.click(tools)
+    expect(tools.getAttribute('aria-expanded')).toBe('true')
+
+    for (const name of ['Capabilities', 'Messaging', 'Scheduled jobs', 'Settings', 'Webhooks', 'Kanban']) {
+      expect(screen.getByRole('button', { name })).toBeTruthy()
+    }
+
+    fireEvent.click(tools)
+    expect(screen.queryByRole('button', { name: 'Capabilities' })).toBeNull()
+    expect(screen.getByRole('textbox', { name: 'Search sessions' })).toBe(search)
+    expect($selectedStoredSessionId.get()).toBe('tile-one')
+    expect(screen.getByText('Tile one')).toBeTruthy()
+  })
+
+  it('keeps the project view above Tools and preserves its scope across toggles', () => {
+    setSidebarAgentsGrouped(true)
+    $projectTree.set([{ id: '/repos/test', label: 'test', path: '/repos/test', repos: [], sessionCount: 0 }])
+
+    try {
+      const { container } = renderSidebar('/', 'chat')
+      const tools = screen.getByRole('button', { name: 'Tools' })
+      const newSession = container.querySelector('[data-tour="sidebar-nav-new-session"]')!
+      const search = screen.getByRole('textbox', { name: 'Search sessions' })
+      const pinned = screen.getByText('Pinned')
+      const projects = screen.getByText('Projects')
+
+      for (const [before, after] of [[newSession, search], [search, pinned], [pinned, projects]]) {
+        expect(before.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      }
+
+      expect(
+        screen.getByText('Projects').compareDocumentPosition(tools) & Node.DOCUMENT_POSITION_FOLLOWING
+      ).toBeTruthy()
+      fireEvent.click(tools)
+      fireEvent.click(tools)
+      expect($projectScope.get()).toBe(ALL_PROJECTS)
+      expect(screen.getByText('Projects')).toBeTruthy()
+    } finally {
+      cleanup()
+      $projectTree.set([])
+      setSidebarAgentsGrouped(false)
+    }
+  })
+
+  it.each([
+    ['Capabilities', '/capabilities'],
+    ['Messaging', '/messaging'],
+    ['Artifacts', '/artifacts'],
+    ['Scheduled jobs', '/cron'],
+    ['Settings', '/settings'],
+    ['Webhooks', '/webhooks'],
+    ['Kanban', '/kanban'],
+    ['Reports', '/reports']
+  ])('dispatches %s to its existing route after reopening Tools', (name, route) => {
+    const onNavigate = vi.fn()
+    renderSidebar('/', 'chat', noopAsync, { onNavigate })
+    const tools = screen.getByRole('button', { name: 'Tools' })
+
+    expect(screen.queryByRole('button', { name })).toBeNull()
+    fireEvent.click(tools)
+    fireEvent.click(tools)
+    expect(screen.queryByRole('button', { name })).toBeNull()
+    fireEvent.click(tools)
+    expect(onNavigate).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name }))
+    expect(onNavigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ route }))
+    expect($selectedStoredSessionId.get()).toBe('tile-one')
+  })
+
+  it('keeps session resume and New session available on both sides of the Tools toggle', () => {
+    const onNavigate = vi.fn()
+    const onResumeSession = vi.fn()
+    const { container } = renderSidebar('/', 'chat', noopAsync, { onNavigate, onResumeSession })
+    const tools = screen.getByRole('button', { name: 'Tools' })
+    const newSession = container.querySelector('[data-tour="sidebar-nav-new-session"]')!.closest('button')!
+
+    for (const open of [false, true, false]) {
+      expect(tools.getAttribute('aria-expanded')).toBe(String(open))
+      fireEvent.click(screen.getByText('Tile two'))
+      expect(onResumeSession).toHaveBeenLastCalledWith('tile-two', expect.objectContaining({ id: 'tile-two' }))
+      fireEvent.click(newSession)
+      expect(onNavigate).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'new-session' }))
+      fireEvent.click(tools)
+    }
+
+    expect(onNavigate).toHaveBeenCalledTimes(3)
+    expect(onResumeSession).toHaveBeenCalledTimes(3)
+  })
+
   // Teardown proof: the loader disposes a plugin's contributions on disable,
   // and that disposer alone must bring the row back — no store to clear.
   it('hides a nav row while a sidebarNav.prefs contribution is registered and restores it on dispose', () => {
     renderSidebar('/kanban', 'extension')
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }))
     expect(screen.getByRole('button', { name: 'Kanban' })).toBeTruthy()
 
     let dispose = () => {}

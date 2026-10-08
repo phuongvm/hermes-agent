@@ -241,7 +241,7 @@ describe('ConnectionSwitcher', () => {
 
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
     expect(screen.queryByRole('menuitemradio', { name: 'W2Probe' })).toBeNull()
-    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.keyDown(window.document, { key: 'Escape' })
 
     act(() => $connectionsRegistry.set(after))
 

@@ -254,7 +254,7 @@ afterEach(() => {
 describe('ProfileRail overflow', () => {
   // jsdom drops valid gradient values containing calc(); observe the real DOM
   // style assignment instead. Actual layout, resize and painting run in Chromium.
-  const observeMask = () => vi.spyOn(Object.getPrototypeOf(document.createElement('div').style), 'maskImage', 'set')
+  const observeMask = () => vi.spyOn(Object.getPrototypeOf(window.document.createElement('div').style), 'maskImage', 'set')
   let mask: ReturnType<typeof observeMask>
 
   beforeEach(() => {
@@ -371,7 +371,7 @@ describe('ProfileRail fleet mode', () => {
         expect(openWindow).toHaveBeenLastCalledWith({ connectionId: target.connectionId, profile: target.profile })
         expect(selectProfile).not.toHaveBeenCalled()
         expect(selectConnection).not.toHaveBeenCalled()
-        fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' })
+        fireEvent.keyDown(window.document.activeElement ?? window.document.body, { key: 'Escape' })
       }
     }
   )

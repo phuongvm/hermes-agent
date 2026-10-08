@@ -8,7 +8,8 @@ const { refreshActiveProfile } = vi.hoisted(() => ({
 vi.mock('@/store/profile', () => ({ refreshActiveProfile }))
 
 import { setTerminalSignedOut } from '@/store/auth-terminal-state'
-import { $gatewayState } from '@/store/session'
+import { $connection, $gatewayState } from '@/store/session'
+
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
 describe('useProfileRailRefreshOnActive', () => {
@@ -17,6 +18,8 @@ describe('useProfileRailRefreshOnActive', () => {
   })
 
   afterEach(() => {
+    $connection.set(null)
+    setTerminalSignedOut('https://gateway.example.com', false)
     refreshActiveProfile.mockClear()
     vi.restoreAllMocks()
   })
@@ -115,6 +118,7 @@ describe('useProfileRailRefreshOnActive', () => {
   })
 
   it('suppresses refresh during terminal signed-out state and refreshes on sign-in recovery', async () => {
+    $connection.set({ baseUrl: 'https://gateway.example.com' } as any)
     setTerminalSignedOut('https://gateway.example.com', true)
 
     // Mount while signed out
