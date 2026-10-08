@@ -7,7 +7,7 @@ from __future__ import annotations
 # Only as ``python -m``: tests import this module, and the bootstrap's TMPDIR/scratch exports
 # must not fire in a library importer.
 if __name__ == "__main__":
-    import hermes_bootstrap  # noqa: F401
+    import hermes_bootstrap
 
 import argparse
 import concurrent.futures
