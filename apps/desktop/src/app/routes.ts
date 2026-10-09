@@ -136,6 +136,8 @@ export interface SidebarNavContribution {
   path: string
   /** `'advanced'` keeps the row out of Simple mode; unset shows it everywhere. */
   tier?: InterfaceTier
+  /** When true, clicking this item opens or reveals the route as a layout tile tab rather than full-page navigation. */
+  asTile?: boolean
 }
 
 // ── Contributed profile-group header — the `sidebar.profileGroup.header` area ─

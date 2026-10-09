@@ -45,6 +45,7 @@ import {
 } from '@/store/profile'
 import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
 import { $projectTree } from '@/store/projects'
+import { $routeTiles } from '@/store/route-tiles'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
@@ -6503,6 +6504,31 @@ describe('selectSidebarItem', () => {
     expect(navigate).toHaveBeenCalledWith('/capabilities', undefined)
     expect(noteActiveTreeGroup).toHaveBeenCalledWith(null)
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
+  })
+
+  it('opens route tile in center dock and reveals pane when item has asTile: true', async () => {
+    $routeTiles.set([])
+    vi.mocked(revealTreePane).mockClear()
+    const navigate = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => {
+      handle!.selectSidebarItem({
+        asTile: true,
+        icon: (() => null) as never,
+        id: 'crew',
+        label: 'Crew',
+        route: '/crew'
+      })
+    })
+
+    expect($routeTiles.get()).toContainEqual({ dir: 'center', path: '/crew' })
+    expect(navigate).not.toHaveBeenCalled()
+    expect(revealTreePane).toHaveBeenCalledWith('route-tile:/crew')
   })
 })
 

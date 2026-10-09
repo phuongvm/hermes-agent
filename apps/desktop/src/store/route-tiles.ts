@@ -1,8 +1,9 @@
 import { atom } from 'nanostores'
 
+import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { readJson, writeJson } from '@/lib/storage'
 
-import type { SplitDir } from './session-states'
+import type { TileDock } from './session-states'
 
 /**
  * Route (page) tiles — a full-page view (Capabilities / Messaging / Artifacts,
@@ -13,7 +14,7 @@ export interface RouteTile {
   /** The route path this tile renders, e.g. `/capabilities`. */
   path: string
   /** Edge to dock against main on adoption (default right). */
-  dir?: SplitDir
+  dir?: TileDock
 }
 
 const TILES_KEY = 'hermes.desktop.routeTiles.v1'
@@ -37,12 +38,14 @@ function saveTiles(tiles: RouteTile[]) {
 
 /** Open (or front) a page tile for a route, docked on `dir` (default right).
  *  Idempotent — an already-open tile keeps its original edge. */
-export function openRouteTile(path: string, dir: SplitDir = 'right') {
+export function openRouteTile(path: string, dir: TileDock = 'right') {
   const tiles = $routeTiles.get()
 
   if (!tiles.some(t => t.path === path)) {
     saveTiles([...tiles, { dir, path }])
   }
+
+  revealTreePane('route-tile:' + path)
 }
 
 export function closeRouteTile(path: string) {

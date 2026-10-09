@@ -419,7 +419,8 @@ export function ChatSidebar({
             label: data.label,
             icon: (props: { className?: string }) => <Codicon name={codicon} {...props} />,
             route: data.path,
-            tier: data.tier
+            tier: data.tier,
+            asTile: data.asTile
           }
         ]
       }),

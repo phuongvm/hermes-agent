@@ -69,6 +69,7 @@ import { $projectScope } from '@/store/project-scope'
 import { projectProfile, resolveNewSessionCwd } from '@/store/projects'
 import { clearAllPrompts } from '@/store/prompts'
 import { clearStoredTranscriptReadOnly, markStoredTranscriptReadOnly } from '@/store/read-only-transcript'
+import { openRouteTile } from '@/store/route-tiles'
 import {
   $activeSessionStoredIdRotation,
   $connection,
@@ -1009,6 +1010,12 @@ export function useSessionActions({
         prepareDefaultNewSession()
         setWorkspaceScope('sessions')
         startFreshSessionDraft()
+
+        return
+      }
+
+      if (item.asTile && item.route) {
+        openRouteTile(item.route, 'center')
 
         return
       }

@@ -137,6 +137,7 @@ export interface SidebarNavItem extends Tiered {
   action?: 'new-session'
   /** Keybind action id — when set, the tooltip shows the keybind hint. */
   keybindActionId?: string
+  asTile?: boolean
 }
 
 export interface PersistedDisplayTranscriptProvenance {
