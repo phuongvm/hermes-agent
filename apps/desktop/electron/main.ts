@@ -9671,6 +9671,8 @@ async function buildRemoteConnection(
 
     rememberRemoteWsHeaders(wsUrl, remoteHeaders)
 
+    const nativeBearer = await ensureNativeAccessToken(baseUrl).catch(() => null)
+
     return {
       baseUrl,
       mode: 'remote',
@@ -9680,8 +9682,7 @@ async function buildRemoteConnection(
       remoteIdentity,
       remoteKind,
       headers: remoteHeaders,
-      // No static token in OAuth mode; REST is cookie-authed via the partition.
-      token: null,
+      token: nativeBearer,
       wsUrl
     }
   }

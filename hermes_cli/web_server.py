@@ -386,7 +386,7 @@ app.include_router(_memory_oauth_router)
 _DASHBOARD_TOKEN_FILE = ".dashboard_session_token"
 
 
-def _get_effective_user_identity() -> Tuple[Optional[str], Optional[str]]:
+def _get_effective_user_identity() -> tuple[Optional[str], Optional[str]]:
     """Return (user_sid, user_name) for the effective process token on Windows."""
     if os.name != "nt":
         return None, None
@@ -708,7 +708,7 @@ class _SessionTokenLock:
                     fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.acquired = True
                 return self
-            except (OSError, IOError) as exc:
+            except OSError as exc:
                 if time.monotonic() - start >= self.timeout:
                     _log.debug("Session token lock acquisition failed on %s: %s", self.lock_path, exc)
                     self.acquired = False
@@ -985,7 +985,10 @@ def _has_valid_session_token(request: Request) -> bool:
     if session_header and hmac.compare_digest(session_header.encode(), _SESSION_TOKEN.encode()):
         return True
     auth = request.headers.get("authorization", "")
-    return hmac.compare_digest(auth.encode(), f"Bearer {_SESSION_TOKEN}".encode())
+    if auth and hmac.compare_digest(auth.encode(), f"Bearer {_SESSION_TOKEN}".encode()):
+        return True
+    cookie = request.cookies.get("hermes_session", "") or request.cookies.get(_SESSION_HEADER_NAME, "")
+    return bool(cookie) and hmac.compare_digest(cookie.encode(), _SESSION_TOKEN.encode())
 
 
 # Routes that may also authenticate via ``?token=`` (download links opened by
@@ -994,7 +997,7 @@ _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
-    if path not in _QUERY_TOKEN_API_PATHS:
+    if path not in _QUERY_TOKEN_API_PATHS and not path.startswith("/api/plugins/"):
         return False
     token = request.query_params.get("token", "")
     return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())

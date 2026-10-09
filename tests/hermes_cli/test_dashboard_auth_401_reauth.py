@@ -810,3 +810,20 @@ class TestAuthLoginPkceCookieNext:
         cookies = r.headers.get_list("set-cookie")
         pkce = next(c for c in cookies if "hermes_session_pkce" in c)
         assert "next=" not in pkce
+
+    def test_plugin_route_authenticated_via_query_token_in_gated_mode(self, gated_app):
+        from hermes_cli.web_server import _SESSION_TOKEN
+        r = gated_app.get(f"/api/plugins/crew/board?token={_SESSION_TOKEN}")
+        assert r.status_code != 401
+
+    def test_plugin_route_authenticated_via_cookie_in_gated_mode(self, gated_app):
+        from hermes_cli.web_server import _SESSION_TOKEN
+        gated_app.cookies.set("hermes_session", _SESSION_TOKEN)
+        r = gated_app.get("/api/plugins/crew/board")
+        assert r.status_code != 401
+
+    def test_plugin_route_authenticated_via_ticket_in_gated_mode(self, gated_app):
+        from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
+        ticket = mint_ticket(user_id="test-oauth-user", provider="entra")
+        r = gated_app.get(f"/api/plugins/crew/board?ticket={ticket}")
+        assert r.status_code != 401

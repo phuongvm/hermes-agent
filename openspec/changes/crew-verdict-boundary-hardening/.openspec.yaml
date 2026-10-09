@@ -1,0 +1,5 @@
+schema: spec-driven
+change_id: crew-verdict-boundary-hardening
+title: Harden Crew verdict boundaries for ad-hoc and non-contract Kanban cards
+created_at: 2026-10-09
+status: draft

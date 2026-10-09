@@ -4773,6 +4773,41 @@ class TestPluginAPIAuth:
         resp = self.client.get("/api/plugins/_definitely_not_a_plugin_/anything")
         assert resp.status_code == 401
 
+    def test_query_token_authenticates_plugin_endpoints(self):
+        """Query token should authenticate /api/plugins/ routes."""
+        from hermes_cli.web_server import _SESSION_TOKEN
+
+        # Valid query token on plugin route: handler runs (200).
+        resp = self.client.get("/api/plugins/example/hello", params={"token": _SESSION_TOKEN})
+        assert resp.status_code == 200
+
+        # Invalid query token: 401.
+        resp = self.client.get("/api/plugins/example/hello", params={"token": "bad-token"})
+        assert resp.status_code == 401
+
+    def test_session_cookie_authenticates_plugin_endpoints(self):
+        """Session cookies (hermes_session or header-named) authenticate routes."""
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        # hermes_session cookie: 200.
+        resp = self.client.get("/api/plugins/example/hello", cookies={"hermes_session": _SESSION_TOKEN})
+        assert resp.status_code == 200
+
+        # header-named cookie: 200.
+        resp = self.client.get("/api/plugins/example/hello", cookies={_SESSION_HEADER_NAME: _SESSION_TOKEN})
+        assert resp.status_code == 200
+
+        # Invalid cookie: 401.
+        resp = self.client.get("/api/plugins/example/hello", cookies={"hermes_session": "bad-token"})
+        assert resp.status_code == 401
+
+    def test_query_token_does_not_authenticate_core_endpoints(self):
+        """Query token must not authenticate core non-plugin endpoints."""
+        from hermes_cli.web_server import _SESSION_TOKEN
+
+        resp = self.client.get("/api/sessions/history", params={"token": _SESSION_TOKEN})
+        assert resp.status_code == 401
+
 
 class TestPluginAPISecretScopeProductionMount:
     """#120310: a plugin API handler's ``get_secret()`` must resolve the *requested*

@@ -169,6 +169,42 @@ async def gated_auth_middleware(
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
         return await call_next(request)
 
+    # Plugin routes authenticated via query token or session cookie/header
+    if request.url.path.startswith("/api/plugins/"):
+        from hermes_cli.web_server import _has_valid_query_token, _has_valid_session_token, _SESSION_TOKEN
+        from hermes_cli.dashboard_auth.base import Session
+        if _has_valid_query_token(request, request.url.path) or _has_valid_session_token(request):
+            request.state.session = Session(
+                user_id="plugin-user", email="plugin@local", display_name="Plugin User", org_id="",
+                provider="local", expires_at=2147483647, access_token=_SESSION_TOKEN, refresh_token="")
+            return await call_next(request)
+        ticket = request.query_params.get("ticket")
+        if ticket:
+            try:
+                from hermes_cli.dashboard_auth.ws_tickets import consume_ticket
+                info = consume_ticket(ticket)
+                request.state.session = Session(
+                    user_id=info.get("user_id", "oauth-user"),
+                    email="",
+                    display_name=info.get("user_id", "OAuth User"),
+                    org_id="",
+                    provider=info.get("provider", "oauth"),
+                    expires_at=2147483647,
+                    access_token=_SESSION_TOKEN,
+                    refresh_token="")
+                return await call_next(request)
+            except Exception:
+                pass
+        query_token = request.query_params.get("token") or request.cookies.get("hermes_session")
+        if query_token:
+            try:
+                query_session = _verify_access_token(request, access_token=query_token, audit=False)
+                if query_session is not None:
+                    request.state.session = query_session
+                    return await call_next(request)
+            except Exception:
+                pass
+
     from hermes_cli.web_server import is_startup_ready
     if not is_startup_ready(getattr(request.app, "state", None)):
         return JSONResponse(
