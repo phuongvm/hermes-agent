@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -109,7 +109,7 @@ class TeamsPipelineConfig:
     llm_model: str | None = None
 
     @classmethod
-    def from_dict(cls, payload: Optional[dict[str, Any]]) -> "TeamsPipelineConfig":
+    def from_dict(cls, payload: Optional[dict[str, Any]]) -> TeamsPipelineConfig:
         data = dict(payload or {})
         tmp_dir = data.get("tmp_dir") or data.get("tmpDir")
         return cls(
@@ -363,8 +363,8 @@ class TeamsMeetingPipeline:
                     updated_at = None
             if updated_at is not None:
                 if updated_at.tzinfo is None:
-                    updated_at = updated_at.replace(tzinfo=timezone.utc)
-                age = (datetime.now(timezone.utc) - updated_at).total_seconds() / 60
+                    updated_at = updated_at.replace(tzinfo=UTC)
+                age = (datetime.now(UTC) - updated_at).total_seconds() / 60
                 if age > stale_minutes:
                     logger.warning(
                         "Teams pipeline job %s stuck in %s for %.0f min — resetting to received",
