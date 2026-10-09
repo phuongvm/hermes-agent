@@ -151,7 +151,7 @@ class _ScriptedWebSocket(_FakeWebSocket):
             raise res()
         if res == "timeout":
             fut = asyncio.get_running_loop().create_future()
-            fut.set_exception(asyncio.TimeoutError("ping timed out"))
+            fut.set_exception(TimeoutError("ping timed out"))
             return fut
         if res is not None:
             return res
@@ -211,7 +211,7 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
         task.cancel()
         try:
             await asyncio.wait_for(task, 5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
     assert len(sockets) >= 2, "idle read watchdog did not force a reconnect"
@@ -274,7 +274,7 @@ async def test_websocket_loop_reconnects_when_discovery_send_sees_closed_socket(
         task.cancel()
         try:
             await asyncio.wait_for(task, 5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
     assert len(sockets) >= 2, "a closed socket seen by the discovery sweep did not force a reconnect"
@@ -313,7 +313,7 @@ async def test_websocket_loop_backs_off_and_publishes_retrying_on_clean_relay_cl
         task.cancel()
         try:
             await asyncio.wait_for(task, 5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
     assert len(sockets) == 1, f"clean close must back off before reconnecting, got {len(sockets)} connects in 0.3s"
@@ -357,7 +357,7 @@ async def test_websocket_loop_idle_silent_channel_keeps_connection_alive_when_pi
         task.cancel()
         try:
             await asyncio.wait_for(task, 5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (asyncio.CancelledError, TimeoutError):
             pass
 
     assert sockets[0].exited, "connection should be closed cleanly after cancellation"
@@ -406,7 +406,7 @@ async def test_websocket_loop_reconnects_when_ping_fails_or_times_out(monkeypatc
         task.cancel()
         try:
             await asyncio.wait_for(task, 5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (asyncio.CancelledError, TimeoutError):
             pass
 
     assert len(sockets) >= 2, "failed/timed-out ping probe did not force a reconnect"
