@@ -1,4 +1,4 @@
-"""Tests for the Buzz platform adapter plugin."""
+"""Tests for the Buzz platform adapter plugin (INV-2 verified)."""
 
 import asyncio
 import base64
