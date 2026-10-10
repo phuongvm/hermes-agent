@@ -131,11 +131,13 @@ describe('ReconnectBackoffTracker', () => {
   it('transitions to exhausted after 12 retries or 5 minutes', () => {
     const tracker = new ReconnectBackoffTracker()
     let now = 1000
+
     for (let i = 0; i < MAX_RECONNECT_ATTEMPTS; i++) {
       const res = tracker.recordFailure(now)
       expect(res.exhausted).toBe(false)
       now += 1000
     }
+
     const res = tracker.recordFailure(now)
     expect(res.exhausted).toBe(true)
   })

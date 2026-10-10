@@ -4,12 +4,14 @@ import { $connection } from '@/store/session'
 
 export function normalizeBaseUrl(url: string): string {
   const trimmed = String(url || '').trim()
+
   if (!trimmed) {
     return ''
   }
 
   try {
     const parsed = new URL(trimmed)
+
     return `${parsed.protocol}//${parsed.host.toLowerCase()}${parsed.pathname}`.replace(/\/+$/, '')
   } catch {
     return trimmed.replace(/\/+$/, '')
@@ -22,16 +24,19 @@ const resumeSyncHandlers = new Set<(baseUrl: string) => void | Promise<void>>()
 
 export function isTerminalSignedOut(url?: string | null): boolean {
   const target = url !== undefined && url !== null ? url : $connection.get()?.baseUrl
+
   if (!target) {
     return false
   }
 
   const normalized = normalizeBaseUrl(target)
+
   return $terminalSignedOutUrls.get().includes(normalized)
 }
 
 export function setTerminalSignedOut(url: string, signedOut: boolean, reason?: string): void {
   const normalized = normalizeBaseUrl(url)
+
   if (!normalized) {
     return
   }
@@ -76,6 +81,7 @@ export function resetAuthTerminalState(): void {
 
 export function initAuthTerminalStateListener(): () => void {
   const desktop = (typeof window !== 'undefined' ? (window as any).hermesDesktop : undefined)
+
   if (!desktop?.auth?.onTerminalStateChanged) {
     return () => {}
   }
