@@ -36,6 +36,7 @@
 
 ## 💬 Updates Log
 <!-- AGENTS: Append your updates below this line -->
+- 2026-10-10 15:05 [COORDINATOR]: Completed OpenSpec Phase 5 Sync & Phase 6 Archive for change `crew-card-contract-display`. Created canonical specification `openspec/specs/crew-card-contract-display/spec.md`, archived change to `openspec/changes/archive/2026-10-10-crew-card-contract-display/`. All 17 canonical specs validated strictly (`openspec validate --specs --strict` exit 0).
 - 2026-10-10 14:50 [COORDINATOR]: Completed Task 3 of `crew-card-contract-display`. Added `test_card_view_contract_metadata_and_specification` to `test_crew_dashboard_customization.py` (15/15 unit tests passing). Synchronized runtime scripts to `_config/agent4070/hermes/plugins/crew/` and verified live card view `/card/<id>` on port 8799 rendering full contract specification.
 - 2026-10-10 14:35 [CODER]: Task t_121fc157 (Task 2 of crew-card-contract-display) completed and verified. Updated `card.js` to render Goal, Artifact, Lands at, Inputs, Proof command, and full Contract Specification & Details under the Contract tab. Node syntax check clean and proof command verified PASS.
 - 2026-10-10 14:15 [CODER]: Task t_f7843f31 (Task 1 of crew-card-contract-display) completed and verified. Extracted contract metadata (`goal`, `artifact`, `lands_at`, `inputs`, `proof_cmd`, `proof_mode`) and full `body` in `oss/crew/scripts/crew_graph.py` inside `_Builder.branch()`. Proof command verified PASS, `/card/<id>.json` now carries complete contract specification.

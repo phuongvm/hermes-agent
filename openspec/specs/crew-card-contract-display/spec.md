@@ -1,8 +1,7 @@
 # crew-card-contract-display Specification
 
 ## Purpose
-Specifies the requirement for displaying full contract metadata and specification details in the Crew detail card view (`/card/<id>`).
-
+Defines requirements and verification scenarios for displaying comprehensive card contract metadata, artifacts, landing locations, inputs, proof commands, and full specification details under the Contract tab on the Crew coordination dashboard.
 ## Requirements
 ### Requirement: Comprehensive Card Contract Metadata Display
 The Crew card view MUST display full contract specification fields under the "Contract" tab when viewing a coordinator card node.
@@ -17,3 +16,4 @@ The Crew card view MUST display full contract specification fields under the "Co
 - GIVEN a legacy task has only a single-line body or lacks structured fields
 - WHEN `/card/<id>.json` is fetched
 - THEN `card_ev` MUST gracefully omit empty fields without throwing errors or breaking the UI layout.
+
