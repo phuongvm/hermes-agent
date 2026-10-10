@@ -1,7 +1,8 @@
-# Capability: Crew Dashboard UI Enhancements
+# crew-dashboard-ui-enhancements Specification
 
-## ADDED REQUIREMENTS
-
+## Purpose
+Defines requirements and verification scenarios for Crew coordination board UI enhancements across Hermes Desktop and Hermes Web Dashboard, covering radar sweep animations for running tasks, dynamic theme synchronization, notification acknowledgment authorization, and dynamic title case board title display.
+## Requirements
 ### Requirement: Active Task Radar Animation
 The Crew board MUST animate cards in `running` status with a rotating conic-gradient radar sweep across the card border.
 
@@ -43,14 +44,15 @@ The 'Clear All' button on the notification panel MUST successfully acknowledge a
 ---
 
 ### Requirement: Dynamic Kanban Board Title Display
-The Crew dashboard header MUST display the name/slug of the currently active Kanban board instead of hardcoding 'crew board'.
+The Crew dashboard header MUST display the configured display name (`name` in `board.json`) or slug of the currently active Kanban board instead of hardcoding 'crew board'.
 
-#### Scenario: Active board is crew
-- GIVEN the active Kanban board is `crew`
+#### Scenario: Active board has configured display name
+- GIVEN the active Kanban board is `crew` with `name` configured as `Custom Crew` in `board.json`
 - WHEN `/board.json` is fetched
-- THEN `"board": "crew"` MUST be present in the JSON response, and the header `<h1>` MUST display "Crew Board".
+- THEN `"board": "crew"` and `"board_name": "Custom Crew"` MUST be present in the JSON response, and the header `<h1>` and `<title>` MUST display "Custom Crew".
 
-#### Scenario: Active board is custom slug
-- GIVEN the active Kanban board is set to `default` or `deskrpg`
+#### Scenario: Active board without custom name falls back to formatted slug
+- GIVEN the active Kanban board has no custom `name` in `board.json`
 - WHEN the dashboard renders
-- THEN the header MUST display the corresponding board name.
+- THEN the header MUST display the formatted board slug (e.g. "Default Board").
+
