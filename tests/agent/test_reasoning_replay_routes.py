@@ -38,12 +38,13 @@ def _wire(provider, base_url, model="m", rejected=()):
     ("custom", "https://api.cerebras.ai/v1", "m", set()),
     ("fireworks", "https://api.fireworks.ai/inference/v1", "m", {"reasoning_content"}),
     # OpenRouter-format gateways, incl. the Portal (#118182 does not reproduce)
+    # (``reasoning`` aliases ``reasoning_content``: one text carrier per message, never both)
     ("nous", "https://inference-api.nousresearch.com/v1", "z-ai/glm-5.3",
-     {"reasoning_content", "reasoning", "reasoning_details"}),
-    ("kilocode", "https://api.kilo.ai/api/gateway", "m", {"reasoning_content", "reasoning", "reasoning_details"}),
+     {"reasoning_content", "reasoning_details"}),
+    ("kilocode", "https://api.kilo.ai/api/gateway", "m", {"reasoning_content", "reasoning_details"}),
     ("novita", "https://api.novita.ai/openai/v1", "m", {"reasoning_content", "reasoning_details"}),
-    ("ollama-cloud", "https://ollama.com/v1", "m", {"reasoning_content", "reasoning"}),
-    ("custom", "http://127.0.0.1:8080/v1", "m", {"reasoning_content", "reasoning"}),
+    ("ollama-cloud", "https://ollama.com/v1", "m", {"reasoning"}),  # Ollama reads only ``reasoning``
+    ("custom", "http://127.0.0.1:8080/v1", "m", {"reasoning_content"}),
     # everyone else: the de-facto standard alias
     ("zai", "https://api.z.ai/api/paas/v4", "glm-5.3", {"reasoning_content"}),
     ("openai-api", "https://api.openai.com/v1", "gpt-5", {"reasoning_content"}),

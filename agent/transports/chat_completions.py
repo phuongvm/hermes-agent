@@ -387,9 +387,31 @@ def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *,
     return api_kwargs
 
 
+def _wire_text_carrier(provider: Any, base_url: Any) -> str:
+    """The ONE reasoning text key an assistant wire message keeps when it holds both.
+
+    ``reasoning`` and ``reasoning_content`` carry the same text; serde-style gateways (9Router,
+    Rust/axum relays) alias one onto the other and reject a message with both: ``duplicate
+    field `reasoning_content``` (HTTP 400). Ollama's OpenAI-compat endpoint reads only
+    ``reasoning`` (-> ``thinking``); every other route reads ``reasoning_content``.
+    """
+    from utils import base_url_host_matches
+
+    if (provider or "").strip().lower() in {"ollama", "ollama-cloud"} or base_url_host_matches(base_url, "ollama.com") \
+            or ":11434" in str(base_url or ""):
+        return "reasoning"
+    return "reasoning_content"
+
+
+def _duplicate_text_carrier(msg: dict, text_carrier: str) -> str:
+    """Key to drop from a message carrying both text carriers; a null preferred key yields to the other."""
+    other = "reasoning" if text_carrier == "reasoning_content" else "reasoning_content"
+    return other if isinstance(msg.get(text_carrier), str) or not isinstance(msg.get(other), str) else text_carrier
+
+
 def _sanitize_message(
     msg: Any, strip_extra_content: bool, strip_reasoning: frozenset = frozenset(),
-    native_reasoning_details_type: str | None = None,
+    native_reasoning_details_type: str | None = None, text_carrier: str = "reasoning_content",
 ) -> dict | None:
     """Sanitized copy of ``msg``, or None when nothing needs stripping.
 
@@ -398,7 +420,8 @@ def _sanitize_message(
     ``tool_calls: []`` / ``null`` (strict providers reject both), ``name``
     on tool results (schema-valid only on user/assistant messages; strict
     providers reject it with ``contains item with unknown key name``), and the reasoning
-    keys in ``strip_reasoning`` (carriers the route does not read, ``_wire_reasoning_carriers``).
+    keys in ``strip_reasoning`` (carriers the route does not read, ``_wire_reasoning_carriers``),
+    and the duplicate of ``reasoning``/``reasoning_content`` (``_wire_text_carrier`` keeps one).
     On a route that reads ``reasoning_details``, private ``<provider>.native_assistant`` carriers still go only to the
     profile that declared that exact type: another provider's signed replay is meaningless (or
     rejected) elsewhere, and stored history keeps it for a return to the original provider.
@@ -422,6 +445,9 @@ def _sanitize_message(
     # reject with "contains item with unknown key name").
     if msg.get("role") == "tool" and "name" in msg:
         strip_keys.append("name")
+    if msg.get("role") == "assistant" and "reasoning" in msg and "reasoning" not in strip_keys \
+            and "reasoning_content" in msg and "reasoning_content" not in strip_keys:
+        strip_keys.append(_duplicate_text_carrier(msg, text_carrier))
     out_msg = {k: v for k, v in msg.items() if k not in strip_keys}
     if kept_details:
         out_msg["reasoning_details"] = kept_details
@@ -473,7 +499,8 @@ class ChatCompletionsTransport(ProviderTransport):
             # A profile declaring a native carrier type consumes replayed details by contract.
             carriers = carriers | {"reasoning_details"}
         strip_reasoning = frozenset({"reasoning_content", "reasoning", "reasoning_details"}) - carriers
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning, native_type))
+        text_carrier = _wire_text_carrier(provider, kwargs.get("base_url"))
+        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning, native_type, text_carrier))
                            for m in messages]
         if all(s is None for _, s in sanitized_pairs):
             return messages
