@@ -1198,18 +1198,17 @@ def create_task(
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
-    ``idempotency_key``: an existing non-archived task with the key is returned
-    instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
-    SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
-    worker model (provider requires model); ``reasoning_effort`` is independent.
-    ``creator_task_id``: inherit durable session/subscriptions independently of
-    dependency edges; an explicit ``session_id`` still wins.
+    ``idempotency_key``: an existing non-archived task with the key is returned instead of a duplicate.
+    ``max_runtime_seconds``: cap before the dispatcher SIGTERMs and re-queues.
+    ``model_override``/``provider_override`` pin the worker model (provider requires model); ``reasoning_effort`` is
+    independent. ``creator_task_id``: inherit durable session/subscriptions independently of dependency edges;
+    explicit ``session_id`` wins, else the caller's persisted ``HERMES_SESSION_ID`` (``""`` = none).
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
-    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_db_graph import ambient_session_id, initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
@@ -1259,6 +1258,7 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    ambient_session = ambient_session_id() if session_id is None else None  # state.db read outside the txn
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
@@ -1302,7 +1302,7 @@ def create_task(
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id or None, completion_contract,
                     ),
                 )
                 for pid in parents:
@@ -1346,7 +1346,7 @@ def create_task(
                             {"reason": "parent_not_done", "parent": gating[0]},
                         )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
-                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
+                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now, ambient_session=ambient_session)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:

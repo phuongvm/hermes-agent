@@ -255,3 +255,75 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Session provenance: `create` inherits HERMES_SESSION_ID; --session overrides
+# ---------------------------------------------------------------------------
+
+
+def _persist_sessions(home, *session_ids):
+    from hermes_state import SessionDB
+
+    state = SessionDB(db_path=home / "state.db")
+    try:
+        for sid in session_ids:
+            state.create_session(sid, source="cli")
+    finally:
+        state.close()
+
+
+def _created_session(out):
+    import re
+
+    m = re.search(r"Created\s+(t_[0-9a-f]+)", out)
+    assert m, out
+    with kbc.connect_closing() as conn:
+        return kb.get_task(conn, m.group(1)).session_id
+
+
+def test_create_inherits_persisted_hermes_session_id(kanban_home, monkeypatch):
+    """A card created from an agent's terminal links back to the agent's session."""
+    _persist_sessions(kanban_home, "agent-session")
+    monkeypatch.setenv("HERMES_SESSION_ID", "agent-session")
+    assert _created_session(kc.run_slash("create 'from agent terminal' --assignee coder")) == "agent-session"
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, kb.create_task(conn, title="direct")).session_id == "agent-session"
+
+
+def test_create_ignores_unpersisted_or_missing_session(kanban_home, monkeypatch):
+    """An env id with no sessions row (or no state.db at all) is not provenance."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "phantom")
+    assert _created_session(kc.run_slash("create 'no state.db' --assignee coder")) is None
+    _persist_sessions(kanban_home, "other")
+    assert _created_session(kc.run_slash("create 'unknown id' --assignee coder")) is None
+    monkeypatch.delenv("HERMES_SESSION_ID")
+    assert _created_session(kc.run_slash("create 'plain cli' --assignee coder")) is None
+
+
+def test_create_session_flag_is_explicit_and_wins_over_env(kanban_home, monkeypatch):
+    """--session records the given id verbatim (the caller vouches for it); '' records none."""
+    _persist_sessions(kanban_home, "agent-session")
+    monkeypatch.setenv("HERMES_SESSION_ID", "agent-session")
+    out = kc.run_slash("create 'planned card' --assignee coder --session planning-session")
+    assert _created_session(out) == "planning-session"
+    assert _created_session(kc.run_slash("create 'opt out' --assignee coder --session ''")) is None
+
+
+def test_create_creator_task_origin_beats_ambient_session(kanban_home, monkeypatch):
+    """A worker's own (transient) session never displaces its task's durable origin."""
+    _persist_sessions(kanban_home, "worker-run")
+    with kbc.connect_closing() as conn:
+        owner = kb.create_task(conn, title="owner", session_id="durable-origin")
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-run")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
+    assert _created_session(kc.run_slash("create 'child' --assignee coder")) == "durable-origin"
+
+
+def test_create_bound_context_wins_over_process_env(kanban_home, monkeypatch):
+    """In a multi-session host the request-scoped binding names the caller, not os.environ."""
+    from gateway.session_context import scoped_current_session_id
+
+    _persist_sessions(kanban_home, "last-built-agent", "ordering-session")
+    monkeypatch.setenv("HERMES_SESSION_ID", "last-built-agent")
+    with scoped_current_session_id("ordering-session"):
+        out = kc.run_slash("create 'ordered' --assignee coder")
+    assert _created_session(out) == "ordering-session"

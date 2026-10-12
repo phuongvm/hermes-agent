@@ -186,6 +186,9 @@ _SPECS = [
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
+        _arg("--session", dest="session_id", metavar="SESSION_ID",
+             help="Originating session id recorded as the task's provenance. Default: the calling "
+                  "agent's HERMES_SESSION_ID when this profile's state.db holds it; '' records none."),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "

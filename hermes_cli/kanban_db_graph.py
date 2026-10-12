@@ -1,25 +1,72 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 import time
 from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
+
+
+def ambient_session_id() -> Optional[str]:
+    """The calling agent's ``HERMES_SESSION_ID`` when this profile's state.db holds it, else None.
+
+    A ``hermes kanban create`` run from an agent's terminal inherits the id, so CLI-created cards keep
+    their originating session. Once a host has bound session ContextVars (gateway, TUI/desktop
+    backend) only the request-scoped binding counts: the ``os.environ`` mirror names the LAST agent
+    built, not this caller (same guard as ``tools.environments.local._inject_session_context_env``).
+    An id with no ``sessions`` row is provenance pointing at nothing — ``kanban_create``'s policy.
+    """
+    from gateway.session_context import _UNSET, _VAR_MAP, session_context_engaged
+
+    bound = _VAR_MAP["HERMES_SESSION_ID"].get()
+    if bound is _UNSET:
+        bound = "" if session_context_engaged() else os.environ.get("HERMES_SESSION_ID", "")
+    session_id = (bound or "").strip()
+    if not session_id:
+        return None
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+
+    db_path = get_hermes_home() / "state.db"
+    if not db_path.exists():  # a bare CLI invocation outside any agent
+        return None
+    try:
+        state = SessionDB(db_path=db_path, read_only=True)
+    except sqlite3.Error:
+        logger.debug("Could not open state.db to verify Kanban provenance", exc_info=True)
+        return None
+    try:
+        return session_id if state.get_session(session_id) else None
+    finally:
+        state.close()
+
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
-    created_at: int,
+    created_at: int, ambient_session: Optional[str] = None,
 ) -> None:
-    """Copy durable origin inside creation's transaction, never adding dependencies."""
-    if not creator_task_id:
-        return
-    from hermes_cli.kanban_db import _inherit_notify_subs
+    """Copy durable origin inside creation's transaction, never adding dependencies.
 
-    conn.execute(
-        "UPDATE tasks SET session_id = COALESCE(session_id, "
-        "(SELECT session_id FROM tasks WHERE id = ?)) WHERE id = ?",
-        (creator_task_id, task_id),
-    )
-    _inherit_notify_subs(conn, task_id, (creator_task_id,), created_at=created_at)
+    Precedence: the explicit ``session_id`` already on the row, then the creator task's durable
+    origin, then ``ambient_session`` (the calling agent's own, possibly transient, session).
+    """
+    if creator_task_id:
+        from hermes_cli.kanban_db import _inherit_notify_subs
+
+        conn.execute(
+            "UPDATE tasks SET session_id = COALESCE(session_id, "
+            "(SELECT session_id FROM tasks WHERE id = ?)) WHERE id = ?",
+            (creator_task_id, task_id),
+        )
+        _inherit_notify_subs(conn, task_id, (creator_task_id,), created_at=created_at)
+    if ambient_session:
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ? AND session_id IS NULL",
+            (ambient_session, task_id),
+        )
 
 
 def initial_task_state(
