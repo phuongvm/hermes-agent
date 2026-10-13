@@ -26,10 +26,10 @@
   - Proof: `scripts/run_tests.sh tests/skills/test_skill_docs_contract.py tests/skills/test_skill_pages_match_shipped_skills.py -q` passes.
 
 - [x] Task 7: Remediate Round-1 Reviewer findings (C-01, C-02, C-03)
-  - C-01: Comprehensively close mutating classes in `sentinel_probes.py` (`assert_read_only` blocks Redis writes including `redis-cli SET`, SQL write statements including `MERGE INTO` and `UPDATE SET`, file redirection, and scripting runtimes `python -c`, `open(`, `.write(`); add `Probe.__post_init__` check and behavioral CLI tests proving exit 2 and zero runner calls.
-  - C-02: Enforce non-empty evidence across all findings in `sentinel_checks.py` and `sentinel_platform.py` (including OK/INFO absence findings `DOCKER-RESTARTS`, `DB-CH-LOG-TTL`, `DOCKER-HEALTH`, `DOCKER-LOG-ROTATION`, `DOCKER-OOM`, `SEC-DB-PORTS`, `SEC-DOCKER-PRIV`, `DOCKER-LOG-SIZE`, `DOCKER-RW-LAYER`, `STORAGE-ORPHANS`); add non-empty evidence contract test.
-  - C-03: Implement expected catalog and section completeness check in `check_collection`, cascade missing/malformed sections to UNKNOWN findings across host (`HOST-LOAD`), security, DB, and docker checks; add missing-section and malformed-payload tests.
-  - Proof: 67/67 unit tests pass in `test_intel_nuc_sentinel_skill.py`; `sentinel.py verify` passes on live run `20261013T103241Z`.
+  - C-01: New `scripts/sentinel_guard.py`, a fail-closed per-transport allowlist checked in `Probe.__post_init__`, `build_probes` and `load_config` before any runner call. The `sentinel_probes.py` denylist is widened (Redis writes, SQL MERGE/UPSERT/REPLACE, interpreter `-c/-e`, file-write calls) and kept as a second check. Tests: 44 refusals with the denylist emptied; CLI `plan`/`run` exit 2 with zero runner calls and no run directory for Redis SET, SQL MERGE, unlisted executable and unlisted cmdlet.
+  - C-02: `finding()` raises when given no evidence line. Every all-clear finding cites the per-container / per-row values it inspected, and every UNKNOWN cites stderr or the section state. Contract test over the healthy fixture, plus a test that `finding()` without evidence raises.
+  - C-03: `expected_sections(cfg)` drives `check_collection`. rc=0 sections are shape-checked (`sentinel_parse.well_formed`), SQL results need their required tags, and Windows JSON needs its typed fields. Missing, failed or malformed input produces UNKNOWN; no finding is omitted. Tests: 90 parametrised cases (every expected section x drop / rc!=0 / malformed) plus structured-probe and ps-without-inspect cases.
+  - Proof: `test_intel_nuc_sentinel_skill.py` 205 passed; ruff clean; `openspec validate --strict` valid; fresh live run plus `sentinel.py verify` recorded in the card handoff.
 
 - [ ] Task 8: Independent re-review (@reviewer / crew-verifier) of skill, scripts and artifacts.
 

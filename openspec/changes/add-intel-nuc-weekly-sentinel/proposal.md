@@ -11,8 +11,9 @@ harmful commands, with every metric backed by evidence. Exploration:
 ## What Changes
 - New bundled skill `skills/devops/intel-nuc-sentinel/`:
   - `scripts/sentinel.py`: CLI with `plan | collect | evaluate | run | verify`.
-  - `scripts/sentinel_probes.py`: fixed probe catalog, config token validation, read-only guard.
-  - `scripts/sentinel_parse.py`: pure parsers for `df`, `du`, `stat`, `meminfo`, `sshd -T`, apt, JSON lines.
+  - `scripts/sentinel_probes.py`: fixed probe catalog, config token validation, mutating-pattern denylist.
+  - `scripts/sentinel_guard.py`: fail-closed per-transport allowlist (bash / SQL / PowerShell) every probe script must pass.
+  - `scripts/sentinel_parse.py`: pure parsers for `df`, `du`, `stat`, `meminfo`, `sshd -T`, apt, JSON lines, and per-section shape checks.
   - `scripts/sentinel_checks.py`, `scripts/sentinel_platform.py`: deterministic findings for
     docker, storage, datastores, host and security, with cross-checks.
   - `templates/intel-nuc.json`: host paths, container names, thresholds.

@@ -19,12 +19,21 @@ requires no password and changes nothing. The run never uses `sudo`.
 
 ## Read-only guarantees
 
-1. Probe scripts and every remote command line pass `assert_read_only` (`scripts/sentinel_probes.py`)
-   before `ssh` starts: no `rm/mv/cp/kill/tee/touch`, no output redirection to a file, no
-   mutating `docker`/`systemctl`/`apt`/`wsl` verbs, no SQL write statements (`MERGE INTO`, `UPDATE SET`, `INSERT`, `DELETE`),
-   no Redis writes (`SET`, `DEL`, `HSET`, `LPUSH`, `FLUSHALL`), no interpreter escape paths (`python -c`, `perl -e`, `node -e`, `open(`, `.write(`),
-   no mutating PowerShell verbs (`Set-`, `Remove-`, `Stop-`, `Optimize-`, `Out-`, ...). Probe construction
-   enforces this in `Probe.__post_init__`, and `load_config` validates every script and command before connection.
+1. Every probe script must pass the fail-closed allowlist in `scripts/sentinel_guard.py` before
+   `ssh` starts. A command it does not know is refused, never run:
+   - bash (`linux_host`, `docker_engine`, `docker_vm`, `ubuntu_root`): only `## name` section
+     blocks; executables `echo test cat grep nproc date df du stat sshd apt docker xargs` with fixed
+     argument shapes (`apt list --upgradable`, `sshd -T`, `docker ps|info|inspect|system df`,
+     `docker exec <c> redis-cli PING|INFO [section]`, `docker exec <c> sh -c '<echo only>'`); no
+     `$(...)`, backticks, redirection other than `2>/dev/null`, or `&`.
+   - SQL (`postgres`, `clickhouse`): `SELECT` only, allowlisted functions, no `INTO`, `SETTINGS`,
+     `FOR`, comments, dollar or identifier quotes.
+   - PowerShell (`windows_host`): allowlisted `Get-*`/pipeline cmdlets, type literals, static
+     members and methods; no `&`, `.` invocation, backtick, redirection, here-strings, provider
+     paths or dynamic member names.
+   The mutating-pattern denylist in `scripts/sentinel_probes.py` (`assert_read_only`) checks the
+   same scripts and every remote command line as well. Both run in `Probe.__post_init__`,
+   `build_probes` and `load_config`, so `plan`/`run` exit 2 before any connection.
 2. Database sessions are read-only at the server: Postgres refuses writes
    (`cannot execute ... in a read-only transaction`), ClickHouse `readonly=1`. The first query of
    each probe echoes the setting, and `DB-PG-UP` / `DB-CH-UP` go CRIT if it is not in force.

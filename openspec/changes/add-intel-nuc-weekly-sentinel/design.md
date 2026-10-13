@@ -39,9 +39,9 @@ single finding to UNKNOWN instead of failing the run. SQL probes tag their first
 | Decision | Rationale | Rejected alternative |
 |---|---|---|
 | Probe scripts on stdin, fixed remote reader | Remote command line stays short and auditable; no quoting of the script through ssh | `ssh host "<long quoted script>"`: fragile quoting, harder to guard |
-| Comprehensive mutation guard **plus** fixed catalog | Guard comprehensively blocks filesystem writes, redirections, SQL write statements (including MERGE/UPDATE), Redis writes (SET/DEL/HSET), and scripting runtimes; catalog is the allowlist | Incomplete denylist that missed Redis writes, SQL MERGE, and interpreter escapes |
-| Non-empty evidence contract | Every finding (including OK/INFO absence findings) quotes raw section lines inspected | Empty evidence arrays on healthy findings |
-| Expected catalog completeness check | Missing or malformed sections/probes cascade to UNKNOWN findings and flag missing sections | Checking only sections that exist in raw output |
+| Fail-closed per-transport allowlist (`sentinel_guard.py`) **plus** denylist | Round-1 review showed the denylist alone admitted `redis-cli SET`, SQL `MERGE` and `python -c open(...,'w')`. The allowlist parses each transport: bash scripts must be `_section` blocks whose simple commands use an allowlisted executable with allowlisted arguments (`docker` only `ps/info/inspect/system df` and `exec <c> redis-cli PING|INFO [s]`); SQL must be `SELECT` with allowlisted functions and no `INTO`/`SETTINGS`/`FOR`/comments/dollar quotes; PowerShell only allowlisted cmdlets, types, statics and methods, with no `&`, backtick, redirection, here-strings or provider paths. Anything unknown is refused. The denylist stays as a second check | Denylist only: an unlisted command spelling runs. Full shell/SQL/PowerShell parsers: far more code than an 8-probe catalog needs |
+| Evidence is mandatory at construction | `finding()` raises without a non-empty evidence line, so a missing citation is a bug caught by tests, never a placeholder; all-clear findings cite the per-container / per-row values they inspected | Empty evidence on healthy findings; synthesising a placeholder line |
+| Completeness against the expected catalog, with shape checks | `expected_sections(cfg)` lists every section each bash probe must print; `sentinel_parse.well_formed` checks each rc=0 section has the shape its command prints; SQL results need their required tags; Windows JSON needs its typed fields; a docker ps row without an inspect record makes per-container docker checks UNKNOWN. Any gap is UNKNOWN plus `COLLECT-<PROBE>` | Checking only sections present in raw output; trusting rc=0 |
 | Bytes on stdin | Windows text-mode stdin injected `\r`, breaking every `2>&1` (seen live) | Text mode |
 | `{{with index .State "Health"}}` | `.State.Health` errors on containers without a healthcheck (seen live) | `{{if .State.Health}}` |
 | Severity in the report, exit 0 on any report | Cron passes stdout to the agent only on success | Non-zero exit on WARN/CRIT would drop the report |
@@ -60,10 +60,13 @@ single finding to UNKNOWN instead of failing the run. SQL probes tag their first
 ## 5. Testing
 
 `tests/skills/test_intel_nuc_sentinel_skill.py` fakes ssh with a runner that returns canned output
-per probe (matched by script bytes). It covers: catalog validity; refused mutating commands and
-allowed reads (including Redis SET, SQL MERGE/UPDATE, interpreter/file escapes); CLI exit 2 and zero runner
-calls on mutating catalog; non-empty evidence contract across all findings; missing/malformed sections
-emitting UNKNOWN (loadavg/nproc, meminfo, windows_host, postgres, clickhouse, security sections);
+per probe (matched by script bytes). It covers: catalog validity (allowlist and denylist); refused
+mutating commands and allowed reads (including Redis SET, SQL MERGE/UPDATE, interpreter/file escapes);
+44 allowlist refusals with the denylist disabled, and CLI exit 2 / zero runner calls / no run directory
+for unlisted commands with the denylist disabled; non-empty evidence contract across all findings and
+`finding()` raising without evidence; every expected section x {dropped, rc != 0, malformed} emitting
+UNKNOWN with no finding lost and none OK from the broken section (90 cases); windows_host / postgres /
+clickhouse missing or malformed; ps row without inspect record;
 healthy host => no CRIT/WARN/UNKNOWN and all cross-checks agree; stopped container => CRIT with evidence;
 failed section => UNKNOWN; DB unreachable => CRIT; source disagreement => `verified=False`; risky posture => WARN;
 restart deltas and container re-create; determinism; LF bytes on stdin; timeout => rc 124; run dir verifies

@@ -4,13 +4,23 @@
 
 ### Requirement: Read-only collection
 The sentinel MUST collect every metric through a fixed probe catalog and MUST NOT change state on the
-host. A probe script or remote command line that matches a mutating pattern MUST be refused before any
-connection is opened.
+host. Enforcement MUST fail closed: every probe script MUST be accepted by a per-transport allowlist
+(bash: only `## name` section blocks whose simple commands use allowlisted executables and arguments;
+SQL: only `SELECT` statements calling allowlisted functions; PowerShell: only allowlisted cmdlets, type
+literals, static members and methods). A command the allowlist does not know MUST be refused, not run.
+A mutating-pattern denylist MUST additionally check probe scripts and remote command lines. Both checks
+MUST run before any connection is opened.
 
 #### Scenario: Catalog edit introduces a mutating command
 - GIVEN a probe script containing `docker restart`, `rm`, `apt update`, `wsl --shutdown`, SQL write statements (including `MERGE INTO`, `UPDATE SET`, `INSERT`, `DELETE`), Redis writes (including `redis-cli SET`, `DEL`, `HSET`, `LPUSH`), interpreter escape paths (including `python -c`, `perl -e`, `node -e`, `open(...)`), mutating PowerShell cmdlets, or output redirection to a file
 - WHEN the configuration or probe is loaded
 - THEN loading MUST fail with `ReadOnlyViolation` and the CLI MUST exit 2 without running `ssh` or any runner calls
+
+#### Scenario: Unknown command with the denylist disabled
+- GIVEN the mutating-pattern denylist is empty
+- AND a probe script uses a command the allowlist does not know (an unlisted executable, a Redis verb other than `PING`/`INFO`, a non-`SELECT` SQL statement or unlisted SQL function, an unlisted PowerShell cmdlet, alias, provider path or .NET member, command substitution, or redirection)
+- WHEN `sentinel.py plan` or `sentinel.py run` loads the configuration
+- THEN it MUST exit 2, make zero runner calls and create no run directory
 
 #### Scenario: Datastore sessions
 - GIVEN the Postgres and ClickHouse probes
@@ -38,11 +48,15 @@ stderr) MUST be stored with the run.
 - GIVEN a completely healthy host run
 - WHEN the findings are evaluated
 - THEN every finding (including `DOCKER-RESTARTS`, `DB-CH-LOG-TTL`, `DOCKER-HEALTH`, `DOCKER-LOG-ROTATION`, `DOCKER-OOM`, `SEC-DB-PORTS`, `SEC-DOCKER-PRIV`, `DOCKER-LOG-SIZE`, `DOCKER-RW-LAYER`, `STORAGE-ORPHANS`) MUST have non-empty `evidence` quoting the inspected raw lines
+- AND constructing a finding without an evidence line MUST raise, so no placeholder evidence is ever synthesised
 
 ### Requirement: No estimated values
-A metric whose probe section failed or is missing MUST be reported UNKNOWN with the failing section and rc. It MUST NOT
-be reported OK or filled from a previous run. Collection completeness MUST compare against the expected probe catalog
-and expected sections.
+A metric MUST be reported UNKNOWN, with the failing section and rc, when its probe section failed, is
+missing, or exited 0 but does not have the shape its command prints (malformed). The same applies to a SQL
+probe missing a required result tag and to Windows JSON missing a required field. It MUST NOT be reported
+OK, omitted, or filled from a previous run. Collection completeness MUST compare against the expected
+probe catalog and expected sections, and `COLLECT-<PROBE>` MUST list `failed_sections`,
+`missing_sections` and `malformed_sections`.
 
 #### Scenario: One probe section fails
 - GIVEN the `df` section of `linux_host` exits non-zero
@@ -55,6 +69,13 @@ and expected sections.
 - WHEN the run is evaluated
 - THEN `HOST-LOAD` MUST be emitted as UNKNOWN with evidence
 - AND `COLLECT-LINUX_HOST` MUST list the missing sections in `missing_sections`
+
+#### Scenario: Any required section dropped, failed or malformed
+- GIVEN any one expected section of `linux_host`, `docker_engine`, `docker_vm` or `ubuntu_root` is dropped, exits non-zero, or exits 0 with unparseable content
+- WHEN the run is evaluated
+- THEN every finding a healthy run emits MUST still be present
+- AND no finding derived from that section MUST be OK
+- AND `COLLECT-<PROBE>` MUST name the section in `missing_sections`, `failed_sections` or `malformed_sections`
 
 ### Requirement: Cross-checked metrics
 Where a second independent source exists, the finding MUST record whether both agree (`verified`). When
