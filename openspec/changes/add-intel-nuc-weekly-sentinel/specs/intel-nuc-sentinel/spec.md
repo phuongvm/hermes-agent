@@ -34,10 +34,14 @@ MUST run before any connection is opened.
 - THEN loading MUST fail with `ConfigError` and the CLI MUST exit 2
 
 ### Requirement: Evidence for every finding
-Each finding MUST carry a status (CRIT, WARN, UNKNOWN, INFO, OK), a value, and non-empty evidence lines quoting the
-raw probe output it was derived from. Every finding, including OK and INFO findings that observe the absence of issues,
-MUST cite the inspected raw lines. The raw output of every probe (argv, script sha256, rc, stdout,
-stderr) MUST be stored with the run.
+Each finding MUST carry a status (CRIT, WARN, UNKNOWN, INFO, OK), a value, and non-empty evidence. Every
+evidence item MUST be a verifiable locator plus the exact raw line: `{probe, section, line_no, line}` where
+`line` equals line `line_no` of the stored probe stdout (stderr when `section` is `stderr`) and `line_no`
+lies inside the cited section (SQL: a row with that tag). Normalised or derived text MUST NOT appear as
+evidence. The only exception is `section: status`, which records that a probe or section produced no output
+at all, and it MAY back only an UNKNOWN or CRIT finding. Every finding, including OK and INFO findings that
+observe the absence of issues, MUST cite the inspected raw lines. The raw output of every probe (argv, script
+sha256, rc, stdout, stderr) MUST be stored with the run.
 
 #### Scenario: Weekly run
 - GIVEN a reachable host
@@ -50,11 +54,20 @@ stderr) MUST be stored with the run.
 - THEN every finding (including `DOCKER-RESTARTS`, `DB-CH-LOG-TTL`, `DOCKER-HEALTH`, `DOCKER-LOG-ROTATION`, `DOCKER-OOM`, `SEC-DB-PORTS`, `SEC-DOCKER-PRIV`, `DOCKER-LOG-SIZE`, `DOCKER-RW-LAYER`, `STORAGE-ORPHANS`) MUST have non-empty `evidence` quoting the inspected raw lines
 - AND constructing a finding without an evidence line MUST raise, so no placeholder evidence is ever synthesised
 
+#### Scenario: Evidence is verbatim raw output
+- GIVEN any evaluated run (healthy, degraded or failed)
+- WHEN `sentinel_evidence.evidence_problems(raw, findings)` runs
+- THEN it MUST return no problems: every cited line is the raw line at its locator
+- AND `sentinel.py verify` MUST report and exit 4 when a stored evidence line differs from its raw line
+
 ### Requirement: No estimated values
 A metric MUST be reported UNKNOWN, with the failing section and rc, when its probe section failed, is
 missing, or exited 0 but does not have the shape its command prints (malformed). The same applies to a SQL
-probe missing a required result tag and to Windows JSON missing a required field. It MUST NOT be reported
-OK, omitted, or filled from a previous run. Collection completeness MUST compare against the expected
+probe whose rows do not match the typed schema (each tag's row count, column count and column types) and to
+Windows JSON that does not match its typed schema, nested `disks`, `vhdx` and `firewall` entries included. A
+finding MUST declare every source it needs, primary and cross-check alike; if any of them is unusable the
+finding MUST be UNKNOWN with `verified` null, never OK/INFO/WARN with an unverified cross-check, and evaluation
+MUST NOT raise. It MUST NOT be reported OK, omitted, or filled from a previous run. Collection completeness MUST compare against the expected
 probe catalog and expected sections, and `COLLECT-<PROBE>` MUST list `failed_sections`,
 `missing_sections` and `malformed_sections`.
 
@@ -76,6 +89,17 @@ probe catalog and expected sections, and `COLLECT-<PROBE>` MUST list `failed_sec
 - THEN every finding a healthy run emits MUST still be present
 - AND no finding derived from that section MUST be OK
 - AND `COLLECT-<PROBE>` MUST name the section in `missing_sections`, `failed_sections` or `malformed_sections`
+
+#### Scenario: Cross-check source unavailable
+- GIVEN `docker_info`, `data_du`, `vhdx_stat`, the inner `df`, or the whole `windows_host` probe is dropped, failed or malformed
+- WHEN the run is evaluated
+- THEN every finding that uses it as primary or cross-check source (`DOCKER-LIVENESS`; `DB-ZK-AUTOPURGE`, `DB-PG-SIZE`, `DB-CH-SIZE`; `STORAGE-VHDX-*`; `STORAGE-DISK-MNT-C/D`) MUST be UNKNOWN with `verified` null
+
+#### Scenario: Malformed rc=0 structured payload
+- GIVEN a SQL row with the wrong arity or type (e.g. `conn|10`), a duplicated single-row tag, or Windows JSON whose `disks` holds a non-object
+- WHEN the run is evaluated
+- THEN evaluation MUST NOT raise
+- AND `COLLECT-<PROBE>` and every finding derived from that probe MUST be UNKNOWN
 
 ### Requirement: Cross-checked metrics
 Where a second independent source exists, the finding MUST record whether both agree (`verified`). When

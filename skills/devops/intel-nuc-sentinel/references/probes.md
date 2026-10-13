@@ -51,7 +51,15 @@ requires no password and changes nothing. The run never uses `sudo`.
 | `DB-PG-SIZE` | `sum(pg_database_size)` | `du -skx` of PGDATA | A <= B x 1.05 |
 | `DB-CH-SIZE` | `sum(system.parts.bytes_on_disk)` | `du -skx` of the data dir | A <= B x 1.05 |
 
-`MISMATCH` means two sources disagree: report it, never pick one.
+`MISMATCH` means two sources disagree: report it, never pick one. If either source failed, is missing
+or is malformed (or lacks the row for that disk / VHDX / data dir), the finding is UNKNOWN with no
+`verified` value: a cross-checked metric is never reported on one source.
+
+## Evidence
+
+Every evidence item is `{probe, section, line_no, line}`: `line` is line `line_no` of that probe's stored
+stdout (stderr for `section: stderr`), inside the cited section (SQL: a row with that tag). `section:
+status` means no output existed and backs only UNKNOWN/CRIT. `sentinel.py verify` re-checks every locator.
 
 ## Findings
 

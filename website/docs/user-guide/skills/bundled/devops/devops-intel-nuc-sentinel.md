@@ -102,6 +102,8 @@ prompt such as "Summarise the sentinel report for the owner; follow the skill's 
 ## Pitfalls
 
 - A probe section that fails yields UNKNOWN, not OK. Never fill a gap from an older report or memory.
+- A cross-checked finding whose second source failed is UNKNOWN too; do not report it from the surviving source.
+- Evidence lines are verbatim raw output with a `line_no` locator; quote them as they are, never paraphrase.
 - `apt list --upgradable` is only as fresh as the package lists (`SEC-APT-LISTS-AGE`); the
   sentinel never runs `apt update`, which would write to the host.
 - VHDX slack is file length minus filesystem used; it is reclaimable only by compaction in a
