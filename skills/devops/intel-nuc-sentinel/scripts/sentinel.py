@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sentinel_checks as C
+import sentinel_evidence as E
 import sentinel_platform as PL
 from sentinel_probes import ConfigError, ReadOnlyViolation, assert_probe_read_only, build_probes, remote_command, ssh_argv
 
@@ -104,14 +105,13 @@ def next_baseline(cfg: dict, raw: dict, prev: dict) -> dict | None:
     """State the next run diffs against. A section this run could not read keeps the previous
     value, so one failed probe never resets week-over-week deltas. None: nothing new to record."""
     ctx = C.Ctx(cfg, raw, {})
-    pg, ch = ctx.sql("postgres", "|"), ctx.sql("clickhouse", "\t")
     new = dict(prev)
     if ctx.containers is not None:
-        new["restart_counts"] = {r["name"]: r["inspect"].get("restart_count", 0) for r in ctx.containers}
-    if pg and pg.get("db"):
-        new["pg_sizes"] = {r[0]: int(r[1]) for r in pg["db"]}
-    if ch and ch.get("db"):
-        new["ch_sizes"] = {r[0]: int(r[1]) for r in ch["db"]}
+        new["restart_counts"] = {r["name"]: r["inspect"]["restart_count"] for r in ctx.containers}
+    if ctx.pg:
+        new["pg_sizes"] = {e["cols"][0]: int(e["cols"][1]) for e in ctx.pg["db"]}
+    if ctx.ch and ctx.ch.get("db"):
+        new["ch_sizes"] = {e["cols"][0]: int(e["cols"][1]) for e in ctx.ch["db"]}
     return new if new != prev else None
 
 
@@ -130,7 +130,8 @@ def render(findings: list[dict], meta: dict) -> str:
         if f["status"] == "OK":
             continue
         lines.append(f"- **{f['id']}** {f['note']}".rstrip())
-        lines += [f"  - `{e['probe']}/{e['section']}`: `{e['line'].splitlines()[0][:200] if e['line'] else ''}`" for e in f["evidence"][:6]]
+        lines += [f"  - `{e['probe']}/{e['section']}" + (f":{e['line_no']}" if e.get("line_no") is not None else "")
+                  + f"`: `{e['line'][:200]}`" for e in f["evidence"][:6]]
     lines += ["", "No action was taken on the host. Every remediation needs owner approval."]
     return "\n".join(lines) + "\n"
 
@@ -164,6 +165,7 @@ def verify(run_dir: Path) -> list[str]:
     stored = load_json(run_dir / "findings.json")["findings"]
     if evaluate_raw(cfg, raw, baseline) != stored:
         problems.append("findings.json differs from a fresh evaluation of raw.json")
+    problems += E.evidence_problems(raw, stored)
     for pid, r in sorted(raw.items()):
         probe = next((p for p in build_probes(cfg) if p.id == pid), None)
         if probe is None or hashlib.sha256(probe.script.encode()).hexdigest() != r["script_sha256"]:

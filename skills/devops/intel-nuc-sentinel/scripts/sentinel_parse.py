@@ -312,7 +312,7 @@ SQL_SCHEMA = {
 
 
 def _row_ok(cols: list[str], types: tuple[str, ...]) -> bool:
-    return len(cols) == len(types) and all(re.fullmatch(_COL[t], v) for t, v in zip(cols, types))
+    return len(cols) == len(types) and all(re.fullmatch(_COL[t], v) for v, t in zip(cols, types))
 
 
 def sql_well_formed(probe: str, rows: dict[str, list[dict]]) -> bool:

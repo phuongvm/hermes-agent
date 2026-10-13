@@ -1,20 +1,28 @@
 """Deterministic evaluation: raw probe output + config + optional baseline -> findings.
 
-A metric whose probe section failed is reported UNKNOWN, never estimated. A metric with a
-second, independent source is cross-checked; ``verified`` is True only when both sources agree,
-False when they disagree, None when no second source exists.
+Every finding names the sources it needs, primary and cross-check. If any of them failed, is
+missing or is malformed, the finding is UNKNOWN and cites the raw lines that show why; it is never
+estimated, filled from an older run, or reported with an unverified cross-check. Every evidence
+item is an exact line of the stored raw output plus its locator (see ``sentinel_evidence``).
 """
 from __future__ import annotations
 
 import json
 import posixpath
 
+import sentinel_evidence as E
 import sentinel_parse as P
 from sentinel_probes import DB_PORTS
 
 ORDER = {"CRIT": 0, "WARN": 1, "UNKNOWN": 2, "INFO": 3, "OK": 4}
 GB = 1e9
-BASH_PROBES = ("linux_host", "docker_engine", "docker_vm", "ubuntu_root")
+BASH_PROBES = E.BASH_PROBES
+PROBES = ("linux_host", "windows_host", "docker_engine", "docker_vm", "ubuntu_root", "postgres", "clickhouse")
+# Sources a finding can require: (probe, section) for framed shell output, (probe, None) for a
+# structured probe, and CONTAINERS for `docker ps` joined one-to-one with `docker inspect`.
+CONTAINERS = ("docker_engine", "*containers")
+WIN, PG, CH = ("windows_host", None), ("postgres", None), ("clickhouse", None)
+DOCKER_INFO = ("docker_engine", "docker_info")
 
 
 def finding(fid, area, title, status, value=None, threshold=None, evidence=(), verified=None, note=""):
@@ -23,20 +31,7 @@ def finding(fid, area, title, status, value=None, threshold=None, evidence=(), v
         # Spec: every finding cites the raw probe/section line it was derived from; never synthesise one.
         raise ValueError(f"finding {fid}: no evidence line")
     return {"id": fid, "area": area, "title": title, "status": status, "value": value,
-            "threshold": threshold, "verified": verified, "note": note,
-            "evidence": evid}
-
-
-def ev(probe, section, line):
-    return {"probe": probe, "section": section, "line": str(line)[:300]}
-
-
-def unknown(fid, area, title, probe, section, sec):
-    rc = None if sec is None else sec.get("rc")
-    lines = (sec or {}).get("lines", [])
-    head = "\n".join(lines[:5]) if lines else f"{probe}/{section} missing or failed (rc={rc})"
-    return finding(fid, area, title, "UNKNOWN", note=f"{probe}/{section} failed or missing (rc={rc})",
-                   evidence=[ev(probe, section, head)])
+            "threshold": threshold, "verified": verified, "note": note, "evidence": evid}
 
 
 def level(value, warn, crit=None):
@@ -67,15 +62,17 @@ def expected_sections(cfg: dict) -> dict[str, list[str]]:
 
 
 class Ctx:
-    """Parsed view of one run's raw probe output."""
+    """Parsed, shape-checked view of one run's raw probe output."""
 
     def __init__(self, cfg: dict, raw: dict[str, dict], baseline: dict | None):
         self.cfg, self.raw, self.baseline = cfg, raw, baseline or {}
         self.t = cfg["thresholds"]
-        self.sec = {pid: P.sections(raw.get(pid, {}).get("stdout", "")) for pid in BASH_PROBES}
-        self.containers = self._containers()
-        self.win = self._windows()
+        self.sec = {pid: P.sections((raw.get(pid) or {}).get("stdout", "")) for pid in BASH_PROBES}
+        self.containers, self.unjoined = self._containers()
+        self.win, self.win_line = self._windows()
+        self.pg, self.ch = self._sql("postgres"), self._sql("clickhouse")
 
+    # ---------------------------------------------------------------- sections and payloads
     def s(self, probe, name):
         return self.sec.get(probe, {}).get(name)
 
@@ -87,249 +84,267 @@ class Ctx:
     def malformed(self, probe):
         return sorted(n for n, s in self.sec.get(probe, {}).items() if P.ok(s) and not P.well_formed(n, s["lines"]))
 
-    def sql(self, probe, sep):
+    def sql(self, probe):
+        return {"postgres": self.pg, "clickhouse": self.ch}[probe]
+
+    def _sql(self, probe):
         r = self.raw.get(probe) or {}
         if r.get("rc") != 0:
             return None
-        rows = P.tagged_rows(r.get("stdout", ""), sep)
+        rows = P.sql_rows(r.get("stdout", ""), E.SQL_SEP[probe])
         return rows if P.sql_well_formed(probe, rows) else None
 
     def _containers(self):
         ps, ins = self.ok("docker_engine", "docker_ps"), self.ok("docker_engine", "docker_inspect")
         if ps is None or ins is None:
-            return None
-        rows, _ = P.json_lines(ps["lines"])
-        by_id = {d["id"]: d for d in P.json_lines(ins["lines"])[0]}
-        if any(r["id"] not in by_id for r in rows):
+            return None, []
+        by_id = {o["id"]: (ln, o) for ln, o in P.json_records(ins["lines"])}
+        rows, unjoined = [], []
+        for ln, o in P.json_records(ps["lines"]):
+            if o["id"] not in by_id:
+                unjoined.append(ln)
+                continue
+            iln, io = by_id[o["id"]]
+            rows.append({**o, "ps_line": ln, "inspect": io, "inspect_line": iln})
+        if unjoined:
             # A container listed by ps with no inspect record: its health/OOM/ports are unknown.
-            return None
-        for r in rows:
-            r["inspect"] = by_id[r["id"]]
-        return sorted(rows, key=lambda r: r["name"])
+            return None, unjoined
+        return sorted(rows, key=lambda r: r["name"]), []
 
     def _windows(self):
         r = self.raw.get("windows_host") or {}
         if r.get("rc") != 0:
-            return None
-        try:
-            obj = json.loads(r.get("stdout", "").strip())
-        except ValueError:
-            return None
-        return obj if P.windows_well_formed(obj) else None
+            return None, None
+        lines = P.body(P.raw_lines(r.get("stdout", "")))
+        good, _ = P.json_lines(lines[:1])
+        if len(lines) != 1 or not good or not P.windows_well_formed(good[0]):
+            return None, None
+        return good[0], lines[0]
+
+    # ---------------------------------------------------------------- evidence
+    def cite(self, probe, section, line):
+        n = E.locate(self.raw, probe, section, line)
+        if n is None:
+            raise ValueError(f"evidence {probe}/{section}: {line[:80]!r} is not a raw line of that section")
+        return {"probe": probe, "section": section, "line_no": n, "line": line}
+
+    def cite_all(self, probe, section, lines):
+        return [self.cite(probe, section, ln) for ln in P.body(lines)]
+
+    def frame(self, probe, name):
+        """The ``##rc name 0`` line: raw proof that a section ran and printed nothing."""
+        return self.cite(probe, name, self.s(probe, name)["rc_line"])
+
+    def win_ev(self):
+        return self.cite("windows_host", E.JSON, self.win_line)
+
+    def row_ev(self, probe, tag):
+        return [self.cite(probe, tag, e["raw"]) for e in self.sql(probe).get(tag, [])]
+
+    @staticmethod
+    def status(probe, subject, msg):
+        """No raw line exists (probe or section absent). Only ever backs UNKNOWN or CRIT."""
+        return {"probe": probe, "section": E.STATUS, "subject": subject, "line_no": None, "line": msg}
+
+    def unavailable(self, *srcs) -> list[dict]:
+        """Raw evidence for every listed source that cannot be used; [] when all are usable."""
+        return [e for src in srcs for e in self._why(src)]
+
+    def _why(self, src):
+        probe, name = src
+        if src == CONTAINERS:
+            return (self._why(("docker_engine", "docker_ps")) + self._why(("docker_engine", "docker_inspect"))
+                    or [self.cite("docker_engine", "docker_ps", ln) for ln in self.unjoined])
+        if probe not in self.raw:
+            return [self.status(probe, name, f"probe {probe} missing from raw.json")]
+        if name is None:
+            return self._probe_why(probe)
+        sec = self.s(probe, name)
+        if sec is None:
+            return [self.status(probe, name, f"section {name} missing from {probe} output (probe rc={self.raw[probe].get('rc')})")]
+        if self.ok(probe, name):
+            return []
+        block = P.raw_lines(self.raw[probe]["stdout"])[sec["start"]:sec["end"]]
+        keep = block[:4] + ([sec["rc_line"]] if "rc_line" in sec and len(block) > 4 else [])
+        return [self.cite(probe, name, ln) for ln in keep if ln.strip()]
+
+    def _probe_why(self, probe):
+        if {"windows_host": self.win, "postgres": self.pg, "clickhouse": self.ch}[probe] is not None:
+            return []
+        r = self.raw[probe]
+        ev = [self.cite(probe, E.STDERR, ln) for ln in P.body(P.raw_lines(r.get("stderr") or ""))[:3]]
+        ev += [self.cite(probe, E.STDOUT, ln) for ln in P.body(P.raw_lines(r.get("stdout") or ""))[:3]]
+        return ev or [self.status(probe, None, f"probe {probe} rc={r.get('rc')} printed nothing")]
+
+
+def unknown(fid, area, title, evidence, note="a required source failed, is missing or is malformed"):
+    return finding(fid, area, title, "UNKNOWN", note=note, evidence=evidence)
+
+
+def gated(c: Ctx, fid, area, title, srcs, compute):
+    """``compute(c)`` only when every required source is usable; otherwise UNKNOWN with the why."""
+    bad = c.unavailable(*srcs)
+    return unknown(fid, area, title, bad) if bad else compute(c)
 
 
 # ------------------------------------------------------------------ collection
+def _collect_bash(c: Ctx, pid: str, exp: list[str]):
+    r = c.raw[pid]
+    parsed = c.sec.get(pid, {})
+    missing = [s for s in exp if s not in parsed]
+    failed = sorted(n for n, s in parsed.items() if s.get("rc") != 0)
+    malformed = c.malformed(pid)
+    if r.get("rc") == 0 and not (failed or missing or malformed):
+        return None
+    val = {"rc": r.get("rc")}
+    for k, v in (("failed_sections", failed), ("missing_sections", missing), ("malformed_sections", malformed)):
+        if v:
+            val[k] = v
+    evid = [e for n in failed + malformed for e in c.unavailable((pid, n))]
+    evid += [c.status(pid, n, f"section {n} missing from {pid} output") for n in missing]
+    evid += [c.cite(pid, E.STDERR, ln) for ln in P.body(P.raw_lines(r.get("stderr") or ""))[:3]]
+    evid = evid or [c.status(pid, None, f"probe {pid} exited rc={r.get('rc')}")]
+    return finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN", value=val, evidence=evid)
+
+
 def check_collection(c: Ctx) -> list[dict]:
     out = []
     exp_sec = expected_sections(c.cfg)
-    expected_probes = ["linux_host", "windows_host", "docker_engine", "docker_vm", "ubuntu_root", "postgres", "clickhouse"]
-    for pid in expected_probes:
+    for pid in PROBES:
         if pid not in c.raw:
             out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} missing from run", "UNKNOWN",
                                value={"rc": None, "missing_probe": True},
-                               evidence=[ev(pid, "status", f"probe {pid} not found in raw.json")]))
-            continue
-        r = c.raw[pid]
-        if pid in exp_sec:
-            parsed_sec = c.sec.get(pid, {})
-            missing = [s for s in exp_sec[pid] if s not in parsed_sec]
-            failed = sorted(n for n, s in parsed_sec.items() if s.get("rc") != 0)
-            malformed = c.malformed(pid)
-            if r.get("rc") != 0 or failed or missing or malformed:
-                val = {"rc": r.get("rc")}
-                if failed:
-                    val["failed_sections"] = failed
-                if missing:
-                    val["missing_sections"] = missing
-                if malformed:
-                    val["malformed_sections"] = malformed
-                err = (r.get("stderr") or "").strip()
-                evid_line = err[:300] if err else f"rc={r.get('rc')} failed={failed} missing={missing} malformed={malformed}"
-                out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
-                                   value=val, evidence=[ev(pid, "stderr" if err else "status", evid_line)]))
+                               evidence=[c.status(pid, None, f"probe {pid} missing from raw.json")]))
+        elif pid in exp_sec:
+            f = _collect_bash(c, pid, exp_sec[pid])
+            if f:
+                out.append(f)
         else:
-            failed = (r.get("rc") != 0 or
-                      (pid == "windows_host" and c.win is None) or
-                      (pid == "postgres" and c.sql("postgres", "|") is None) or
-                      (pid == "clickhouse" and c.sql("clickhouse", "\t") is None))
-            if failed:
-                err = (r.get("stderr") or "").strip()
-                head = (r.get("stdout") or "").strip()[:200]
-                evid_line = err[:300] if err else f"rc={r.get('rc')} output not in expected shape: {head!r}"
+            bad = c.unavailable((pid, None))
+            if bad:
                 out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
-                                   value={"rc": r.get("rc")}, evidence=[ev(pid, "stderr" if err else "status", evid_line)]))
+                                   value={"rc": c.raw[pid].get("rc")}, evidence=bad))
     return out
 
 
 # ------------------------------------------------------------------ docker
-def check_docker(c: Ctx) -> list[dict]:
-    if c.containers is None:
-        if c.ok("docker_engine", "docker_ps") is None:
-            failed_sec, sec_obj = "docker_ps", c.s("docker_engine", "docker_ps")
-        elif c.ok("docker_engine", "docker_inspect") is None:
-            failed_sec, sec_obj = "docker_inspect", c.s("docker_engine", "docker_inspect")
-        else:
-            failed_sec, sec_obj = "docker_inspect", {"rc": 0, "lines": ["a container listed by docker ps has no docker inspect record"]}
-        return [
-            unknown("DOCKER-LIVENESS", "docker", "Container liveness", "docker_engine", failed_sec, sec_obj),
-            unknown("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", "docker_engine", failed_sec, sec_obj),
-            unknown("DOCKER-OOM", "docker", "Container last exit was OOM kill", "docker_engine", failed_sec, sec_obj),
-            unknown("DOCKER-RESTARTS", "docker", "Restarts since baseline", "docker_engine", failed_sec, sec_obj),
-            unknown("DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size", "docker_engine", failed_sec, sec_obj),
-            unknown("DOCKER-RW-LAYER", "storage", "Container writable layer over threshold", "docker_engine", failed_sec, sec_obj),
-            unknown("DOCKER-LOG-SIZE", "storage", "Container json log size", "docker_engine", failed_sec, sec_obj),
-            unknown("SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount", "docker_engine", failed_sec, sec_obj),
-            unknown("SEC-DB-PORTS", "security", "Datastore port published on all interfaces", "docker_engine", failed_sec, sec_obj),
-        ]
-    return [_liveness(c), _health(c), _oom(c), _restarts(c), _log_rotation(c), _rw_layers(c),
-            _log_sizes(c), _privileged(c), _db_ports(c)]
-
-
-def _each(c, section, fmt):
-    """Evidence for an all-clear finding: the per-container values it was derived from."""
-    if not c.containers:
-        return [ev("docker_engine", section, "docker ps listed 0 containers")]
-    return [ev("docker_engine", section, fmt(r)) for r in c.containers[:5]]
+def _cite_rows(c: Ctx, rows, kind):
+    """The raw ``docker ps`` (kind="ps") or ``docker inspect`` line of each row; all rows when none is flagged."""
+    rows = rows or c.containers
+    if not rows:
+        return [c.frame("docker_engine", "docker_ps"), c.frame("docker_engine", "docker_inspect")]
+    section = "docker_ps" if kind == "ps" else "docker_inspect"
+    return [c.cite("docker_engine", section, r[f"{kind}_line"]) for r in rows]
 
 
 def _liveness(c):
     down = [r for r in c.containers if r["state"] != "running"]
     running = len(c.containers) - len(down)
-    verified, note = None, "docker info unavailable"
-    info_sec = c.ok("docker_engine", "docker_info")
-    info = P.json_lines(info_sec["lines"])[0] if info_sec else []
-    if info:
-        verified = info[0]["running"] == running and info[0]["total"] == len(c.containers)
-        note = (f"docker info running={info[0]['running']} total={info[0]['total']}; "
-                f"ps running={running} total={len(c.containers)}")
-    evid = [ev("docker_engine", "docker_ps", f"{r['name']}|{r['state']}|{r['status']}") for r in down]
+    line = P.body(c.ok(*DOCKER_INFO)["lines"])[0]
+    info = json.loads(line)
+    verified = info["running"] == running and info["total"] == len(c.containers)
     return finding("DOCKER-LIVENESS", "docker", "Containers not running", "CRIT" if down else "OK",
                    value={"running": running, "total": len(c.containers), "down": [r["name"] for r in down]},
-                   evidence=evid or _each(c, "docker_ps", lambda r: f"{r['name']}|{r['state']}|{r['status']}"),
-                   verified=verified, note=note)
+                   evidence=_cite_rows(c, down, "ps") + [c.cite(*DOCKER_INFO, line)], verified=verified,
+                   note=f"docker info running={info['running']} total={info['total']}; "
+                        f"ps running={running} total={len(c.containers)}")
+
+
+def _flagged(c, fid, area, title, pred, bad_status, value):
+    bad = [r for r in c.containers if pred(r["inspect"])]
+    return finding(fid, area, title, bad_status if bad else "OK", value=value(bad), evidence=_cite_rows(c, bad, "inspect"))
 
 
 def _health(c):
-    bad = [r for r in c.containers if r["inspect"].get("health") == "unhealthy"]
-    if bad:
-        evid = [ev("docker_engine", "docker_ps", f"{r['name']}|{r['status']}") for r in bad]
-    else:
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} health={r['inspect'].get('health') or 'none'}")
-    return finding("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", "WARN" if bad else "OK",
-                   value=[r["name"] for r in bad],
-                   evidence=evid)
+    return _flagged(c, "DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy",
+                    lambda i: i["health"] == "unhealthy", "WARN", lambda bad: [r["name"] for r in bad])
 
 
 def _oom(c):
-    bad = [r for r in c.containers if r["inspect"].get("oom_killed")]
-    if bad:
-        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} oom_killed=true") for r in bad]
-    else:
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} oom_killed=false")
-    return finding("DOCKER-OOM", "docker", "Container last exit was OOM kill", "CRIT" if bad else "OK",
-                   value=[r["name"] for r in bad],
-                   evidence=evid)
+    return _flagged(c, "DOCKER-OOM", "docker", "Container last exit was OOM kill",
+                    lambda i: i["oom_killed"], "CRIT", lambda bad: [r["name"] for r in bad])
+
+
+def _log_rotation(c):
+    return _flagged(c, "DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size",
+                    lambda i: i["log_type"] == "json-file" and "max-size" not in (i["log_opts"] or {}), "WARN",
+                    lambda bad: {"count": len(bad), "containers": [r["name"] for r in bad]})
+
+
+def _sock(i):
+    return any(m["source"] in ("/var/run/docker.sock", "/run/docker.sock") for m in i["mounts"])
+
+
+def _privileged(c):
+    return _flagged(c, "SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount",
+                    lambda i: i["privileged"] or _sock(i), "WARN",
+                    lambda bad: [f"{r['name']} privileged={r['inspect']['privileged']} docker_sock={_sock(r['inspect'])}" for r in bad])
+
+
+def _exposed(r):
+    return [f"{r['name']} {port} -> {b['HostIp'] or '*'}:{b['HostPort']}"
+            for port, binds in sorted((r["inspect"]["ports"] or {}).items()) for b in binds or []
+            if port.split("/", 1)[0] in DB_PORTS and b["HostIp"] in ("", "0.0.0.0", "::")]
+
+
+def _db_ports(c):
+    bad = [r for r in c.containers if _exposed(r)]
+    return finding("SEC-DB-PORTS", "security", "Datastore port published on all interfaces", "WARN" if bad else "OK",
+                   value=[e for r in bad for e in _exposed(r)], evidence=_cite_rows(c, bad, "inspect"))
 
 
 def _restarts(c):
-    cur = {r["name"]: r["inspect"].get("restart_count", 0) for r in c.containers}
+    cur = {r["name"]: r["inspect"]["restart_count"] for r in c.containers}
     prev = c.baseline.get("restart_counts")
     if prev is None:
-        nonzero = {n: v for n, v in cur.items() if v}
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} restart_count={cur[r['name']]}")
-        return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "INFO", value=nonzero,
-                       evidence=evid,
+        return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "INFO",
+                       value={n: v for n, v in cur.items() if v}, evidence=_cite_rows(c, [], "inspect"),
                        note="no baseline: cumulative RestartCount shown; weekly delta starts next run")
     # RestartCount resets when a container is re-created, so a smaller value counts as all-new restarts.
     deltas = {n: (v - prev[n] if v >= prev[n] else v) for n, v in cur.items() if n in prev}
     deltas = {n: d for n, d in deltas.items() if d > 0}
-    if deltas:
-        evid = [ev("docker_engine", "docker_inspect", f"{n} restart_count={cur[n]} baseline={prev[n]}") for n in deltas]
-    else:
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} restart_count={cur[r['name']]} baseline={prev.get(r['name'])}")
+    flagged = [r for r in c.containers if r["name"] in deltas]
     return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "WARN" if deltas else "OK",
-                   value=deltas, evidence=evid)
-
-
-def _log_rotation(c):
-    bad = [r["name"] for r in c.containers
-           if r["inspect"].get("log_type") == "json-file" and "max-size" not in (r["inspect"].get("log_opts") or {})]
-    if bad:
-        evid = [ev("docker_engine", "docker_inspect", f"{n} log_opts has no max-size") for n in bad[:5]]
-    else:
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} log_type={r['inspect'].get('log_type')} "
-                     f"max-size={(r['inspect'].get('log_opts') or {}).get('max-size')}")
-    return finding("DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size", "WARN" if bad else "OK",
-                   value={"count": len(bad), "containers": bad},
-                   evidence=evid)
+                   value=deltas, evidence=_cite_rows(c, flagged, "inspect"),
+                   note="baseline restart_counts from the previous run's baseline.json")
 
 
 def _rw_layers(c):
     limit = c.t["container_rw_mb_warn"] * 1e6
-    big = []
-    for r in c.containers:
-        size = P.human_bytes((r.get("size") or "").split(" ", 1)[0])
-        if size is not None and size >= limit:
-            big.append((r["name"], size, r["size"]))
-    if big:
-        evid = [ev("docker_engine", "docker_ps", f"{n} size={raw}") for n, _, raw in big]
-    else:
-        evid = _each(c, "docker_ps", lambda r: f"{r['name']} size={r.get('size') or '0B'}")
+    big = [r for r in c.containers if (P.human_bytes(r["size"].split(" ", 1)[0]) or 0) >= limit]
     return finding("DOCKER-RW-LAYER", "storage", "Container writable layer over threshold", "WARN" if big else "OK",
-                   value={n: gb(s) for n, s, _ in big}, threshold=f">= {c.t['container_rw_mb_warn']} MB",
-                   evidence=evid)
+                   value={r["name"]: gb(P.human_bytes(r["size"].split(" ", 1)[0])) for r in big},
+                   threshold=f">= {c.t['container_rw_mb_warn']} MB", evidence=_cite_rows(c, big, "ps"))
 
 
 def _log_sizes(c):
-    sec = c.s("docker_vm", "container_logs")
-    if c.ok("docker_vm", "container_logs") is None:
-        return unknown("DOCKER-LOG-SIZE", "storage", "Container json log size", "docker_vm", "container_logs", sec)
+    sec = c.ok("docker_vm", "container_logs")
     by_file = {posixpath.basename(p): v for p, v in P.du_rows(sec["lines"]).items()}
     limit = c.t["container_log_mb_warn"] * 1e6
-    big = []
-    for r in c.containers:
-        row = by_file.get(posixpath.basename(r["inspect"].get("log_path") or ""))
-        if row and row["bytes"] >= limit:
-            big.append((r["name"], row))
+    big = [(r, by_file[posixpath.basename(r["inspect"]["log_path"])]) for r in c.containers
+           if by_file.get(posixpath.basename(r["inspect"]["log_path"]), {}).get("bytes", 0) >= limit]
     total = sum(v["bytes"] for v in by_file.values())
     if big:
-        evid = [ev("docker_vm", "container_logs", row["raw"]) for _, row in big]
+        evid = [c.cite("docker_vm", "container_logs", row["raw"]) for _, row in big] + _cite_rows(c, [r for r, _ in big], "inspect")
     else:
-        evid = [ev("docker_vm", "container_logs", ln) for ln in sec["lines"][:5]] if sec["lines"] else [
-            ev("docker_vm", "container_logs", "no container log files found")
-        ]
+        evid = c.cite_all("docker_vm", "container_logs", sec["lines"])
     return finding("DOCKER-LOG-SIZE", "storage", "Container json log over threshold", "WARN" if big else "OK",
-                   value={"total_gb": gb(total), "over_gb": {n: gb(row["bytes"]) for n, row in big}},
-                   threshold=f">= {c.t['container_log_mb_warn']} MB",
-                   evidence=evid)
+                   value={"total_gb": gb(total), "over_gb": {r["name"]: gb(row["bytes"]) for r, row in big}},
+                   threshold=f">= {c.t['container_log_mb_warn']} MB", evidence=evid)
 
 
-def _privileged(c):
-    bad = []
-    for r in c.containers:
-        i = r["inspect"]
-        sock = any(m.get("source") in ("/var/run/docker.sock", "/run/docker.sock") for m in i.get("mounts", []))
-        if i.get("privileged") or sock:
-            bad.append(f"{r['name']} privileged={i.get('privileged')} docker_sock={sock}")
-    if bad:
-        evid = [ev("docker_engine", "docker_inspect", b) for b in bad]
-    else:
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} privileged=false docker_sock=false")
-    return finding("SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount", "WARN" if bad else "OK",
-                   value=bad, evidence=evid)
+DOCKER_CHECKS = (
+    ("DOCKER-LIVENESS", "docker", "Containers not running", (CONTAINERS, DOCKER_INFO), _liveness),
+    ("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", (CONTAINERS,), _health),
+    ("DOCKER-OOM", "docker", "Container last exit was OOM kill", (CONTAINERS,), _oom),
+    ("DOCKER-RESTARTS", "docker", "Restarts since baseline", (CONTAINERS,), _restarts),
+    ("DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size", (CONTAINERS,), _log_rotation),
+    ("DOCKER-RW-LAYER", "storage", "Container writable layer over threshold", (CONTAINERS,), _rw_layers),
+    ("DOCKER-LOG-SIZE", "storage", "Container json log size", (CONTAINERS, ("docker_vm", "container_logs")), _log_sizes),
+    ("SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount", (CONTAINERS,), _privileged),
+    ("SEC-DB-PORTS", "security", "Datastore port published on all interfaces", (CONTAINERS,), _db_ports),
+)
 
 
-def _db_ports(c):
-    exposed = []
-    for r in c.containers:
-        for port, binds in sorted((r["inspect"].get("ports") or {}).items()):
-            for b in binds or []:
-                if port.split("/", 1)[0] in DB_PORTS and b.get("HostIp", "") in ("", "0.0.0.0", "::"):
-                    exposed.append(f"{r['name']} {port} -> {b.get('HostIp') or '*'}:{b.get('HostPort')}")
-    if exposed:
-        evid = [ev("docker_engine", "docker_inspect", e) for e in exposed]
-    else:
-        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} ports={sorted((r['inspect'].get('ports') or {}).keys())}")
-    return finding("SEC-DB-PORTS", "security", "Datastore port published on all interfaces",
-                   "WARN" if exposed else "OK", value=exposed,
-                   evidence=evid)
+def check_docker(c: Ctx) -> list[dict]:
+    return [gated(c, fid, area, title, srcs, fn) for fid, area, title, srcs, fn in DOCKER_CHECKS]
