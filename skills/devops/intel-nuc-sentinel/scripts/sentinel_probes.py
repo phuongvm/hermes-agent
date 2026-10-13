@@ -1,20 +1,23 @@
 """Probe catalog for the intel-nuc sentinel.
 
 Every remote command is built here from fixed templates plus config values that must match
-SAFE_TOKEN, and every script and remote command line is checked by ``assert_read_only``
-before anything leaves the machine. Nothing in this module talks to the network.
+SAFE_TOKEN. Every probe script must pass the per-transport allowlist in ``sentinel_guard``
+(fail closed) and the mutating-pattern denylist below; remote command lines pass the denylist.
+All of it runs before anything leaves the machine. Nothing in this module talks to the network.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
+from sentinel_guard import ReadOnlyViolation, check_probe_script
+
 SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_./:+@-]+$")
 SAFE_WIN_PATH = re.compile(r"^[A-Za-z]:\\[A-Za-z0-9_.\\ ()-]+$")
 # ssh -o values; never ProxyCommand/LocalCommand (those execute commands locally).
 SAFE_SSH_OPT = re.compile(r"^(?!.*(?i:proxycommand|localcommand|permitlocalcommand))-?[A-Za-z0-9_.=:/@-]+$")
 
-# Accidental-mutation guard. A probe or remote command that matches any of these is refused before it runs.
+# Second line of defence behind the sentinel_guard allowlist: known mutating spellings.
 _MUTATING = [
     # Filesystem / system mutating commands and utilities
     r"(?:^|[\s;&|({])(?:rm|rmdir|mv|cp|chmod|chown|chattr|truncate|dd|mkfs\S*|shutdown|reboot"
@@ -62,10 +65,6 @@ MUTATING_PATTERNS = [re.compile(p, re.MULTILINE) for p in _MUTATING]
 DB_PORTS = {"5432", "6379", "6479", "8123", "9000", "7687", "7474", "2181", "9092", "6333", "6334", "8529"}
 
 
-class ReadOnlyViolation(ValueError):
-    """A probe or remote command line matched a mutating pattern."""
-
-
 class ConfigError(ValueError):
     """A config value is unsafe to interpolate into a remote command."""
 
@@ -78,7 +77,7 @@ class Probe:
     container: str = ""
 
     def __post_init__(self):
-        assert_read_only(self.script, f"probe {self.id}")
+        assert_probe_read_only(self)
 
 
 def assert_read_only(text: str, where: str) -> None:
@@ -86,6 +85,12 @@ def assert_read_only(text: str, where: str) -> None:
         m = pat.search(text)
         if m:
             raise ReadOnlyViolation(f"{where}: refused, mutating pattern {m.group(0).strip()!r}")
+
+
+def assert_probe_read_only(probe: Probe) -> None:
+    """Fail closed: the transport allowlist must accept the script, and no denylist pattern may match."""
+    check_probe_script(probe.transport, probe.script, f"probe {probe.id}")
+    assert_read_only(probe.script, f"probe {probe.id}")
 
 
 def token(value: str, key: str) -> str:
@@ -251,7 +256,7 @@ def build_probes(cfg: dict) -> list[Probe]:
         Probe("clickhouse", "clickhouse", _CH_SQL, token(cfg["clickhouse"]["container"], "clickhouse.container")),
     ]
     for p in probes:
-        assert_read_only(p.script, f"probe {p.id}")
+        assert_probe_read_only(p)
     return probes
 
 

@@ -12,6 +12,8 @@ sys.path.insert(0, str(SKILL / "scripts"))
 
 import sentinel
 import sentinel_parse as P
+import sentinel_probes
+from sentinel_guard import check_probe_script
 from sentinel_probes import ConfigError, Probe, ReadOnlyViolation, assert_read_only, build_probes, remote_command, ssh_argv
 
 CFG = json.loads((SKILL / "templates" / "intel-nuc.json").read_text(encoding="utf-8-sig"))
@@ -413,3 +415,101 @@ def test_missing_docker_containers_emits_unknown_for_all_docker_checks():
         assert findings[fid]["status"] == "UNKNOWN"
         assert len(findings[fid]["evidence"]) > 0
 
+
+# ------------------------------------------------------------------ fail-closed allowlist (sentinel_guard)
+
+
+def _blk(cmd):
+    return sentinel_probes._section("x", cmd)
+
+
+ALLOWLIST_REFUSES = [
+    # Unknown executables / interpreters / network fetch
+    ("bash", _blk("wget -qO- http://example.invalid/x")),
+    ("bash", _blk("python3 -c 'open(\"/tmp/x\",\"w\").write(\"y\")'")),
+    ("bash", _blk("xargs -r rm")),
+    # Shell expansion, redirection, background, text outside section blocks
+    ("bash", _blk("echo $(id)")), ("bash", _blk('echo "`id`"')), ("bash", _blk("cat /etc/hostname > /tmp/x")),
+    ("bash", _blk("cat /x & id")), ("bash", _blk("cat /x") + "rm -rf /\n"), ("bash", ""),
+    # Redis: anything but PING / INFO [section]
+    ("bash", _blk("docker exec c redis-cli SET review_probe value")),
+    ("bash", _blk("docker exec c redis-cli -n 1 SET a b")),
+    ("bash", _blk("docker exec c redis-cli INFO memory extra")),
+    # docker exec payloads
+    ("bash", _blk("docker exec c psql -c 'DROP TABLE x'")),
+    ("bash", _blk("docker exec c sh -c 'echo a; rm -rf /'")),
+    ("bash", _blk("docker exec -u root c redis-cli INFO")),
+    # SQL write forms, side-effect functions, setting overrides, comments, dollar quotes
+    ("psql", "MERGE INTO t USING s ON true WHEN MATCHED THEN UPDATE SET a = 1;"),
+    ("psql", "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;"),
+    ("psql", "SELECT * INTO new_t FROM t;"), ("psql", "SELECT 1 FOR UPDATE;"),
+    ("psql", "SELECT pg_terminate_backend(1);"), ("psql", "SELECT set_config('a', 'b', false);"),
+    ("psql", "SELECT 'x'; -- \nDROP TABLE t;"), ("psql", "SELECT $$;$$; DROP TABLE t;"),
+    ("psql", "SELECT 'a\\'; DROP TABLE t;"), ("psql", "SELECT 1\\gexec"),
+    ("clickhouse", "SELECT 1 SETTINGS readonly = 0;"), ("clickhouse", "SELECT * FROM t INTO OUTFILE '/tmp/x';"),
+    ("clickhouse", "SELECT * FROM url('http://x', CSV, 'a String');"), ("clickhouse", "SELECT 1; SYSTEM FLUSH LOGS;"),
+    # PowerShell: unlisted cmdlets, aliases, invocation, providers, .NET members, hashtable values
+    ("powershell", "Get-Date; Stop-Computer"), ("powershell", "Get-Date | Out-File C:\\x"),
+    ("powershell", "Get-Item 'x' | % { $_.Delete() }"), ("powershell", "Get-Item 'x' | ForEach-Object Delete"),
+    ("powershell", "iex 'Remove-Item x'"), ("powershell", "& 'Remove-Item' x"),
+    ("powershell", "[IO.File]::WriteAllText('C:\\x', 'y')"), ("powershell", "${C:\\x} = 'y'"),
+    ("powershell", "$x.'Delete'()"), ("powershell", "$x = @{epoch=Remove-Item 'C:\\x'}"),
+    ("powershell", "Get-Item 'x' # '; Remove-Item y"),
+    ("unknown-transport", "SELECT 1"),
+]
+
+
+@pytest.mark.parametrize("transport,script", ALLOWLIST_REFUSES)
+def test_allowlist_refuses_without_denylist(transport, script, monkeypatch):
+    monkeypatch.setattr(sentinel_probes, "MUTATING_PATTERNS", [])
+    with pytest.raises(ReadOnlyViolation):
+        check_probe_script(transport, script, "t")
+    with pytest.raises(ReadOnlyViolation):
+        Probe("t", transport, script)
+
+
+@pytest.mark.parametrize("transport,script", [
+    ("bash", _blk("wget -qO- http://example.invalid/x")),
+    ("bash", _blk("docker exec c redis-cli SET review_probe value")),
+    ("psql", "MERGE INTO t USING s ON true WHEN MATCHED THEN UPDATE SET a = 1;"),
+    ("powershell", "Get-Date; Stop-Computer"),
+])
+def test_cli_refuses_unlisted_command_with_denylist_disabled(transport, script, monkeypatch, tmp_path):
+    """The allowlist alone stops plan/run: exit 2 and the ssh runner is never called."""
+    monkeypatch.setattr(sentinel_probes, "MUTATING_PATTERNS", [])
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a))
+    orig = sentinel.build_probes
+
+    def injected(cfg):
+        return [*orig(cfg), _unchecked_probe(transport, script)]
+
+    monkeypatch.setattr(sentinel, "build_probes", injected)
+    cfg = str(SKILL / "templates" / "intel-nuc.json")
+    assert sentinel.main(["plan", "--config", cfg]) == 2
+    out = tmp_path / "out"
+    assert sentinel.main(["run", "--config", cfg, "--out-dir", str(out)]) == 2
+    assert calls == []
+    assert not out.exists()
+
+
+def _unchecked_probe(transport, script):
+    """A Probe built past __post_init__, as a future catalog edit could hand to load_config."""
+    p = object.__new__(Probe)
+    for k, v in {"id": "injected", "transport": transport, "script": script, "container": ""}.items():
+        object.__setattr__(p, k, v)
+    return p
+
+
+def test_shipped_catalog_passes_allowlist_with_denylist_disabled(monkeypatch):
+    monkeypatch.setattr(sentinel_probes, "MUTATING_PATTERNS", [])
+    for p in build_probes(CFG):
+        check_probe_script(p.transport, p.script, p.id)
+
+
+def test_finding_without_evidence_is_a_programming_error():
+    import sentinel_checks as C
+    with pytest.raises(ValueError):
+        C.finding("X", "host", "t", "OK")
+    with pytest.raises(ValueError):
+        C.finding("X", "host", "t", "OK", evidence=[C.ev("p", "s", "")])

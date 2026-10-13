@@ -20,8 +20,8 @@ BASH_PROBES = ("linux_host", "docker_engine", "docker_vm", "ubuntu_root")
 def finding(fid, area, title, status, value=None, threshold=None, evidence=(), verified=None, note=""):
     evid = [e for e in evidence if e and e.get("line")]
     if not evid:
-        # Every finding MUST cite non-empty evidence
-        evid = [ev(area, fid, note or f"{status} finding")]
+        # Spec: every finding cites the raw probe/section line it was derived from; never synthesise one.
+        raise ValueError(f"finding {fid}: no evidence line")
     return {"id": fid, "area": area, "title": title, "status": status, "value": value,
             "threshold": threshold, "verified": verified, "note": note,
             "evidence": evid}
