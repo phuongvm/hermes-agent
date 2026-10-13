@@ -13,6 +13,7 @@ sys.path.insert(0, str(SKILL / "scripts"))
 
 import sentinel
 import sentinel_checks as _C
+import sentinel_evidence as E
 import sentinel_parse as P
 import sentinel_probes
 from sentinel_guard import check_probe_script
@@ -150,7 +151,7 @@ def test_stopped_container_is_critical_with_evidence():
     raw = healthy_raw([container("web"), container("db", state="exited")])
     f = by_id(sentinel.evaluate_raw(CFG, raw, {}))["DOCKER-LIVENESS"]
     assert f["status"] == "CRIT" and f["value"]["down"] == ["db"]
-    assert "db|exited" in f["evidence"][0]["line"]
+    assert '"name": "db", "state": "exited"' in f["evidence"][0]["line"]
 
 
 def test_failed_probe_section_reports_unknown_never_ok():
@@ -252,7 +253,8 @@ def test_baseline_keeps_sections_a_failed_run_could_not_read(tmp_path):
 
 def test_parsers():
     s = P.sections("## a\nx\n##rc a 0\n## b\ny\n")
-    assert s["a"] == {"rc": 0, "lines": ["x"]} and s["b"]["rc"] is None
+    assert s["a"]["rc"] == 0 and s["a"]["lines"] == ["x"] and s["b"]["rc"] is None
+    assert (s["a"]["start"], s["a"]["end"], s["a"]["rc_line"]) == (0, 3, "##rc a 0")
     assert P.human_bytes("2.8GB") == 2_800_000_000 and P.human_bytes("4.1kB") == 4100
     apt = P.apt_upgradable(["Listing...", "libx/noble-security 1 amd64 [upgradable from: 0]",
                             "vim/noble-updates 2 amd64 [upgradable from: 1]"])
@@ -514,7 +516,11 @@ def test_finding_without_evidence_is_a_programming_error():
     with pytest.raises(ValueError):
         C.finding("X", "host", "t", "OK")
     with pytest.raises(ValueError):
-        C.finding("X", "host", "t", "OK", evidence=[C.ev("p", "s", "")])
+        C.finding("X", "host", "t", "OK", evidence=[{"probe": "p", "section": "s", "line_no": 0, "line": ""}])
+    # A cited line that is not a raw line of its section is refused at construction time.
+    ctx = C.Ctx(CFG, healthy_raw(), {})
+    with pytest.raises(ValueError):
+        ctx.cite("docker_engine", "docker_inspect", "web health=none")
 
 
 # ------------------------------------------------------------------ C-03: every required section, every failure mode
@@ -533,37 +539,43 @@ def _mutate(raw, pid, name, mode):
 @pytest.mark.parametrize("mode", ["drop", "rcfail", "malformed"])
 @pytest.mark.parametrize("pid,name", _SECTION_CASES)
 def test_every_required_section_failure_is_unknown_never_silent(pid, name, mode):
-    healthy = {f["id"] for f in sentinel.evaluate_raw(CFG, healthy_raw(), {})}
+    healthy = sentinel.evaluate_raw(CFG, healthy_raw(), {})
+    # The sources each healthy finding was derived from (primary AND cross-check).
+    deps = {f["id"]: {(e["probe"], e["section"]) for e in f["evidence"]} for f in healthy}
     raw = healthy_raw()
     _mutate(raw, pid, name, mode)
     fs = sentinel.evaluate_raw(CFG, raw, {})
-    ids = {f["id"] for f in fs}
     # No finding disappears: a metric that cannot be computed is reported, never omitted.
-    assert healthy <= ids
+    assert set(deps) <= {f["id"] for f in fs}
     col = by_id(fs)[f"COLLECT-{pid.upper()}"]
     key = {"drop": "missing_sections", "rcfail": "failed_sections", "malformed": "malformed_sections"}[mode]
     assert name in col["value"][key]
+    assert E.evidence_problems(raw, fs) == []
     for f in fs:
-        assert f["evidence"] and all(e["line"] for e in f["evidence"]), f["id"]
-        # Nothing derived from the broken section may report OK.
-        if f["status"] == "OK" and f["id"] != "DB-ZK-AUTOPURGE":
-            assert not any(e["probe"] == pid and e["section"] == name for e in f["evidence"]), f["id"]
+        # Every finding derived from the broken section is UNKNOWN (CRIT only for a failed health probe).
+        if (pid, name) in deps.get(f["id"], ()):
+            assert f["status"] in ("UNKNOWN", "CRIT"), (f["id"], f["status"])
+            assert f["verified"] is None, f["id"]
 
 
 @pytest.mark.parametrize("pid", ["windows_host", "postgres", "clickhouse"])
 @pytest.mark.parametrize("mode", ["missing", "malformed"])
 def test_structured_probe_failure_is_unknown_never_silent(pid, mode):
-    healthy = {f["id"] for f in sentinel.evaluate_raw(CFG, healthy_raw(), {})}
+    healthy = sentinel.evaluate_raw(CFG, healthy_raw(), {})
+    deps = {f["id"] for f in healthy if any(e["probe"] == pid for e in f["evidence"])}
     raw = healthy_raw()
     if mode == "missing":
         del raw[pid]
     else:
         raw[pid]["stdout"] = "@@ not the shape this probe prints @@\n"
     fs = sentinel.evaluate_raw(CFG, raw, {})
-    assert healthy <= {f["id"] for f in fs}
+    assert {f["id"] for f in healthy} <= {f["id"] for f in fs}
     assert by_id(fs)[f"COLLECT-{pid.upper()}"]["status"] == "UNKNOWN"
+    assert E.evidence_problems(raw, fs) == []
+    assert deps, pid
     for f in fs:
-        assert f["evidence"] and all(e["line"] for e in f["evidence"]), f["id"]
+        if f["id"] in deps:
+            assert f["status"] == "UNKNOWN", (f["id"], f["status"])
 
 
 def test_container_without_inspect_record_is_unknown():
@@ -575,3 +587,176 @@ def test_container_without_inspect_record_is_unknown():
     f = by_id(sentinel.evaluate_raw(CFG, raw, {}))
     for fid in ("DOCKER-HEALTH", "DOCKER-OOM", "SEC-DB-PORTS", "SEC-DOCKER-PRIV"):
         assert f[fid]["status"] == "UNKNOWN"
+
+
+# ------------------------------------------------------------------ Round-2 C-04: evidence is verbatim raw output
+def _all_findings_raws():
+    """Healthy, risky and degraded runs: every path that builds evidence."""
+    risky = healthy_raw([container("web", state="exited", health="unhealthy", restarts=3, size="2GB (virtual 3GB)"),
+                         container("db", ports={"5432/tcp": [{"HostIp": "", "HostPort": "5432"}]}, log_opts={})])
+    rc_fail = healthy_raw()
+    rc_fail["postgres"] = {"rc": 2, "stdout": "", "stderr": "psql: error: connection refused\n"}
+    rc_fail["windows_host"] = {"rc": 1, "stdout": "", "stderr": "powershell failed\n"}
+    no_win = healthy_raw()
+    del no_win["windows_host"]
+    return [healthy_raw(), risky, rc_fail, no_win]
+
+
+@pytest.mark.parametrize("idx", range(4))
+def test_every_evidence_line_is_the_raw_line_at_its_locator(idx):
+    raw = _all_findings_raws()[idx]
+    fs = sentinel.evaluate_raw(CFG, raw, {"restart_counts": {"web": 1, "db": 0}})
+    assert E.evidence_problems(raw, fs) == []
+    for f in fs:
+        for e in f["evidence"]:
+            if e["section"] == E.STATUS:
+                assert f["status"] in ("UNKNOWN", "CRIT"), f["id"]
+                continue
+            src = raw[e["probe"]]["stderr" if e["section"] == E.STDERR else "stdout"]
+            assert P.raw_lines(src)[e["line_no"]] == e["line"], f["id"]
+
+
+def test_round2_c04_finding_ids_quote_raw_probe_lines():
+    raw = healthy_raw()
+    fs = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    for fid in ("DB-CH-LOG-TTL", "DB-PG-TX", "DB-ZK-AUTOPURGE", "DOCKER-HEALTH", "DOCKER-LIVENESS",
+                "DOCKER-LOG-ROTATION", "DOCKER-OOM", "DOCKER-RESTARTS", "DOCKER-RW-LAYER", "HOST-MEM-WIN",
+                "HOST-MEM-WSL", "HOST-REBOOT-WIN", "SEC-APT-UPDATES", "SEC-DB-PORTS", "SEC-DOCKER-PRIV",
+                "SEC-WIN-DEFENDER", "SEC-WIN-FIREWALL", "SEC-WIN-HOTFIX"):
+        for e in fs[fid]["evidence"]:
+            assert e["section"] != E.STATUS, fid
+            assert e["line"] in P.raw_lines(raw[e["probe"]]["stdout"]), (fid, e["line"])
+
+
+def test_verify_rejects_a_synthesised_evidence_line(tmp_path):
+    run_dir = sentinel.collect(CFG, tmp_path, runner=FakeSSH(healthy_raw()))
+    sentinel.evaluate(run_dir, tmp_path)
+    assert sentinel.verify(run_dir) == []
+    doc = json.loads((run_dir / "findings.json").read_text(encoding="utf-8-sig"))
+    doc["findings"][0]["evidence"][0]["line"] = "db health=none"
+    raw = json.loads((run_dir / "raw.json").read_text(encoding="utf-8-sig"))
+    assert any("is not the cited raw line" in p for p in E.evidence_problems(raw, doc["findings"]))
+
+
+# ------------------------------------------------------------------ Round-2 C-05: cross-check sources gate dependents
+def _drop(raw, pid, name):
+    _mutate(raw, pid, name, "drop")
+    return raw
+
+
+@pytest.mark.parametrize("raw_fn,fids", [
+    (lambda: _drop(healthy_raw(), "docker_engine", "docker_info"), ["DOCKER-LIVENESS"]),
+    (lambda: _drop(healthy_raw(), "ubuntu_root", "data_du"), ["DB-ZK-AUTOPURGE", "DB-PG-SIZE", "DB-CH-SIZE"]),
+    (lambda: {k: v for k, v in healthy_raw().items() if k != "windows_host"},
+     ["STORAGE-DISK-MNT-C", "STORAGE-DISK-MNT-D", "STORAGE-VHDX-DOCKER_DATA", "STORAGE-VHDX-UBUNTU_EXT4"]),
+    (lambda: _drop(healthy_raw(), "linux_host", "vhdx_stat"), ["STORAGE-VHDX-DOCKER_DATA", "STORAGE-VHDX-UBUNTU_EXT4"]),
+    (lambda: _drop(healthy_raw(), "docker_vm", "df"), ["STORAGE-VHDX-DOCKER_DATA"]),
+    (lambda: _drop(healthy_raw(), "linux_host", "epoch"), ["SEC-APT-LISTS-AGE"]),
+])
+def test_round2_c05_failed_cross_check_source_makes_dependents_unknown(raw_fn, fids):
+    raw = raw_fn()
+    fs = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    for fid in fids:
+        assert fs[fid]["status"] == "UNKNOWN" and fs[fid]["verified"] is None, (fid, fs[fid]["status"])
+    assert E.evidence_problems(raw, list(fs.values())) == []
+
+
+def test_mandatory_cross_check_pairs_carry_a_verdict_on_a_complete_run():
+    fs = by_id(sentinel.evaluate_raw(CFG, healthy_raw(), {}))
+    for fid in ("STORAGE-DISK-MNT-C", "STORAGE-DISK-MNT-D", "STORAGE-VHDX-DOCKER_DATA", "STORAGE-VHDX-UBUNTU_EXT4",
+                "DOCKER-LIVENESS", "DB-PG-SIZE", "DB-CH-SIZE"):
+        assert fs[fid]["verified"] is True, fid
+
+
+def test_cross_check_row_missing_from_secondary_is_unknown():
+    raw = healthy_raw()
+    win = json.loads(raw["windows_host"]["stdout"])
+    win["disks"] = [d for d in win["disks"] if d["id"] != "C:"]
+    win["vhdx"] = win["vhdx"][1:]
+    raw["windows_host"]["stdout"] = json.dumps(win)
+    fs = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    assert fs["STORAGE-DISK-MNT-C"]["status"] == "UNKNOWN"
+    assert fs["STORAGE-VHDX-DOCKER_DATA"]["status"] == "UNKNOWN"
+    assert fs["STORAGE-VHDX-UBUNTU_EXT4"]["verified"] is True
+
+
+# ------------------------------------------------------------------ Round-2 C-06: typed shapes, never an exception
+def _pg(raw, old, new):
+    raw["postgres"]["stdout"] = raw["postgres"]["stdout"].replace(old, new)
+    return raw
+
+
+def _ch(raw, old, new):
+    raw["clickhouse"]["stdout"] = raw["clickhouse"]["stdout"].replace(old, new)
+    return raw
+
+
+def _win(raw, mutate):
+    w = json.loads(raw["windows_host"]["stdout"])
+    mutate(w)
+    raw["windows_host"]["stdout"] = json.dumps(w)
+    return raw
+
+
+def _engine(raw, old, new):
+    raw["docker_engine"]["stdout"] = raw["docker_engine"]["stdout"].replace(old, new, 1)
+    return raw
+
+
+_MALFORMED_PAYLOADS = {
+    "pg-conn-arity": (lambda: _pg(healthy_raw(), "conn|10|100", "conn|10"), "postgres", ["DB-PG-CONN", "DB-PG-SIZE"]),
+    "pg-conn-type": (lambda: _pg(healthy_raw(), "conn|10|100", "conn|ten|100"), "postgres", ["DB-PG-CONN"]),
+    "pg-dup-tag": (lambda: _pg(healthy_raw(), "long_tx|0\n", "long_tx|0\nlong_tx|1\n"), "postgres", ["DB-PG-TX"]),
+    "pg-xid-type": (lambda: _pg(healthy_raw(), "xid_age|postgres|1000", "xid_age|postgres|"), "postgres", ["DB-PG-XID"]),
+    "pg-db-arity": (lambda: _pg(healthy_raw(), "db|dify|200000000", "db|dify"), "postgres", ["DB-PG-SIZE"]),
+    "pg-extra-tag": (lambda: _pg(healthy_raw(), "in_recovery|f", "in_recovery|f\nERROR:  boom"), "postgres", ["DB-PG-UP"]),
+    "ch-parts-type": (lambda: _ch(healthy_raw(), "parts_total\t3000000000", "parts_total\tx"), "clickhouse", ["DB-CH-SIZE"]),
+    "ch-db-arity": (lambda: _ch(healthy_raw(), "db\tlangfuse\t3000000000", "db\tlangfuse"), "clickhouse", ["DB-CH-SIZE"]),
+    "ch-no-disk": (lambda: _ch(healthy_raw(), "disk\tdefault\t1\t2\n", ""), "clickhouse", ["DB-CH-UP"]),
+    "win-disk-not-object": (lambda: _win(healthy_raw(), lambda w: w.update(disks=["not-an-object"])), "windows_host",
+                            ["STORAGE-DISK-MNT-C", "HOST-MEM-WIN"]),
+    "win-disk-free-str": (lambda: _win(healthy_raw(), lambda w: w["disks"][0].update(free="lots")), "windows_host",
+                          ["STORAGE-DISK-MNT-C"]),
+    "win-vhdx-bytes-missing": (lambda: _win(healthy_raw(), lambda w: w["vhdx"][0].pop("bytes")), "windows_host",
+                               ["STORAGE-VHDX-DOCKER_DATA"]),
+    "win-firewall-entry": (lambda: _win(healthy_raw(), lambda w: w.update(firewall=[{"name": "Public"}])), "windows_host",
+                           ["SEC-WIN-FIREWALL"]),
+    "win-hotfix-date": (lambda: _win(healthy_raw(), lambda w: w.update(hotfix_date="last tuesday")), "windows_host",
+                        ["SEC-WIN-HOTFIX"]),
+    "win-defender-type": (lambda: _win(healthy_raw(), lambda w: w.update(defender_sig_age_days="0")), "windows_host",
+                          ["SEC-WIN-DEFENDER"]),
+    "win-not-object": (lambda: _win(healthy_raw(), lambda w: w.clear()), "windows_host", ["HOST-REBOOT-WIN"]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_MALFORMED_PAYLOADS))
+def test_round2_c06_malformed_rc0_payload_is_unknown_not_an_exception(case):
+    raw_fn, probe, fids = _MALFORMED_PAYLOADS[case]
+    raw = raw_fn()
+    fs = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    assert fs[f"COLLECT-{probe.upper()}"]["status"] == "UNKNOWN"
+    for fid in fids:
+        assert fs[fid]["status"] == "UNKNOWN", (fid, fs[fid]["status"])
+    assert E.evidence_problems(raw, list(fs.values())) == []
+
+
+@pytest.mark.parametrize("old,new", [
+    ('"restart_count": 0', '"restart_count": "0"'),
+    ('"oom_killed": false', '"oom_killed": "false"'),
+    ('"mounts": [{"type": "bind"', '"mounts": [{"kind": "bind"'),
+    ('"ports": {}', '"ports": {"5432/tcp": [{"HostIp": ""}]}'),
+    ('"log_opts": {"max-size": "50m"}', '"log_opts": ["max-size"]'),
+])
+def test_malformed_docker_inspect_record_is_unknown_not_an_exception(old, new):
+    raw = _engine(healthy_raw(), old, new)
+    fs = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    assert "docker_inspect" in fs["COLLECT-DOCKER_ENGINE"]["value"]["malformed_sections"]
+    for fid in ("DOCKER-HEALTH", "DOCKER-OOM", "DOCKER-RESTARTS", "SEC-DB-PORTS", "STORAGE-ORPHANS"):
+        assert fs[fid]["status"] == "UNKNOWN", fid
+
+
+def test_typed_schemas_accept_null_health_ports_and_log_opts():
+    _, ins = container("web")
+    ins.update(health=None, ports=None, log_opts=None)
+    assert P.conforms(ins, P.DOCKER_INSPECT)
+    assert not P.conforms({**ins, "restart_count": True}, P.DOCKER_INSPECT)
