@@ -220,7 +220,7 @@ def _redis(c):
         mem = c.ok("docker_engine", f"redis_memory:{name}")
         if not (ping and pers):
             err_line = " ".join(ping_sec.get("lines", [])[:3]) or f"rc={ping_sec.get('rc')} PING or INFO failed"
-            out.append(finding(f"DB-REDIS-{name}", "db", f"Redis {name} health", "CRIT", note="PING or INFO exited non-zero",
+            out.append(finding(f"DB-REDIS-{name}", "db", f"Redis {name} health", "CRIT", note="PING or INFO failed, missing or malformed",
                                evidence=[ev("docker_engine", f"redis_ping:{name}", err_line)]))
             continue
         kv = P.kv_rows(pers["lines"])

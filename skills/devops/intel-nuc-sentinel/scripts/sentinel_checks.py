@@ -80,12 +80,19 @@ class Ctx:
         return self.sec.get(probe, {}).get(name)
 
     def ok(self, probe, name):
+        """The section, only when it exited 0 AND has the shape its command prints."""
         sec = self.s(probe, name)
-        return sec if P.ok(sec) else None
+        return sec if P.ok(sec) and P.well_formed(name, sec["lines"]) else None
+
+    def malformed(self, probe):
+        return sorted(n for n, s in self.sec.get(probe, {}).items() if P.ok(s) and not P.well_formed(n, s["lines"]))
 
     def sql(self, probe, sep):
         r = self.raw.get(probe) or {}
-        return P.tagged_rows(r.get("stdout", ""), sep) if r.get("rc") == 0 else None
+        if r.get("rc") != 0:
+            return None
+        rows = P.tagged_rows(r.get("stdout", ""), sep)
+        return rows if P.sql_well_formed(probe, rows) else None
 
     def _containers(self):
         ps, ins = self.ok("docker_engine", "docker_ps"), self.ok("docker_engine", "docker_inspect")
@@ -93,8 +100,11 @@ class Ctx:
             return None
         rows, _ = P.json_lines(ps["lines"])
         by_id = {d["id"]: d for d in P.json_lines(ins["lines"])[0]}
+        if any(r["id"] not in by_id for r in rows):
+            # A container listed by ps with no inspect record: its health/OOM/ports are unknown.
+            return None
         for r in rows:
-            r["inspect"] = by_id.get(r["id"], {})
+            r["inspect"] = by_id[r["id"]]
         return sorted(rows, key=lambda r: r["name"])
 
     def _windows(self):
@@ -102,9 +112,10 @@ class Ctx:
         if r.get("rc") != 0:
             return None
         try:
-            return json.loads(r.get("stdout", "").strip())
+            obj = json.loads(r.get("stdout", "").strip())
         except ValueError:
             return None
+        return obj if P.windows_well_formed(obj) else None
 
 
 # ------------------------------------------------------------------ collection
@@ -123,14 +134,17 @@ def check_collection(c: Ctx) -> list[dict]:
             parsed_sec = c.sec.get(pid, {})
             missing = [s for s in exp_sec[pid] if s not in parsed_sec]
             failed = sorted(n for n, s in parsed_sec.items() if s.get("rc") != 0)
-            if r.get("rc") != 0 or failed or missing:
+            malformed = c.malformed(pid)
+            if r.get("rc") != 0 or failed or missing or malformed:
                 val = {"rc": r.get("rc")}
                 if failed:
                     val["failed_sections"] = failed
                 if missing:
                     val["missing_sections"] = missing
+                if malformed:
+                    val["malformed_sections"] = malformed
                 err = (r.get("stderr") or "").strip()
-                evid_line = err[:300] if err else f"rc={r.get('rc')} failed={failed} missing={missing}"
+                evid_line = err[:300] if err else f"rc={r.get('rc')} failed={failed} missing={missing} malformed={malformed}"
                 out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
                                    value=val, evidence=[ev(pid, "stderr" if err else "status", evid_line)]))
         else:
@@ -140,7 +154,8 @@ def check_collection(c: Ctx) -> list[dict]:
                       (pid == "clickhouse" and c.sql("clickhouse", "\t") is None))
             if failed:
                 err = (r.get("stderr") or "").strip()
-                evid_line = err[:300] if err else f"rc={r.get('rc')} probe execution or parsing failed"
+                head = (r.get("stdout") or "").strip()[:200]
+                evid_line = err[:300] if err else f"rc={r.get('rc')} output not in expected shape: {head!r}"
                 out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
                                    value={"rc": r.get("rc")}, evidence=[ev(pid, "stderr" if err else "status", evid_line)]))
     return out
@@ -149,10 +164,12 @@ def check_collection(c: Ctx) -> list[dict]:
 # ------------------------------------------------------------------ docker
 def check_docker(c: Ctx) -> list[dict]:
     if c.containers is None:
-        ps_sec = c.s("docker_engine", "docker_ps")
-        ins_sec = c.s("docker_engine", "docker_inspect")
-        failed_sec = "docker_ps" if not P.ok(ps_sec) else "docker_inspect"
-        sec_obj = ps_sec if not P.ok(ps_sec) else ins_sec
+        if c.ok("docker_engine", "docker_ps") is None:
+            failed_sec, sec_obj = "docker_ps", c.s("docker_engine", "docker_ps")
+        elif c.ok("docker_engine", "docker_inspect") is None:
+            failed_sec, sec_obj = "docker_inspect", c.s("docker_engine", "docker_inspect")
+        else:
+            failed_sec, sec_obj = "docker_inspect", {"rc": 0, "lines": ["a container listed by docker ps has no docker inspect record"]}
         return [
             unknown("DOCKER-LIVENESS", "docker", "Container liveness", "docker_engine", failed_sec, sec_obj),
             unknown("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", "docker_engine", failed_sec, sec_obj),
@@ -168,6 +185,13 @@ def check_docker(c: Ctx) -> list[dict]:
             _log_sizes(c), _privileged(c), _db_ports(c)]
 
 
+def _each(c, section, fmt):
+    """Evidence for an all-clear finding: the per-container values it was derived from."""
+    if not c.containers:
+        return [ev("docker_engine", section, "docker ps listed 0 containers")]
+    return [ev("docker_engine", section, fmt(r)) for r in c.containers[:5]]
+
+
 def _liveness(c):
     down = [r for r in c.containers if r["state"] != "running"]
     running = len(c.containers) - len(down)
@@ -181,7 +205,8 @@ def _liveness(c):
     evid = [ev("docker_engine", "docker_ps", f"{r['name']}|{r['state']}|{r['status']}") for r in down]
     return finding("DOCKER-LIVENESS", "docker", "Containers not running", "CRIT" if down else "OK",
                    value={"running": running, "total": len(c.containers), "down": [r["name"] for r in down]},
-                   evidence=evid or [ev("docker_engine", "docker_info", note)], verified=verified, note=note)
+                   evidence=evid or _each(c, "docker_ps", lambda r: f"{r['name']}|{r['state']}|{r['status']}"),
+                   verified=verified, note=note)
 
 
 def _health(c):
@@ -189,8 +214,7 @@ def _health(c):
     if bad:
         evid = [ev("docker_engine", "docker_ps", f"{r['name']}|{r['status']}") for r in bad]
     else:
-        evid = [ev("docker_engine", "docker_inspect",
-                   f"{r['name']} health={r['inspect'].get('health') or 'none'}") for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} health={r['inspect'].get('health') or 'none'}")
     return finding("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", "WARN" if bad else "OK",
                    value=[r["name"] for r in bad],
                    evidence=evid)
@@ -201,7 +225,7 @@ def _oom(c):
     if bad:
         evid = [ev("docker_engine", "docker_inspect", f"{r['name']} oom_killed=true") for r in bad]
     else:
-        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} oom_killed=false") for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} oom_killed=false")
     return finding("DOCKER-OOM", "docker", "Container last exit was OOM kill", "CRIT" if bad else "OK",
                    value=[r["name"] for r in bad],
                    evidence=evid)
@@ -212,7 +236,7 @@ def _restarts(c):
     prev = c.baseline.get("restart_counts")
     if prev is None:
         nonzero = {n: v for n, v in cur.items() if v}
-        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} restart_count={cur[r['name']]}") for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} restart_count={cur[r['name']]}")
         return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "INFO", value=nonzero,
                        evidence=evid,
                        note="no baseline: cumulative RestartCount shown; weekly delta starts next run")
@@ -222,7 +246,7 @@ def _restarts(c):
     if deltas:
         evid = [ev("docker_engine", "docker_inspect", f"{n} restart_count={cur[n]} baseline={prev[n]}") for n in deltas]
     else:
-        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} restart_count={cur[r['name']]} baseline={prev.get(r['name'])}") for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} restart_count={cur[r['name']]} baseline={prev.get(r['name'])}")
     return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "WARN" if deltas else "OK",
                    value=deltas, evidence=evid)
 
@@ -233,9 +257,8 @@ def _log_rotation(c):
     if bad:
         evid = [ev("docker_engine", "docker_inspect", f"{n} log_opts has no max-size") for n in bad[:5]]
     else:
-        evid = [ev("docker_engine", "docker_inspect",
-                   f"{r['name']} log_type={r['inspect'].get('log_type')} max-size={(r['inspect'].get('log_opts') or {}).get('max-size')}")
-                for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} log_type={r['inspect'].get('log_type')} "
+                     f"max-size={(r['inspect'].get('log_opts') or {}).get('max-size')}")
     return finding("DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size", "WARN" if bad else "OK",
                    value={"count": len(bad), "containers": bad},
                    evidence=evid)
@@ -251,7 +274,7 @@ def _rw_layers(c):
     if big:
         evid = [ev("docker_engine", "docker_ps", f"{n} size={raw}") for n, _, raw in big]
     else:
-        evid = [ev("docker_engine", "docker_ps", f"{r['name']} size={r.get('size') or '0B'}") for r in c.containers[:5]]
+        evid = _each(c, "docker_ps", lambda r: f"{r['name']} size={r.get('size') or '0B'}")
     return finding("DOCKER-RW-LAYER", "storage", "Container writable layer over threshold", "WARN" if big else "OK",
                    value={n: gb(s) for n, s, _ in big}, threshold=f">= {c.t['container_rw_mb_warn']} MB",
                    evidence=evid)
@@ -259,7 +282,7 @@ def _rw_layers(c):
 
 def _log_sizes(c):
     sec = c.s("docker_vm", "container_logs")
-    if not P.ok(sec):
+    if c.ok("docker_vm", "container_logs") is None:
         return unknown("DOCKER-LOG-SIZE", "storage", "Container json log size", "docker_vm", "container_logs", sec)
     by_file = {posixpath.basename(p): v for p, v in P.du_rows(sec["lines"]).items()}
     limit = c.t["container_log_mb_warn"] * 1e6
@@ -291,7 +314,7 @@ def _privileged(c):
     if bad:
         evid = [ev("docker_engine", "docker_inspect", b) for b in bad]
     else:
-        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} privileged=false docker_sock=false") for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} privileged=false docker_sock=false")
     return finding("SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount", "WARN" if bad else "OK",
                    value=bad, evidence=evid)
 
@@ -306,7 +329,7 @@ def _db_ports(c):
     if exposed:
         evid = [ev("docker_engine", "docker_inspect", e) for e in exposed]
     else:
-        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} ports={list((r['inspect'].get('ports') or {}).keys())}") for r in c.containers[:5]]
+        evid = _each(c, "docker_inspect", lambda r: f"{r['name']} ports={sorted((r['inspect'].get('ports') or {}).keys())}")
     return finding("SEC-DB-PORTS", "security", "Datastore port published on all interfaces",
                    "WARN" if exposed else "OK", value=exposed,
                    evidence=evid)

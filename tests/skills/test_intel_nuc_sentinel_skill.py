@@ -1,6 +1,7 @@
 """Behaviour contracts for skills/devops/intel-nuc-sentinel/scripts (no network: ssh is faked)."""
 
 import json
+import re as _re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ SKILL = Path(__file__).resolve().parents[2] / "skills" / "devops" / "intel-nuc-s
 sys.path.insert(0, str(SKILL / "scripts"))
 
 import sentinel
+import sentinel_checks as _C
 import sentinel_parse as P
 import sentinel_probes
 from sentinel_guard import check_probe_script
@@ -513,3 +515,63 @@ def test_finding_without_evidence_is_a_programming_error():
         C.finding("X", "host", "t", "OK")
     with pytest.raises(ValueError):
         C.finding("X", "host", "t", "OK", evidence=[C.ev("p", "s", "")])
+
+
+# ------------------------------------------------------------------ C-03: every required section, every failure mode
+_SECTION_CASES = [(pid, s) for pid, secs in _C.expected_sections(CFG).items() for s in secs]
+
+
+def _mutate(raw, pid, name, mode):
+    out = raw[pid]["stdout"]
+    m = _re.search(rf"## {_re.escape(name)}\n.*?##rc {_re.escape(name)} 0\n", out, _re.DOTALL)
+    assert m, f"fixture lacks {pid}/{name}"
+    repl = {"drop": "", "rcfail": f"## {name}\nerror: boom\n##rc {name} 1\n",
+            "malformed": f"## {name}\n@@ not the shape this command prints @@\n##rc {name} 0\n"}[mode]
+    raw[pid]["stdout"] = out[:m.start()] + repl + out[m.end():]
+
+
+@pytest.mark.parametrize("mode", ["drop", "rcfail", "malformed"])
+@pytest.mark.parametrize("pid,name", _SECTION_CASES)
+def test_every_required_section_failure_is_unknown_never_silent(pid, name, mode):
+    healthy = {f["id"] for f in sentinel.evaluate_raw(CFG, healthy_raw(), {})}
+    raw = healthy_raw()
+    _mutate(raw, pid, name, mode)
+    fs = sentinel.evaluate_raw(CFG, raw, {})
+    ids = {f["id"] for f in fs}
+    # No finding disappears: a metric that cannot be computed is reported, never omitted.
+    assert healthy <= ids
+    col = by_id(fs)[f"COLLECT-{pid.upper()}"]
+    key = {"drop": "missing_sections", "rcfail": "failed_sections", "malformed": "malformed_sections"}[mode]
+    assert name in col["value"][key]
+    for f in fs:
+        assert f["evidence"] and all(e["line"] for e in f["evidence"]), f["id"]
+        # Nothing derived from the broken section may report OK.
+        if f["status"] == "OK" and f["id"] != "DB-ZK-AUTOPURGE":
+            assert not any(e["probe"] == pid and e["section"] == name for e in f["evidence"]), f["id"]
+
+
+@pytest.mark.parametrize("pid", ["windows_host", "postgres", "clickhouse"])
+@pytest.mark.parametrize("mode", ["missing", "malformed"])
+def test_structured_probe_failure_is_unknown_never_silent(pid, mode):
+    healthy = {f["id"] for f in sentinel.evaluate_raw(CFG, healthy_raw(), {})}
+    raw = healthy_raw()
+    if mode == "missing":
+        del raw[pid]
+    else:
+        raw[pid]["stdout"] = "@@ not the shape this probe prints @@\n"
+    fs = sentinel.evaluate_raw(CFG, raw, {})
+    assert healthy <= {f["id"] for f in fs}
+    assert by_id(fs)[f"COLLECT-{pid.upper()}"]["status"] == "UNKNOWN"
+    for f in fs:
+        assert f["evidence"] and all(e["line"] for e in f["evidence"]), f["id"]
+
+
+def test_container_without_inspect_record_is_unknown():
+    raw = healthy_raw()
+    eng = raw["docker_engine"]["stdout"]
+    m = _re.search(r"## docker_inspect\n(.*?)\n##rc docker_inspect 0\n", eng, _re.DOTALL)
+    first_line_dropped = "\n".join(m.group(1).splitlines()[1:])
+    raw["docker_engine"]["stdout"] = eng[:m.start(1)] + first_line_dropped + eng[m.end(1):]
+    f = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    for fid in ("DOCKER-HEALTH", "DOCKER-OOM", "SEC-DB-PORTS", "SEC-DOCKER-PRIV"):
+        assert f[fid]["status"] == "UNKNOWN"
