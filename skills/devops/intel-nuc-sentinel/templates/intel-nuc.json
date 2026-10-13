@@ -1,0 +1,47 @@
+{
+  "host": "192.168.100.110",
+  "ssh_options": ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"],
+  "probe_timeout_s": 600,
+  "wsl_exe": "/mnt/c/Windows/System32/wsl.exe",
+  "powershell_exe": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+  "ubuntu_distro": "Ubuntu",
+  "docker_distro": "docker-desktop",
+  "docker_disk_mount": "/mnt/docker-desktop-disk",
+  "linux_fs": ["/", "/mnt/c", "/mnt/d"],
+  "drive_cross_check": {"/mnt/c": "C:", "/mnt/d": "D:"},
+  "vhdx": [
+    {
+      "name": "docker_data",
+      "windows_path": "C:\\DockerDesktopWSL\\disk\\docker_data.vhdx",
+      "wsl_path": "/mnt/c/DockerDesktopWSL/disk/docker_data.vhdx",
+      "inner": "docker_disk"
+    },
+    {
+      "name": "ubuntu_ext4",
+      "windows_path": "C:\\Users\\phuong\\AppData\\Local\\Packages\\CanonicalGroupLimited.Ubuntu_79rhkp1fndgsc\\LocalState\\ext4.vhdx",
+      "wsl_path": "/mnt/c/Users/phuong/AppData/Local/Packages/CanonicalGroupLimited.Ubuntu_79rhkp1fndgsc/LocalState/ext4.vhdx",
+      "inner": "ubuntu_root"
+    }
+  ],
+  "volume_root": "/home/ubuntu/volumes",
+  "postgres": {"container": "platform-postgres-1", "data_host_path": "/home/ubuntu/volumes/postgres/data/pgdata"},
+  "clickhouse": {"container": "platform-clickhouse-1", "data_host_path": "/home/ubuntu/volumes/clickhouse/data"},
+  "redis": ["platform-redis-1", "platform-redis7-1"],
+  "zookeeper": {"container": "platform-zookeeper-1", "datalog_host_path": "/home/ubuntu/volumes/zookeeper/datalog"},
+  "thresholds": {
+    "disk_used_pct_warn": 85,
+    "disk_used_pct_crit": 92,
+    "vhdx_slack_gb_warn": 30,
+    "container_log_mb_warn": 500,
+    "container_rw_mb_warn": 1024,
+    "mem_available_pct_warn": 10,
+    "pg_conn_pct_warn": 80,
+    "ch_log_no_ttl_gb_warn": 1,
+    "load_per_cpu_warn": 1.0,
+    "pg_xid_age_warn": 500000000,
+    "pg_xid_age_crit": 1000000000,
+    "hotfix_age_days_warn": 45,
+    "defender_sig_age_days_warn": 3,
+    "apt_lists_age_days_warn": 7
+  }
+}

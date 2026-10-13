@@ -50,6 +50,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
+| [`intel-nuc-sentinel`](../user-guide/skills/bundled/devops/devops-intel-nuc-sentinel.md) | Weekly read-only health audit of the intel-nuc host. | `devops/intel-nuc-sentinel` |
 | [`sdlc-review`](../user-guide/skills/bundled/devops/devops-sdlc-review.md) | Review Kanban handoffs and route verified outcomes. | `devops/sdlc-review` |
 
 ## email

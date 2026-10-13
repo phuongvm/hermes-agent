@@ -211,6 +211,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-devops',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/devops/devops-intel-nuc-sentinel',
                     'user-guide/skills/bundled/devops/devops-sdlc-review',
                   ],
                 },
