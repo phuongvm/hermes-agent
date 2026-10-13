@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sentinel_checks as C
 import sentinel_platform as PL
-from sentinel_probes import ConfigError, ReadOnlyViolation, build_probes, remote_command, ssh_argv
+from sentinel_probes import ConfigError, ReadOnlyViolation, assert_read_only, build_probes, remote_command, ssh_argv
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = SKILL_DIR / "templates" / "intel-nuc.json"
@@ -42,6 +42,7 @@ def load_config(path: Path) -> dict:
     cfg = load_json(path)
     # Validate every token, the read-only guard and the ssh argv before anything runs.
     for p in build_probes(cfg):
+        assert_read_only(p.script, f"probe {p.id}")
         ssh_argv(cfg, remote_command(p, cfg))
     return cfg
 

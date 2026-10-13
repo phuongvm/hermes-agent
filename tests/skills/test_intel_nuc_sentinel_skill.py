@@ -12,7 +12,7 @@ sys.path.insert(0, str(SKILL / "scripts"))
 
 import sentinel
 import sentinel_parse as P
-from sentinel_probes import ConfigError, ReadOnlyViolation, assert_read_only, build_probes, remote_command, ssh_argv
+from sentinel_probes import ConfigError, Probe, ReadOnlyViolation, assert_read_only, build_probes, remote_command, ssh_argv
 
 CFG = json.loads((SKILL / "templates" / "intel-nuc.json").read_text(encoding="utf-8-sig"))
 
@@ -96,10 +96,19 @@ def test_shipped_catalog_is_read_only_and_valid():
 
 @pytest.mark.parametrize("text", [
     "rm -rf /home/ubuntu/volumes/x", "docker restart grafana", "docker system prune -af", "docker compose up -d",
-    "echo 1 > /etc/docker/daemon.json", "apt update", "systemctl restart docker", "wsl.exe --shutdown",
+    "echo 1 > /etc/docker/daemon.json", "echo 1 >> /tmp/foo", "echo 1 >/tmp/foo", "apt update",
+    "systemctl restart docker", "wsl.exe --shutdown",
     "DROP TABLE system.query_log", "TRUNCATE TABLE t", "ALTER TABLE x MODIFY TTL d", "VACUUM FULL",
     "redis-cli FLUSHALL", "redis-cli CONFIG SET maxmemory 1", "Optimize-VHD -Path C:\\x.vhdx",
     "Remove-Item C:\\x", "kill 1", "fstrim -v /", "sed -i s/a/b/ f",
+    # Reviewer repros and expanded mutating classes:
+    "redis-cli SET review_probe value",
+    "MERGE INTO ... WHEN MATCHED THEN UPDATE SET ...",
+    "python -c 'open(\"/tmp/review_probe\",\"w\").write(\"x\")'",
+    "redis-cli DEL key", "redis-cli HSET hash field val", "redis-cli LPUSH list val",
+    "UPDATE users SET name = 'admin'", "INSERT INTO audit_log VALUES (1)", "DELETE FROM sessions",
+    "python3 -c 'import os; os.system(\"rm -rf /\")'", "perl -e 'unlink \"/tmp/x\"'",
+    "ruby -e 'File.write(\"/tmp/x\", \"y\")'", "node -e 'fs.writeFileSync(\"/tmp/x\", \"y\")'",
 ])
 def test_mutating_commands_are_refused(text):
     with pytest.raises(ReadOnlyViolation):
@@ -244,3 +253,163 @@ def test_parsers():
     apt = P.apt_upgradable(["Listing...", "libx/noble-security 1 amd64 [upgradable from: 0]",
                             "vim/noble-updates 2 amd64 [upgradable from: 1]"])
     assert apt == {"count": 2, "security": 1, "security_pkgs": ["libx"]}
+
+
+# ------------------------------------------------------------------ Reviewer C-01: CLI & zero-runner enforcement
+@pytest.mark.parametrize("mutating_injection", [
+    "redis-cli SET review_probe value",
+    "MERGE INTO ... WHEN MATCHED THEN UPDATE SET ...",
+    "python -c 'open(\"/tmp/review_probe\",\"w\").write(\"x\")'",
+])
+def test_cli_exits_2_and_makes_zero_runner_calls_on_mutating_catalog(tmp_path, mutating_injection, monkeypatch):
+    runner_calls = []
+
+    def mock_run(*args, **kwargs):
+        runner_calls.append(args)
+        raise AssertionError("Runner must not be called when mutating pattern is present")
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    # Inject mutating pattern into a probe builder
+    orig_build = sentinel.build_probes
+
+    def injected_build_probes(cfg):
+        probes = orig_build(cfg)
+        return [*probes, Probe("injected_mutating", "bash", mutating_injection)]
+
+    monkeypatch.setattr(sentinel, "build_probes", injected_build_probes)
+
+    # Test both plan and run commands
+    exit_code_plan = sentinel.main(["plan", "--config", str(SKILL / "templates" / "intel-nuc.json")])
+    assert exit_code_plan == 2
+    assert runner_calls == []
+
+    exit_code_run = sentinel.main(["run", "--config", str(SKILL / "templates" / "intel-nuc.json"),
+                                  "--out-dir", str(tmp_path)])
+    assert exit_code_run == 2
+    assert runner_calls == []
+
+
+# ------------------------------------------------------------------ Reviewer C-02: Non-empty evidence contract
+def test_every_finding_has_non_empty_evidence():
+    findings = sentinel.evaluate_raw(CFG, healthy_raw(), {})
+    f_map = by_id(findings)
+
+    # 1. Contract assertion: EVERY single finding has at least one evidence item with a non-empty line
+    for f in findings:
+        assert len(f["evidence"]) > 0, f"Finding {f['id']} has empty evidence"
+        for ev_item in f["evidence"]:
+            assert ev_item.get("line"), f"Finding {f['id']} has empty evidence line: {ev_item}"
+
+    # 2. Specifically verify the 10 findings highlighted in Reviewer C-02
+    c02_fids = [
+        "DOCKER-RESTARTS", "DB-CH-LOG-TTL", "DOCKER-HEALTH", "DOCKER-LOG-ROTATION",
+        "DOCKER-OOM", "SEC-DB-PORTS", "SEC-DOCKER-PRIV", "DOCKER-LOG-SIZE",
+        "DOCKER-RW-LAYER", "STORAGE-ORPHANS"
+    ]
+    for fid in c02_fids:
+        assert fid in f_map, f"Expected finding {fid} in evaluated output"
+        f = f_map[fid]
+        assert len(f["evidence"]) > 0, f"Finding {fid} has empty evidence in healthy evaluation"
+        assert f["evidence"][0]["line"], f"Finding {fid} has empty line in evidence: {f['evidence']}"
+
+
+# ------------------------------------------------------------------ Reviewer C-03: Missing/malformed sections -> UNKNOWN
+def test_missing_loadavg_and_nproc_emits_unknown_and_incomplete_collection():
+    raw = healthy_raw()
+    # Remove both loadavg and nproc sections from linux_host
+    linux = raw["linux_host"]["stdout"]
+    for name in ("loadavg", "nproc"):
+        start = linux.find(f"## {name}\n")
+        end = linux.find(f"##rc {name} 0\n") + len(f"##rc {name} 0\n")
+        assert start != -1 and end != -1
+        linux = linux[:start] + linux[end:]
+    raw["linux_host"]["stdout"] = linux
+
+    findings = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+
+    # HOST-LOAD must be emitted as UNKNOWN with non-empty evidence
+    assert "HOST-LOAD" in findings
+    assert findings["HOST-LOAD"]["status"] == "UNKNOWN"
+    assert len(findings["HOST-LOAD"]["evidence"]) > 0
+
+    # COLLECT-LINUX_HOST must flag both sections as missing
+    assert "COLLECT-LINUX_HOST" in findings
+    assert findings["COLLECT-LINUX_HOST"]["status"] == "UNKNOWN"
+    assert "loadavg" in findings["COLLECT-LINUX_HOST"]["value"].get("missing_sections", [])
+    assert "nproc" in findings["COLLECT-LINUX_HOST"]["value"].get("missing_sections", [])
+
+
+def test_malformed_host_metrics_emit_unknown():
+    raw = healthy_raw()
+    raw["linux_host"]["stdout"] = raw["linux_host"]["stdout"].replace("1.0 1.2 1.1 1/100 5", "not a loadavg")
+    findings = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    assert findings["HOST-LOAD"]["status"] == "UNKNOWN"
+    assert len(findings["HOST-LOAD"]["evidence"]) > 0
+
+
+def test_missing_and_malformed_windows_host_emits_unknown():
+    raw = healthy_raw()
+    raw["windows_host"] = {"rc": 1, "stdout": "", "stderr": "powershell execution failed"}
+    findings = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+
+    for fid in ("HOST-WINDOWS", "HOST-MEM-WIN", "HOST-REBOOT-WIN",
+                "SEC-WIN-DEFENDER", "SEC-WIN-FIREWALL", "SEC-WIN-HOTFIX"):
+        assert fid in findings, f"Expected {fid} when windows_host fails"
+        assert findings[fid]["status"] == "UNKNOWN"
+        assert len(findings[fid]["evidence"]) > 0
+        assert "powershell execution failed" in findings[fid]["evidence"][0]["line"]
+
+
+def test_unreachable_databases_emit_crit_and_unknowns():
+    # Postgres unreachable
+    raw_pg = healthy_raw()
+    raw_pg["postgres"] = {"rc": 1, "stdout": "", "stderr": "FATAL: connection to server failed"}
+    f_pg = by_id(sentinel.evaluate_raw(CFG, raw_pg, {}))
+    assert f_pg["DB-PG-UP"]["status"] == "CRIT"
+    for fid in ("DB-PG-CONN", "DB-PG-TX", "DB-PG-XID", "DB-PG-SIZE"):
+        assert f_pg[fid]["status"] == "UNKNOWN"
+        assert len(f_pg[fid]["evidence"]) > 0
+        assert "connection to server failed" in f_pg[fid]["evidence"][0]["line"]
+
+    # ClickHouse unreachable
+    raw_ch = healthy_raw()
+    raw_ch["clickhouse"] = {"rc": 1, "stdout": "", "stderr": "Connection refused"}
+    f_ch = by_id(sentinel.evaluate_raw(CFG, raw_ch, {}))
+    assert f_ch["DB-CH-UP"]["status"] == "CRIT"
+    for fid in ("DB-CH-LOG-TTL", "DB-CH-SIZE"):
+        assert f_ch[fid]["status"] == "UNKNOWN"
+        assert len(f_ch[fid]["evidence"]) > 0
+        assert "Connection refused" in f_ch[fid]["evidence"][0]["line"]
+
+
+def test_missing_security_sections_emit_unknown():
+    for sec_name, fid in [
+        ("sshd", "SEC-SSHD"),
+        ("apt_upgradable", "SEC-APT-UPDATES"),
+        ("auto_upgrades", "SEC-UNATTENDED"),
+        ("reboot_required", "SEC-WSL-REBOOT"),
+    ]:
+        raw = healthy_raw()
+        ub = raw["ubuntu_root"]["stdout"]
+        start = ub.find(f"## {sec_name}\n")
+        end = ub.find(f"##rc {sec_name} 0\n") + len(f"##rc {sec_name} 0\n")
+        raw["ubuntu_root"]["stdout"] = ub[:start] + ub[end:]
+        f = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+        assert f[fid]["status"] == "UNKNOWN"
+        assert len(f[fid]["evidence"]) > 0
+
+
+def test_missing_docker_containers_emits_unknown_for_all_docker_checks():
+    raw = healthy_raw()
+    raw["docker_engine"]["stdout"] = raw["docker_engine"]["stdout"].replace("##rc docker_ps 0", "##rc docker_ps 1")
+    findings = by_id(sentinel.evaluate_raw(CFG, raw, {}))
+    docker_fids = [
+        "DOCKER-LIVENESS", "DOCKER-HEALTH", "DOCKER-OOM", "DOCKER-RESTARTS",
+        "DOCKER-LOG-ROTATION", "DOCKER-RW-LAYER", "DOCKER-LOG-SIZE",
+        "SEC-DOCKER-PRIV", "SEC-DB-PORTS"
+    ]
+    for fid in docker_fids:
+        assert findings[fid]["status"] == "UNKNOWN"
+        assert len(findings[fid]["evidence"]) > 0
+

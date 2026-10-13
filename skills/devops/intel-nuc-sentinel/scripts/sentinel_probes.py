@@ -14,26 +14,48 @@ SAFE_WIN_PATH = re.compile(r"^[A-Za-z]:\\[A-Za-z0-9_.\\ ()-]+$")
 # ssh -o values; never ProxyCommand/LocalCommand (those execute commands locally).
 SAFE_SSH_OPT = re.compile(r"^(?!.*(?i:proxycommand|localcommand|permitlocalcommand))-?[A-Za-z0-9_.=:/@-]+$")
 
-# Accidental-mutation guard. A probe that matches any of these is refused before it runs.
+# Accidental-mutation guard. A probe or remote command that matches any of these is refused before it runs.
 _MUTATING = [
+    # Filesystem / system mutating commands and utilities
     r"(?:^|[\s;&|({])(?:rm|rmdir|mv|cp|chmod|chown|chattr|truncate|dd|mkfs\S*|shutdown|reboot"
-    r"|poweroff|halt|kill|pkill|killall|tee|fstrim|ln|touch|mkdir)\s",
+    r"|poweroff|halt|kill|pkill|killall|tee|fstrim|ln|touch|mkdir|install)\s",
     r"\bsed\s+-i",
+    # Docker mutating verbs
     r"\bdocker\s+(?:rm|rmi|stop|start|restart|kill|pause|unpause|update|prune|compose|run|create"
     r"|cp|commit|tag|push|pull|build|network|volume|image|container|builder|system\s+prune)\b",
+    # systemctl mutating subcommands
     r"\bsystemctl\s+(?!is-active\b|is-failed\b|status\b|--failed\b|list-)\S+",
+    # apt mutating subcommands
     r"\bapt(?:-get)?\s+(?:install|remove|purge|update|upgrade|full-upgrade|dist-upgrade"
     r"|autoremove|clean)\b",
+    # wsl mutating flags
     r"\bwsl(?:\.exe)?\b[^\n]*\s(?:--shutdown|--terminate|-t|--unregister|--manage|--set-\S+"
     r"|--import|--export|--mount|--unmount)\b",
-    r">>?\s*(?!/dev/null|&)\S",
-    r"(?i)\b(?:insert\s+into|update\s+\w+\s+set|delete\s+from|drop\s+\w+|alter\s+\w+"
-    r"|create\s+\w+|truncate\s+table|optimize\s+table|vacuum|reindex|grant|revoke"
-    r"|attach\s+\w+|detach\s+\w+|kill\s+query|system\s+(?:drop|flush|stop|start|reload|restart))\b",
+    # Output redirection to files (safe stderr redirects 2>&1, >/dev/null, 2>/dev/null allowed)
+    r"(?:>>?|&>|>\|)\s*(?!/dev/null\b|&\s*\d\b)\S",
+    # SQL DDL/DML and write statements (Postgres, ClickHouse, MySQL, SQLite, etc.)
+    r"(?i)\b(?:merge\s+(?:into\s+)?|insert\s+(?:into\s+|overwrite\s+)?|update\s+(?:(?:\w+\.)*\w+\s+)?"
+    r"set\b|update\s+set\b|delete\s+(?:from\s+)?|replace\s+(?:into\s+)?|upsert\s+(?:into\s+)?|"
+    r"drop\s+(?:table|database|view|index|user|role|function|procedure|trigger|dictionary)\b|"
+    r"alter\s+(?:table|database|view|index|user|role)\b|"
+    r"create\s+(?:table|database|view|index|user|role|function|procedure|trigger|dictionary|temporary)\b|"
+    r"truncate\s+(?:table\s+)?|optimize\s+table|vacuum\b|reindex\b|grant\s+\w+|revoke\s+\w+|"
+    r"attach\s+\w+|detach\s+\w+|kill\s+query|system\s+(?:drop|flush|stop|start|reload|restart))\b",
+    # Redis mutating commands
+    r"(?i)\bredis-cli\b[^;\n|]*?\b(?:set\w*|mset\w*|append|setrange|del|unlink|incr\w*|decr\w*|"
+    r"hset\w*|hmset|hdel|hincr\w*|lpush\w*|rpush\w*|lpop|rpop|lrem|lset|ltrim|rpoplpush|lmove|"
+    r"sadd|srem|spop|smove|zadd|zrem\w*|zpop\w*|zincr\w*|xadd|xdel|xtrim|xgroup|xsetid|"
+    r"flushall|flushdb|config\s+set|save|bgsave|bgrewriteaof|rename\w*|expire\w*|pexpire\w*|"
+    r"persist|migrate|restore|move|swapdb|debug\s+\w+|shutdown|slaveof|replicaof|failover|eval\w*|script)\b",
     r"(?i)\b(?:flushall|flushdb|config\s+set|bgrewriteaof|bgsave|debug\s+\w+)\b",
+    # Scripting runtime escape / file-write execution
+    r"\b(?:python[0-9.]*|perl|ruby|node|nodejs|php|lua)\s+(?:-[ce]|--eval)\b",
+    r"\b(?:open\s*\([^)]*['\"][wax+]|\.write\s*\(|"
+    r"os\.(?:system|remove|unlink|rmdir|mkdir|rename|chmod|chown)|subprocess\.(?:run|call|Popen))\b",
+    # PowerShell mutating cmdlets
     r"\b(?:Set|Remove|New|Stop|Restart|Start|Optimize|Clear|Move|Rename|Invoke|Mount|Dismount"
     r"|Resize|Disable|Enable|Install|Uninstall|Update|Add|Register|Unregister|Suspend|Resume"
-    r"|Write|Out|Copy|Reset|Repair)-[A-Za-z]\w*",
+    r"|Write|Out|Copy|Reset|Repair|Format)-[A-Za-z]\w*",
 ]
 MUTATING_PATTERNS = [re.compile(p, re.MULTILINE) for p in _MUTATING]
 
@@ -54,6 +76,9 @@ class Probe:
     transport: str
     script: str
     container: str = ""
+
+    def __post_init__(self):
+        assert_read_only(self.script, f"probe {self.id}")
 
 
 def assert_read_only(text: str, where: str) -> None:

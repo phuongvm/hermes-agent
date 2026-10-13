@@ -21,9 +21,10 @@ requires no password and changes nothing. The run never uses `sudo`.
 
 1. Probe scripts and every remote command line pass `assert_read_only` (`scripts/sentinel_probes.py`)
    before `ssh` starts: no `rm/mv/cp/kill/tee/touch`, no output redirection to a file, no
-   mutating `docker`/`systemctl`/`apt`/`wsl` verbs, no SQL DDL/DML, no Redis writes, no
-   mutating PowerShell verbs (`Set-`, `Remove-`, `Stop-`, `Optimize-`, `Out-`, ...). This is a
-   denylist that catches mistakes in edits to the catalog; the catalog itself is the allowlist.
+   mutating `docker`/`systemctl`/`apt`/`wsl` verbs, no SQL write statements (`MERGE INTO`, `UPDATE SET`, `INSERT`, `DELETE`),
+   no Redis writes (`SET`, `DEL`, `HSET`, `LPUSH`, `FLUSHALL`), no interpreter escape paths (`python -c`, `perl -e`, `node -e`, `open(`, `.write(`),
+   no mutating PowerShell verbs (`Set-`, `Remove-`, `Stop-`, `Optimize-`, `Out-`, ...). Probe construction
+   enforces this in `Probe.__post_init__`, and `load_config` validates every script and command before connection.
 2. Database sessions are read-only at the server: Postgres refuses writes
    (`cannot execute ... in a read-only transaction`), ClickHouse `readonly=1`. The first query of
    each probe echoes the setting, and `DB-PG-UP` / `DB-CH-UP` go CRIT if it is not in force.

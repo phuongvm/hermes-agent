@@ -18,9 +18,13 @@ BASH_PROBES = ("linux_host", "docker_engine", "docker_vm", "ubuntu_root")
 
 
 def finding(fid, area, title, status, value=None, threshold=None, evidence=(), verified=None, note=""):
+    evid = [e for e in evidence if e and e.get("line")]
+    if not evid:
+        # Every finding MUST cite non-empty evidence
+        evid = [ev(area, fid, note or f"{status} finding")]
     return {"id": fid, "area": area, "title": title, "status": status, "value": value,
             "threshold": threshold, "verified": verified, "note": note,
-            "evidence": [e for e in evidence if e]}
+            "evidence": evid}
 
 
 def ev(probe, section, line):
@@ -29,9 +33,10 @@ def ev(probe, section, line):
 
 def unknown(fid, area, title, probe, section, sec):
     rc = None if sec is None else sec.get("rc")
-    head = "\n".join((sec or {}).get("lines", [])[:5])
+    lines = (sec or {}).get("lines", [])
+    head = "\n".join(lines[:5]) if lines else f"{probe}/{section} missing or failed (rc={rc})"
     return finding(fid, area, title, "UNKNOWN", note=f"{probe}/{section} failed or missing (rc={rc})",
-                   evidence=[ev(probe, section, head)] if head else [])
+                   evidence=[ev(probe, section, head)])
 
 
 def level(value, warn, crit=None):
@@ -44,6 +49,21 @@ def level(value, warn, crit=None):
 
 def gb(n):
     return round(n / GB, 2)
+
+
+def expected_sections(cfg: dict) -> dict[str, list[str]]:
+    return {
+        "linux_host": ["epoch", "uptime", "nproc", "loadavg", "meminfo", "df", "vhdx_stat"],
+        "docker_engine": [
+            "docker_ps", "docker_info", "docker_inspect", "docker_df",
+            *[f"redis_ping:{c}" for c in cfg.get("redis", [])],
+            *[f"redis_persistence:{c}" for c in cfg.get("redis", [])],
+            *[f"redis_memory:{c}" for c in cfg.get("redis", [])],
+            "zookeeper_env",
+        ],
+        "docker_vm": ["df", "container_logs"],
+        "ubuntu_root": ["df", "volumes_du", "data_du", "sshd", "apt_upgradable", "apt_cache_mtime", "auto_upgrades", "reboot_required"],
+    }
 
 
 class Ctx:
@@ -90,21 +110,60 @@ class Ctx:
 # ------------------------------------------------------------------ collection
 def check_collection(c: Ctx) -> list[dict]:
     out = []
-    for pid in sorted(c.raw):
+    exp_sec = expected_sections(c.cfg)
+    expected_probes = ["linux_host", "windows_host", "docker_engine", "docker_vm", "ubuntu_root", "postgres", "clickhouse"]
+    for pid in expected_probes:
+        if pid not in c.raw:
+            out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} missing from run", "UNKNOWN",
+                               value={"rc": None, "missing_probe": True},
+                               evidence=[ev(pid, "status", f"probe {pid} not found in raw.json")]))
+            continue
         r = c.raw[pid]
-        failed = sorted(n for n, s in c.sec.get(pid, {}).items() if s.get("rc") != 0)
-        if r.get("rc") != 0 or failed:
-            out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
-                               value={"rc": r.get("rc"), "failed_sections": failed},
-                               evidence=[ev(pid, "stderr", (r.get("stderr") or "")[:300])]))
+        if pid in exp_sec:
+            parsed_sec = c.sec.get(pid, {})
+            missing = [s for s in exp_sec[pid] if s not in parsed_sec]
+            failed = sorted(n for n, s in parsed_sec.items() if s.get("rc") != 0)
+            if r.get("rc") != 0 or failed or missing:
+                val = {"rc": r.get("rc")}
+                if failed:
+                    val["failed_sections"] = failed
+                if missing:
+                    val["missing_sections"] = missing
+                err = (r.get("stderr") or "").strip()
+                evid_line = err[:300] if err else f"rc={r.get('rc')} failed={failed} missing={missing}"
+                out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
+                                   value=val, evidence=[ev(pid, "stderr" if err else "status", evid_line)]))
+        else:
+            failed = (r.get("rc") != 0 or
+                      (pid == "windows_host" and c.win is None) or
+                      (pid == "postgres" and c.sql("postgres", "|") is None) or
+                      (pid == "clickhouse" and c.sql("clickhouse", "\t") is None))
+            if failed:
+                err = (r.get("stderr") or "").strip()
+                evid_line = err[:300] if err else f"rc={r.get('rc')} probe execution or parsing failed"
+                out.append(finding(f"COLLECT-{pid.upper()}", "collection", f"Probe {pid} incomplete", "UNKNOWN",
+                                   value={"rc": r.get("rc")}, evidence=[ev(pid, "stderr" if err else "status", evid_line)]))
     return out
 
 
 # ------------------------------------------------------------------ docker
 def check_docker(c: Ctx) -> list[dict]:
     if c.containers is None:
-        return [unknown("DOCKER-LIVENESS", "docker", "Container liveness", "docker_engine", "docker_ps",
-                        c.s("docker_engine", "docker_ps"))]
+        ps_sec = c.s("docker_engine", "docker_ps")
+        ins_sec = c.s("docker_engine", "docker_inspect")
+        failed_sec = "docker_ps" if not P.ok(ps_sec) else "docker_inspect"
+        sec_obj = ps_sec if not P.ok(ps_sec) else ins_sec
+        return [
+            unknown("DOCKER-LIVENESS", "docker", "Container liveness", "docker_engine", failed_sec, sec_obj),
+            unknown("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", "docker_engine", failed_sec, sec_obj),
+            unknown("DOCKER-OOM", "docker", "Container last exit was OOM kill", "docker_engine", failed_sec, sec_obj),
+            unknown("DOCKER-RESTARTS", "docker", "Restarts since baseline", "docker_engine", failed_sec, sec_obj),
+            unknown("DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size", "docker_engine", failed_sec, sec_obj),
+            unknown("DOCKER-RW-LAYER", "storage", "Container writable layer over threshold", "docker_engine", failed_sec, sec_obj),
+            unknown("DOCKER-LOG-SIZE", "storage", "Container json log size", "docker_engine", failed_sec, sec_obj),
+            unknown("SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount", "docker_engine", failed_sec, sec_obj),
+            unknown("SEC-DB-PORTS", "security", "Datastore port published on all interfaces", "docker_engine", failed_sec, sec_obj),
+        ]
     return [_liveness(c), _health(c), _oom(c), _restarts(c), _log_rotation(c), _rw_layers(c),
             _log_sizes(c), _privileged(c), _db_ports(c)]
 
@@ -127,16 +186,25 @@ def _liveness(c):
 
 def _health(c):
     bad = [r for r in c.containers if r["inspect"].get("health") == "unhealthy"]
+    if bad:
+        evid = [ev("docker_engine", "docker_ps", f"{r['name']}|{r['status']}") for r in bad]
+    else:
+        evid = [ev("docker_engine", "docker_inspect",
+                   f"{r['name']} health={r['inspect'].get('health') or 'none'}") for r in c.containers[:5]]
     return finding("DOCKER-HEALTH", "docker", "Healthcheck reports unhealthy", "WARN" if bad else "OK",
                    value=[r["name"] for r in bad],
-                   evidence=[ev("docker_engine", "docker_ps", f"{r['name']}|{r['status']}") for r in bad])
+                   evidence=evid)
 
 
 def _oom(c):
     bad = [r for r in c.containers if r["inspect"].get("oom_killed")]
+    if bad:
+        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} oom_killed=true") for r in bad]
+    else:
+        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} oom_killed=false") for r in c.containers[:5]]
     return finding("DOCKER-OOM", "docker", "Container last exit was OOM kill", "CRIT" if bad else "OK",
                    value=[r["name"] for r in bad],
-                   evidence=[ev("docker_engine", "docker_inspect", f"{r['name']} oom_killed=true") for r in bad])
+                   evidence=evid)
 
 
 def _restarts(c):
@@ -144,22 +212,33 @@ def _restarts(c):
     prev = c.baseline.get("restart_counts")
     if prev is None:
         nonzero = {n: v for n, v in cur.items() if v}
+        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} restart_count={cur[r['name']]}") for r in c.containers[:5]]
         return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "INFO", value=nonzero,
+                       evidence=evid,
                        note="no baseline: cumulative RestartCount shown; weekly delta starts next run")
     # RestartCount resets when a container is re-created, so a smaller value counts as all-new restarts.
     deltas = {n: (v - prev[n] if v >= prev[n] else v) for n, v in cur.items() if n in prev}
     deltas = {n: d for n, d in deltas.items() if d > 0}
+    if deltas:
+        evid = [ev("docker_engine", "docker_inspect", f"{n} restart_count={cur[n]} baseline={prev[n]}") for n in deltas]
+    else:
+        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} restart_count={cur[r['name']]} baseline={prev.get(r['name'])}") for r in c.containers[:5]]
     return finding("DOCKER-RESTARTS", "docker", "Restarts since baseline", "WARN" if deltas else "OK",
-                   value=deltas, evidence=[ev("docker_engine", "docker_inspect",
-                                              f"{n} restart_count={cur[n]} baseline={prev[n]}") for n in deltas])
+                   value=deltas, evidence=evid)
 
 
 def _log_rotation(c):
     bad = [r["name"] for r in c.containers
            if r["inspect"].get("log_type") == "json-file" and "max-size" not in (r["inspect"].get("log_opts") or {})]
+    if bad:
+        evid = [ev("docker_engine", "docker_inspect", f"{n} log_opts has no max-size") for n in bad[:5]]
+    else:
+        evid = [ev("docker_engine", "docker_inspect",
+                   f"{r['name']} log_type={r['inspect'].get('log_type')} max-size={(r['inspect'].get('log_opts') or {}).get('max-size')}")
+                for r in c.containers[:5]]
     return finding("DOCKER-LOG-ROTATION", "docker", "json-file logs without max-size", "WARN" if bad else "OK",
                    value={"count": len(bad), "containers": bad},
-                   evidence=[ev("docker_engine", "docker_inspect", f"{n} log_opts has no max-size") for n in bad[:5]])
+                   evidence=evid)
 
 
 def _rw_layers(c):
@@ -169,9 +248,13 @@ def _rw_layers(c):
         size = P.human_bytes((r.get("size") or "").split(" ", 1)[0])
         if size is not None and size >= limit:
             big.append((r["name"], size, r["size"]))
+    if big:
+        evid = [ev("docker_engine", "docker_ps", f"{n} size={raw}") for n, _, raw in big]
+    else:
+        evid = [ev("docker_engine", "docker_ps", f"{r['name']} size={r.get('size') or '0B'}") for r in c.containers[:5]]
     return finding("DOCKER-RW-LAYER", "storage", "Container writable layer over threshold", "WARN" if big else "OK",
                    value={n: gb(s) for n, s, _ in big}, threshold=f">= {c.t['container_rw_mb_warn']} MB",
-                   evidence=[ev("docker_engine", "docker_ps", f"{n} size={raw}") for n, _, raw in big])
+                   evidence=evid)
 
 
 def _log_sizes(c):
@@ -186,10 +269,16 @@ def _log_sizes(c):
         if row and row["bytes"] >= limit:
             big.append((r["name"], row))
     total = sum(v["bytes"] for v in by_file.values())
+    if big:
+        evid = [ev("docker_vm", "container_logs", row["raw"]) for _, row in big]
+    else:
+        evid = [ev("docker_vm", "container_logs", ln) for ln in sec["lines"][:5]] if sec["lines"] else [
+            ev("docker_vm", "container_logs", "no container log files found")
+        ]
     return finding("DOCKER-LOG-SIZE", "storage", "Container json log over threshold", "WARN" if big else "OK",
                    value={"total_gb": gb(total), "over_gb": {n: gb(row["bytes"]) for n, row in big}},
                    threshold=f">= {c.t['container_log_mb_warn']} MB",
-                   evidence=[ev("docker_vm", "container_logs", row["raw"]) for _, row in big])
+                   evidence=evid)
 
 
 def _privileged(c):
@@ -199,8 +288,12 @@ def _privileged(c):
         sock = any(m.get("source") in ("/var/run/docker.sock", "/run/docker.sock") for m in i.get("mounts", []))
         if i.get("privileged") or sock:
             bad.append(f"{r['name']} privileged={i.get('privileged')} docker_sock={sock}")
+    if bad:
+        evid = [ev("docker_engine", "docker_inspect", b) for b in bad]
+    else:
+        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} privileged=false docker_sock=false") for r in c.containers[:5]]
     return finding("SEC-DOCKER-PRIV", "security", "Privileged container or docker.sock mount", "WARN" if bad else "OK",
-                   value=bad, evidence=[ev("docker_engine", "docker_inspect", b) for b in bad])
+                   value=bad, evidence=evid)
 
 
 def _db_ports(c):
@@ -210,6 +303,10 @@ def _db_ports(c):
             for b in binds or []:
                 if port.split("/", 1)[0] in DB_PORTS and b.get("HostIp", "") in ("", "0.0.0.0", "::"):
                     exposed.append(f"{r['name']} {port} -> {b.get('HostIp') or '*'}:{b.get('HostPort')}")
+    if exposed:
+        evid = [ev("docker_engine", "docker_inspect", e) for e in exposed]
+    else:
+        evid = [ev("docker_engine", "docker_inspect", f"{r['name']} ports={list((r['inspect'].get('ports') or {}).keys())}") for r in c.containers[:5]]
     return finding("SEC-DB-PORTS", "security", "Datastore port published on all interfaces",
                    "WARN" if exposed else "OK", value=exposed,
-                   evidence=[ev("docker_engine", "docker_inspect", e) for e in exposed])
+                   evidence=evid)

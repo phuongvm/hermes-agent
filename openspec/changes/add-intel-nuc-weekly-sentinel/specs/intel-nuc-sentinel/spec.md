@@ -8,9 +8,9 @@ host. A probe script or remote command line that matches a mutating pattern MUST
 connection is opened.
 
 #### Scenario: Catalog edit introduces a mutating command
-- GIVEN a probe script containing `docker restart`, `rm`, `apt update`, `wsl --shutdown`, SQL DDL/DML, a Redis write, a mutating PowerShell verb, or output redirection to a file
-- WHEN the configuration is loaded
-- THEN loading MUST fail with `ReadOnlyViolation` and the CLI MUST exit 2 without running `ssh`
+- GIVEN a probe script containing `docker restart`, `rm`, `apt update`, `wsl --shutdown`, SQL write statements (including `MERGE INTO`, `UPDATE SET`, `INSERT`, `DELETE`), Redis writes (including `redis-cli SET`, `DEL`, `HSET`, `LPUSH`), interpreter escape paths (including `python -c`, `perl -e`, `node -e`, `open(...)`), mutating PowerShell cmdlets, or output redirection to a file
+- WHEN the configuration or probe is loaded
+- THEN loading MUST fail with `ReadOnlyViolation` and the CLI MUST exit 2 without running `ssh` or any runner calls
 
 #### Scenario: Datastore sessions
 - GIVEN the Postgres and ClickHouse probes
@@ -24,8 +24,9 @@ connection is opened.
 - THEN loading MUST fail with `ConfigError` and the CLI MUST exit 2
 
 ### Requirement: Evidence for every finding
-Each finding MUST carry a status (CRIT, WARN, UNKNOWN, INFO, OK), a value, and evidence lines quoting the
-raw probe output it was derived from. The raw output of every probe (argv, script sha256, rc, stdout,
+Each finding MUST carry a status (CRIT, WARN, UNKNOWN, INFO, OK), a value, and non-empty evidence lines quoting the
+raw probe output it was derived from. Every finding, including OK and INFO findings that observe the absence of issues,
+MUST cite the inspected raw lines. The raw output of every probe (argv, script sha256, rc, stdout,
 stderr) MUST be stored with the run.
 
 #### Scenario: Weekly run
@@ -33,15 +34,27 @@ stderr) MUST be stored with the run.
 - WHEN `sentinel.py run --out-dir D` completes
 - THEN `D/runs/<UTC stamp>/` MUST contain `raw.json`, `config.json`, `baseline.json`, `findings.json`, `report.md` and `manifest.json` with the sha256 of the other five
 
+#### Scenario: Absence findings cite inspected evidence
+- GIVEN a completely healthy host run
+- WHEN the findings are evaluated
+- THEN every finding (including `DOCKER-RESTARTS`, `DB-CH-LOG-TTL`, `DOCKER-HEALTH`, `DOCKER-LOG-ROTATION`, `DOCKER-OOM`, `SEC-DB-PORTS`, `SEC-DOCKER-PRIV`, `DOCKER-LOG-SIZE`, `DOCKER-RW-LAYER`, `STORAGE-ORPHANS`) MUST have non-empty `evidence` quoting the inspected raw lines
+
 ### Requirement: No estimated values
-A metric whose probe section failed MUST be reported UNKNOWN with the failing section and rc. It MUST NOT
-be reported OK or filled from a previous run.
+A metric whose probe section failed or is missing MUST be reported UNKNOWN with the failing section and rc. It MUST NOT
+be reported OK or filled from a previous run. Collection completeness MUST compare against the expected probe catalog
+and expected sections.
 
 #### Scenario: One probe section fails
 - GIVEN the `df` section of `linux_host` exits non-zero
 - WHEN the run is evaluated
 - THEN `STORAGE-DISK-ROOT` MUST be UNKNOWN
 - AND `COLLECT-LINUX_HOST` MUST list `df` in `failed_sections`
+
+#### Scenario: Missing or malformed sections
+- GIVEN `loadavg` or `nproc` is missing or malformed in `linux_host`
+- WHEN the run is evaluated
+- THEN `HOST-LOAD` MUST be emitted as UNKNOWN with evidence
+- AND `COLLECT-LINUX_HOST` MUST list the missing sections in `missing_sections`
 
 ### Requirement: Cross-checked metrics
 Where a second independent source exists, the finding MUST record whether both agree (`verified`). When

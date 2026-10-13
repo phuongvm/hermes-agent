@@ -39,7 +39,9 @@ single finding to UNKNOWN instead of failing the run. SQL probes tag their first
 | Decision | Rationale | Rejected alternative |
 |---|---|---|
 | Probe scripts on stdin, fixed remote reader | Remote command line stays short and auditable; no quoting of the script through ssh | `ssh host "<long quoted script>"`: fragile quoting, harder to guard |
-| Denylist guard **plus** fixed catalog | Catalog is the allowlist; the guard catches mistakes in future edits | Allowlist regex per command: brittle against legitimate pipes and formats |
+| Comprehensive mutation guard **plus** fixed catalog | Guard comprehensively blocks filesystem writes, redirections, SQL write statements (including MERGE/UPDATE), Redis writes (SET/DEL/HSET), and scripting runtimes; catalog is the allowlist | Incomplete denylist that missed Redis writes, SQL MERGE, and interpreter escapes |
+| Non-empty evidence contract | Every finding (including OK/INFO absence findings) quotes raw section lines inspected | Empty evidence arrays on healthy findings |
+| Expected catalog completeness check | Missing or malformed sections/probes cascade to UNKNOWN findings and flag missing sections | Checking only sections that exist in raw output |
 | Bytes on stdin | Windows text-mode stdin injected `\r`, breaking every `2>&1` (seen live) | Text mode |
 | `{{with index .State "Health"}}` | `.State.Health` errors on containers without a healthcheck (seen live) | `{{if .State.Health}}` |
 | Severity in the report, exit 0 on any report | Cron passes stdout to the agent only on success | Non-zero exit on WARN/CRIT would drop the report |
@@ -58,9 +60,11 @@ single finding to UNKNOWN instead of failing the run. SQL probes tag their first
 ## 5. Testing
 
 `tests/skills/test_intel_nuc_sentinel_skill.py` fakes ssh with a runner that returns canned output
-per probe (matched by script bytes). It covers: catalog validity; 19 refused mutating commands and 5
-allowed reads; unsafe config values; healthy host => no CRIT/WARN/UNKNOWN and all cross-checks agree;
-stopped container => CRIT with evidence; failed section => UNKNOWN; DB unreachable => CRIT; source
-disagreement => `verified=False`; risky posture => WARN; restart deltas and container re-create;
-determinism; LF bytes on stdin; timeout => rc 124; run dir verifies and detects tampering; baseline
-retention; parsers.
+per probe (matched by script bytes). It covers: catalog validity; refused mutating commands and
+allowed reads (including Redis SET, SQL MERGE/UPDATE, interpreter/file escapes); CLI exit 2 and zero runner
+calls on mutating catalog; non-empty evidence contract across all findings; missing/malformed sections
+emitting UNKNOWN (loadavg/nproc, meminfo, windows_host, postgres, clickhouse, security sections);
+healthy host => no CRIT/WARN/UNKNOWN and all cross-checks agree; stopped container => CRIT with evidence;
+failed section => UNKNOWN; DB unreachable => CRIT; source disagreement => `verified=False`; risky posture => WARN;
+restart deltas and container re-create; determinism; LF bytes on stdin; timeout => rc 124; run dir verifies
+and detects tampering; baseline retention; parsers.
