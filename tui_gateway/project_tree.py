@@ -185,9 +185,18 @@ def _place_by_heuristic(path: str) -> Optional[dict]:
     return _placement(path, _branch_lane_id(path, DEFAULT_BRANCH_LABEL), base, path, True, False, is_git=False)
 
 
-def _subfolder_under(cwd: str, root: str) -> Optional[tuple[str, str]]:
+def _subfolder_under(
+        cwd: str, root: str, declared_folder: Optional[str] = None) -> Optional[tuple[str, str]]:
     """If cwd is a subfolder of root (and not root itself or internal .git/.worktrees),
-    return (folder_path, subfolder_name)."""
+    return (folder_path, subfolder_name). If declared_folder is provided and falls under root,
+    preserve its full relative path under root."""
+    if declared_folder:
+        dec_segs = _comparison_segments(declared_folder)
+        root_segs = _comparison_segments(root)
+        if len(dec_segs) > len(root_segs) and dec_segs[:len(root_segs)] == root_segs:
+            raw_segs = _segments(declared_folder)
+            rel = "/".join(raw_segs[len(root_segs):])
+            return declared_folder.rstrip("/\\"), rel
     cwd_segs = _comparison_segments(cwd)
     root_segs = _comparison_segments(root)
     if len(cwd_segs) > len(root_segs) and cwd_segs[:len(root_segs)] == root_segs:
@@ -201,12 +210,14 @@ def _subfolder_under(cwd: str, root: str) -> Optional[tuple[str, str]]:
 
 
 def _place(
-        cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: str) -> Optional[dict]:
+        cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: str,
+        folder_index: Optional[Any] = None) -> Optional[dict]:
     info = resolve(cwd) if resolve else None
     if info and info.get("repo_root") and info.get("worktree_root"):
         repo_root, worktree_root = info["repo_root"], info["worktree_root"]
         if _path_key(worktree_root) == _path_key(repo_root) or info.get("is_main"):
-            sub = _subfolder_under(cwd, repo_root)
+            dec_folder = folder_index.match_folder(cwd)[1] if folder_index and hasattr(folder_index, "match_folder") else None
+            sub = _subfolder_under(cwd, repo_root, declared_folder=dec_folder)
             if sub:
                 return _folder_placement(repo_root, sub[0], sub[1])
             return _trunk_placement(repo_root, branch)
@@ -230,14 +241,16 @@ def _place(
     return _place_by_heuristic(cwd)
 
 
-def _place_session(session: dict, resolve: Optional[Resolve]) -> Optional[dict]:
+def _place_session(
+        session: dict, resolve: Optional[Resolve],
+        folder_index: Optional[Any] = None) -> Optional[dict]:
     """``_place`` for a session row, anchored on its cwd or else its persisted repo root;
     ``None`` only when it has neither (the renderer's ``isDetachedSession``)."""
     root = _field(session, "git_repo_root")
     anchor = _field(session, "cwd") or root
     if not anchor:
         return None
-    return _place(anchor, _field(session, "git_branch"), resolve, root)
+    return _place(anchor, _field(session, "git_branch"), resolve, root, folder_index=folder_index)
 
 
 def _session_repo_root(session: dict, resolve: Optional[Resolve]) -> str:
@@ -285,11 +298,13 @@ def _repo_node(root: str, label: str) -> dict:
     return {"id": root, "label": label, "path": root, "groups": [], "sessionCount": 0}
 
 
-def _build_repos(sessions: list[dict], resolve: Optional[Resolve], hydrate: bool) -> list[dict]:
+def _build_repos(
+        sessions: list[dict], resolve: Optional[Resolve], hydrate: bool,
+        folder_index: Optional[Any] = None) -> list[dict]:
     """Build the ``repo -> lane -> sessions`` subtree for a set of sessions."""
     lanes: dict[str, tuple[dict, dict]] = {}  # lane identity -> (group, placement)
     for session in sessions:
-        placement = _place_session(session, resolve)
+        placement = _place_session(session, resolve, folder_index=folder_index)
         if not placement:
             continue
         lane_identity = _lane_key(placement["lane_key"])
@@ -331,25 +346,48 @@ def _seed_folder_repos(
         root = (info or {}).get("repo_root") or raw.rstrip("/\\")
         root_key = _path_key(root)
         if not root_key or root_key in seen:
-            continue
-        seeded.append(_repo_node(root, base_name(root) or root))
-        seen.add(root_key)
+            repo_node = next((r for r in seeded if _path_key(r.get("id") or r.get("path") or "") == root_key), None)
+        else:
+            repo_node = _repo_node(root, base_name(root) or root)
+            seeded.append(repo_node)
+            seen.add(root_key)
+
+        if repo_node is not None:
+            raw_key = _path_key(raw)
+            if raw_key != root_key:
+                raw_segs = _segments(raw)
+                root_segs = _segments(root)
+                if len(raw_segs) > len(root_segs) and _comparison_segments(raw)[:len(root_segs)] == _comparison_segments(root):
+                    rel = "/".join(raw_segs[len(root_segs):])
+                    lane_id = _folder_lane_id(root, rel)
+                    existing_lanes = {_lane_key(g.get("id") or "") for g in repo_node.get("groups", [])}
+                    if _lane_key(lane_id) not in existing_lanes:
+                        repo_node["groups"].append({
+                            "id": lane_id,
+                            "label": f"folder: {rel}",
+                            "path": raw.rstrip("/\\"),
+                            "isMain": False,
+                            "isKanban": False,
+                            "isGit": False,
+                            "sessions": []
+                        })
     if len(seeded) != len(repos):
         _disambiguate_labels(seeded)
     return seeded
 
 
 class _FolderIndex:
-    """Normalized folder path -> (owning project, depth); matched by walking cwd ancestors."""
+    """Normalized folder path -> (owning project, depth, raw_path); matched by walking cwd ancestors."""
 
     def __init__(self, projects: list[dict]) -> None:
-        self._by_path: dict[str, tuple[dict, int]] = {}
+        self._by_path: dict[str, tuple[dict, int, str]] = {}
         for project in projects:
             for folder in project.get("folders") or []:
-                segs = _comparison_segments(folder.get("path") or "")
+                raw_p = folder.get("path") or ""
+                segs = _comparison_segments(raw_p)
                 # Deepest folder wins; ties keep the first project (scan order).
-                if segs and len(segs) > self._by_path.get("/".join(segs), (None, -1))[1]:
-                    self._by_path["/".join(segs)] = (project, len(segs))
+                if segs and len(segs) > self._by_path.get("/".join(segs), (None, -1, ""))[1]:
+                    self._by_path["/".join(segs)] = (project, len(segs), raw_p)
 
     def match(self, target: str) -> tuple[Optional[dict], int]:
         """Owning project for ``target`` by longest ancestor folder, + its depth."""
@@ -357,8 +395,17 @@ class _FolderIndex:
         for end in range(len(segs), 0, -1):
             hit = self._by_path.get("/".join(segs[:end]))
             if hit:
-                return hit
+                return hit[0], hit[1]
         return None, -1
+
+    def match_folder(self, target: str) -> tuple[Optional[dict], Optional[str]]:
+        """Owning project and declared folder path for ``target`` by longest ancestor folder."""
+        segs = _comparison_segments(target or "")
+        for end in range(len(segs), 0, -1):
+            hit = self._by_path.get("/".join(segs[:end]))
+            if hit:
+                return hit[0], hit[2]
+        return None, None
 
 
 def _project_for_session(
@@ -486,7 +533,7 @@ def build_tree(
     for project in active_projects:
         psessions = by_project.get(project["id"], [])
         _scope(psessions)
-        repos = _build_repos(psessions, resolve, hydrate)
+        repos = _build_repos(psessions, resolve, hydrate, folder_index=folder_index)
         repos = _seed_folder_repos(repos, project.get("folders") or [], resolve)
         result.append(_project_node(
             project["id"], project.get("name") or project["id"], project.get("primary_path"), repos,

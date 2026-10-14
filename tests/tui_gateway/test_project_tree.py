@@ -795,3 +795,45 @@ def test_discovered_repo_suppressed_when_inside_explicit_project():
     real_ids = _real_project_ids(tree)
     assert real_ids == ["p_ws"]
 
+
+def test_seed_folder_repos_seeds_subfolder_lane_when_zero_sessions():
+    """Explicit project with a nested non-git subfolder under repo root seeds a folder lane with 0 sessions."""
+    project = _project("p_ir", "Inspire-Robotics", ["/workspaces/devops-support/inspire-robotics"])
+    resolve = _resolver({
+        "/workspaces": ("/workspaces", "/workspaces"),
+        "/workspaces/devops-support/inspire-robotics": ("/workspaces", "/workspaces"),
+    })
+
+    tree = pt.build_tree([project], [], [], resolve=resolve, hydrate=True)
+
+    proj = next(p for p in tree["projects"] if p["id"] == "p_ir")
+    repo = next(r for r in proj["repos"] if r["id"] == "/workspaces")
+    lane_ids = [g["id"] for g in repo["groups"]]
+    assert "/workspaces::folder::devops-support/inspire-robotics" in lane_ids
+    lane = next(g for g in repo["groups"] if g["id"] == "/workspaces::folder::devops-support/inspire-robotics")
+    assert lane["label"] == "folder: devops-support/inspire-robotics"
+    assert lane["path"] == "/workspaces/devops-support/inspire-robotics"
+    assert lane["isMain"] is False
+    assert lane["isGit"] is False
+
+
+def test_nested_subfolder_session_preserves_declared_folder_path():
+    """A session inside a nested declared project folder maps to the declared folder lane, not 1st level."""
+    project = _project("p_ir", "Inspire-Robotics", ["/workspaces/devops-support/inspire-robotics"])
+    resolve = _resolver({
+        "/workspaces": ("/workspaces", "/workspaces"),
+        "/workspaces/devops-support/inspire-robotics": ("/workspaces", "/workspaces"),
+        "/workspaces/devops-support/inspire-robotics/sub": ("/workspaces", "/workspaces"),
+    })
+    s = _session("/workspaces/devops-support/inspire-robotics/sub", branch="main")
+
+    tree = pt.build_tree([project], [s], [], resolve=resolve, hydrate=True)
+
+    proj = next(p for p in tree["projects"] if p["id"] == "p_ir")
+    repo = next(r for r in proj["repos"] if r["id"] == "/workspaces")
+    lane_ids = [g["id"] for g in repo["groups"]]
+    assert "/workspaces::folder::devops-support/inspire-robotics" in lane_ids
+    lane = next(g for g in repo["groups"] if g["id"] == "/workspaces::folder::devops-support/inspire-robotics")
+    assert lane["label"] == "folder: devops-support/inspire-robotics"
+    assert len(lane["sessions"]) == 1
+
