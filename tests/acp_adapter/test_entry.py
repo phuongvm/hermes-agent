@@ -63,20 +63,26 @@ def test_prewarm_imports_run_agent(monkeypatch):
 def test_prewarm_loads_enabled_plugin_native_dependencies(tmp_path):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
+    plugin_dir = hermes_home / "plugins" / "native_dummy"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: native_dummy\nversion: '1.0.0'\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "import fake_native\n\ndef register(ctx):\n    pass\n",
+        encoding="utf-8",
+    )
     (hermes_home / "config.yaml").write_text(
-        "plugins:\n  enabled:\n    - observability/langfuse\n",
+        "plugins:\n  enabled:\n    - native_dummy\n",
         encoding="utf-8",
     )
 
     fake_sdk_root = tmp_path / "fake-sdk"
-    fake_langfuse = fake_sdk_root / "langfuse"
-    fake_langfuse.mkdir(parents=True)
-    (fake_langfuse / "__init__.py").write_text(
-        "import numpy\n"
-        "class Langfuse:\n"
-        "    pass\n"
-        "def propagate_attributes(**_kwargs):\n"
-        "    return None\n",
+    fake_native = fake_sdk_root / "fake_native"
+    fake_native.mkdir(parents=True)
+    (fake_native / "__init__.py").write_text(
+        "import numpy\n",
         encoding="utf-8",
     )
 
@@ -94,7 +100,7 @@ def test_prewarm_loads_enabled_plugin_native_dependencies(tmp_path):
         "from acp_adapter.entry import _load_env, _prewarm_agent_runtime\n"
         "_load_env()\n"
         "_prewarm_agent_runtime()\n"
-        "assert 'langfuse' in sys.modules\n"
+        "assert 'fake_native' in sys.modules\n"
         "assert 'numpy' in sys.modules\n"
     )
     completed = subprocess.run(
