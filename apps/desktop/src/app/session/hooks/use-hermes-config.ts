@@ -6,9 +6,11 @@ import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromC
 import { composerServiceTier } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import { isTerminalSignedOut, normalizeBaseUrl, registerResumeSyncHandler } from '@/store/auth-terminal-state'
+import { $busyInputConfig, busyInputOwnerKey, normalizeBusyInputMode } from '@/store/busy-input-mode'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
 import { $activeGatewayProfile, getProfileFetchGeneration, isGatewayOpen, normalizeProfileKey } from '@/store/profile'
 import { setShowReasoningFromConfig } from '@/store/reasoning-disclosure'
+import { $connection } from '@/store/session'
 import {
   getComposerSelectionGeneration,
   getCurrentModelSource,
@@ -95,6 +97,8 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
       const profileRefreshEpoch = profileRefreshEpochRef.current
       const selectionGeneration = getComposerSelectionGeneration()
+      const connection = $connection.get()
+      const profile = $activeGatewayProfile.get()
       const { key: scopeKey } = getScopeKey()
 
       let fetchPromise: Promise<[any, any]>
@@ -192,6 +196,14 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
         if (!canPublish()) {
           return
+        }
+
+        if ($connection.get() === connection && $activeGatewayProfile.get() === profile) {
+          $busyInputConfig.set({
+            owner: busyInputOwnerKey(connection?.connectionId, profile),
+            connection,
+            mode: normalizeBusyInputMode(config.display?.busy_input_mode)
+          })
         }
 
         setDisplayTimestampsFromConfig(config.display?.timestamps)

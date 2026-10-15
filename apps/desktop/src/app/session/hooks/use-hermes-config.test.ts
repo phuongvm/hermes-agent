@@ -33,6 +33,7 @@ vi.mock('@/hermes', async importOriginal => {
   return {
     ...actual,
     getHermesConfig: vi.fn(),
+    setApiRequestProfile: vi.fn(),
     getHermesConfigDefaults: vi.fn().mockResolvedValue({})
   }
 })

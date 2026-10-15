@@ -140,7 +140,7 @@ def test_main_prewarms_before_background_threads(monkeypatch):
 
     entry.main([])
 
-    assert events == ["logging", "env", "prewarm", "mcp", "acp"]
+    assert events == ["logging", "env", "prewarm", "acp"]
 
 
 
