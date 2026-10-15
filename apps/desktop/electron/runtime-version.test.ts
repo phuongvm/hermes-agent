@@ -364,13 +364,16 @@ describe('Desktop Runtime Version & Install Stamp Resolution (Phases 3 & 4.2)', 
     test('3.1: Packaged + valid stamp + local source tree declaring an older version -> stamp wins and source is NOT read', () => {
       let readCount = 0
       let existsCount = 0
+
       const mockFs = {
         existsSync: () => {
           existsCount++
+
           return true
         },
         readFileSync: () => {
           readCount++
+
           return '__version__ = "0.20.0"\n'
         }
       }

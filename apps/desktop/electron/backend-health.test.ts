@@ -13,7 +13,6 @@ import {
   isServerSideHttpError,
   makeNousCloudBackendDownError,
   makeUnsignedOauthError,
-  normalizeEndpointKey,
   recordEndpoint401,
   resetEndpoint401State,
   waitForHermesReady
@@ -275,9 +274,11 @@ test('single transient 401 during reconnect does not trigger reauth and recovers
     probeHealth: async url => {
       calls.push(['probe', url])
       attempt += 1
+
       if (attempt === 1) {
         throw new Error(GATE_401)
       }
+
       return { ok: true }
     },
     probeIsCredentialed: true,
@@ -308,6 +309,7 @@ test('single transient 401 during reconnect timing out does not set isReauthRequ
       sleep: async () => {},
       now: () => {
         currentTime.value += 30
+
         return currentTime.value
       },
       timeoutMs: 50,
@@ -316,6 +318,7 @@ test('single transient 401 during reconnect timing out does not set isReauthRequ
     (error: any) => {
       assert.equal(isReauthRequiredError(error), false)
       assert.ok(error.message.includes('Hermes backend did not become ready'))
+
       return true
     }
   )
@@ -343,6 +346,7 @@ test('consecutive 401s from stable connection trigger reauth', async () => {
       assert.equal(isReauthRequiredError(error), true)
       assert.equal(error.needsOauthLogin, true)
       assert.match(error.message, /remote gateway session has expired/i)
+
       return true
     }
   )
@@ -361,9 +365,11 @@ test('mixed 401 and 200 responses reset the consecutive counter', async () => {
     fetchJson: async () => ({}),
     probeHealth: async () => {
       attempt += 1
+
       if (attempt === 1) {
         throw new Error(GATE_401)
       }
+
       return { ok: true }
     },
     probeIsCredentialed: true,
@@ -383,9 +389,11 @@ test('mixed 401 and 200 responses reset the consecutive counter', async () => {
     fetchJson: async () => ({}),
     probeHealth: async () => {
       attempt += 1
+
       if (attempt === 1) {
         throw new Error(GATE_401)
       }
+
       return { ok: true }
     },
     probeIsCredentialed: true,
@@ -408,12 +416,15 @@ test('503 and non-401 responses reset the consecutive 401 counter', async () => 
     fetchJson: async () => ({}),
     probeHealth: async () => {
       attempt += 1
+
       if (attempt === 1) {
         throw new Error(GATE_401)
       }
+
       if (attempt === 2) {
         throw new Error('503: Service Unavailable')
       }
+
       return { ok: true }
     },
     probeIsCredentialed: true,
@@ -437,13 +448,16 @@ test('two 401s separated by more than 15s reset the window and do not trigger re
     fetchJson: async () => ({}),
     probeHealth: async () => {
       attempt += 1
+
       if (attempt === 1) {
         throw new Error(GATE_401)
       }
+
       if (attempt === 2) {
         currentTime += 16_000
         throw new Error(GATE_401)
       }
+
       return { ok: true }
     },
     probeIsCredentialed: true,
@@ -473,6 +487,7 @@ test('consecutive 401s without previousGatewayState open do not trigger reauth',
       sleep: async () => {},
       now: () => {
         currentTime.value += 20
+
         return currentTime.value
       },
       timeoutMs: 50,
@@ -481,6 +496,7 @@ test('consecutive 401s without previousGatewayState open do not trigger reauth',
     (error: any) => {
       assert.equal(isReauthRequiredError(error), false)
       assert.ok(error.message.includes('Hermes backend did not become ready'))
+
       return true
     }
   )
@@ -838,12 +854,14 @@ test('two-tier 401 classifier: previously open endpoint with sustained 401s trig
       pollMs: 100,
       now: () => {
         currentTime += 100
+
         return currentTime
       },
       sleep: async () => {}
     }),
     error => {
       assert.equal(isReauthRequiredError(error), true)
+
       return true
     }
   )
@@ -872,6 +890,7 @@ test('two-tier 401 classifier: initial startup with 401 does NOT trigger reauth 
       pollMs: 100,
       now: () => {
         currentTime += 100
+
         return currentTime
       },
       sleep: async () => {}
@@ -880,6 +899,7 @@ test('two-tier 401 classifier: initial startup with 401 does NOT trigger reauth 
       // Must NOT be classified as reauth required
       assert.equal(isReauthRequiredError(error), false)
       assert.ok(String(error).includes('Initial unauthorized') || String(error).includes('did not become ready'))
+
       return true
     }
   )
@@ -898,17 +918,20 @@ test('two-tier 401 classifier: non-auth failure resets 401 counter (C1)', async 
       fetchJson: async () => ({}),
       probeHealth: async () => {
         probeStep += 1
+
         if (probeStep === 1) {
           const err = new Error('401: First 401') as any
           err.statusCode = 401
           throw err
         }
+
         if (probeStep === 2) {
           // 503 resets counter
           const err = new Error('503: Starting up') as any
           err.statusCode = 503
           throw err
         }
+
         // Step 3: Second 401 (count restarted at 1)
         const err = new Error('401: New first 401') as any
         err.statusCode = 401
@@ -920,6 +943,7 @@ test('two-tier 401 classifier: non-auth failure resets 401 counter (C1)', async 
       pollMs: 100,
       now: () => {
         currentTime += 100
+
         return currentTime
       },
       sleep: async () => {}
@@ -927,6 +951,7 @@ test('two-tier 401 classifier: non-auth failure resets 401 counter (C1)', async 
     error => {
       // Because 503 reset the counter, at deadline count was only 1 -> not reauth required
       assert.equal(isReauthRequiredError(error), false)
+
       return true
     }
   )
@@ -953,6 +978,7 @@ test('two-tier 401 classifier: isolates state between different endpoints (C1)',
       pollMs: 100,
       now: () => {
         currentTime += 100
+
         return currentTime
       },
       sleep: async () => {}
@@ -975,6 +1001,7 @@ test('two-tier 401 classifier: isolates state between different endpoints (C1)',
       pollMs: 100,
       now: () => {
         currentTime += 100
+
         return currentTime
       },
       sleep: async () => {}

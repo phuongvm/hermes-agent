@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { buildReconnectOwnerKey, reconnectGateway, registerGatewayReconnect } from './gateway-reconnect'
 import { resetAuthTerminalState, setTerminalSignedOut } from './auth-terminal-state'
+import { buildReconnectOwnerKey, reconnectGateway, registerGatewayReconnect } from './gateway-reconnect'
 
 const disposers: Array<() => void> = []
 
 afterEach(() => {
   resetAuthTerminalState()
+
   while (disposers.length > 0) {
     disposers.pop()?.()
   }
@@ -82,6 +83,7 @@ describe('gateway-reconnect single-flight owner', () => {
       windowId: 'w1',
       logicalOwner: 'owner1',
     })
+
     const key2 = buildReconnectOwnerKey({
       connectionId: 'c1',
       basePath: 'http://localhost:8080',
@@ -89,11 +91,13 @@ describe('gateway-reconnect single-flight owner', () => {
       windowId: 'w1',
       logicalOwner: 'owner1',
     })
+
     expect(key1).toBe(key2)
   })
 
   it('coalesces concurrent reconnect calls into a single in-flight promise', async () => {
     let callCount = 0
+
     const unregister = registerGatewayReconnect(async () => {
       callCount++
       await new Promise(r => setTimeout(r, 20))
@@ -105,6 +109,7 @@ describe('gateway-reconnect single-flight owner', () => {
         reconnectGateway({ connectionId: 'test-conn' }),
         reconnectGateway({ connectionId: 'test-conn' }),
       ]
+
       await Promise.all([p1, p2, p3])
       expect(callCount).toBe(1)
     } finally {

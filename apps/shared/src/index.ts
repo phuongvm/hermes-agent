@@ -110,14 +110,14 @@ export {
 export {
   DEFAULT_BASE_DELAY_MS,
   DEFAULT_CAP_MS,
+  isStableOpen,
   MAX_RECONNECT_ATTEMPTS,
   MAX_RECONNECT_DURATION_MS,
+  RECONNECT_STABLE_OPEN_MS,
   reconnectBackoffDelayMs,
   type ReconnectBackoffOptions,
   ReconnectBackoffTracker,
-  STREAK_RESET_WINDOW_MS,
-  isStableOpen,
-  RECONNECT_STABLE_OPEN_MS
+  STREAK_RESET_WINDOW_MS
 } from './reconnect-backoff'
 export { skillInvocationText } from './skill-scaffold'
 export {

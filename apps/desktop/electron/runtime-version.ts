@@ -247,6 +247,7 @@ export function resolveHermesVersionLadder(ctx: VersionResolutionContext = {}): 
 
   for (const evaluate of evaluators) {
     const version = evaluate()
+
     if (version) {
       return version
     }

@@ -61,6 +61,7 @@ export function reconnectBackoffDelayMs(attempt: number, options: ReconnectBacko
     if (typeof options.retryAfterMs === 'number' && Number.isFinite(options.retryAfterMs) && options.retryAfterMs > 0) {
       return Math.max(ceiling, options.retryAfterMs)
     }
+
     return ceiling
   }
 
@@ -109,6 +110,7 @@ export class ReconnectBackoffTracker {
     }
 
     const elapsed = now - this.firstFailureTime
+
     if (this.attempt >= this.maxAttempts || elapsed >= this.maxDurationMs) {
       return { delayMs: 0, exhausted: true }
     }
@@ -132,8 +134,10 @@ export class ReconnectBackoffTracker {
   checkStreakReset(now = Date.now()): boolean {
     if (this.openTime !== null && this.hasPinged && now - this.openTime >= this.streakResetMs) {
       this.reset()
+
       return true
     }
+
     return false
   }
 
