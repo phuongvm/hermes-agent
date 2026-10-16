@@ -972,11 +972,27 @@ def _kill_known_pids(proc, descendants) -> None:
 
 def _kill_process_windows(proc) -> None:
     """Identity-checked terminate (start time guards against PID reuse), else kill."""
+    descendants = []
+    pid = getattr(proc, "pid", None)
+    if pid:
+        try:
+            import psutil
+            if psutil.pid_exists(pid):
+                descendants = list(psutil.Process(pid).children(recursive=True))
+        except Exception:
+            descendants = []
+
     try:
         from gateway.status import get_process_start_time, terminate_pid
         terminate_pid(proc.pid, force=True, expected_start_time=get_process_start_time(proc.pid))
     except Exception:
         proc.kill()
+
+    for child in descendants:
+        with contextlib.suppress(Exception):
+            if child.is_running():
+                child.kill()
+
     with contextlib.suppress(subprocess.TimeoutExpired, OSError):
         proc.wait(timeout=2.0)
 

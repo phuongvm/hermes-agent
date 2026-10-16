@@ -166,15 +166,26 @@ function hideOwnedBotSessions() {
   // The same member session can appear in several rooms (and legacy rooms can
   // share ids) — hide each (owner, id) pair exactly once.
   const rooms = [...new Map(roomEntries.map(entry => [entry.dedupe, entry])).values()]
+  const blockedRoutes = new Set<string>()
 
   const known = Promise.all(
-    rooms.map(entry =>
-      hidePersistedBotSession(entry.owner, entry.id).catch(error => {
+    rooms.map(async entry => {
+      const route = botConnectionRoute(entry.owner)
+      const routeKey = `${route?.connectionId || ''}::${route?.profile || ''}`
+      if (blockedRoutes.has(routeKey)) {
+        return
+      }
+
+      try {
+        await hidePersistedBotSession(entry.owner, entry.id)
+      } catch (error) {
         if (isMissingPersistedSessionError(error)) {
           pruneMissingRoomSession(entry)
+        } else if (isOfflineMaintenanceError(error)) {
+          blockedRoutes.add(routeKey)
         }
-      })
-    )
+      }
+    })
   )
 
   return Promise.all([known, sweepBotProfileSessions().catch(() => undefined)])
@@ -187,6 +198,15 @@ function isMissingPersistedSessionError(error: unknown) {
   const message = typeof error === 'string' ? error : (error as { message?: unknown })?.message
 
   return typeof message === 'string' && /\b404\b/.test(message) && /session not found/i.test(message)
+}
+
+/** 409 Exclusive maintenance refusal means the gateway owns this profile.
+ *  Further offline maintenance requests for this profile will be refused;
+ *  aborting the sweep stops request storms against the dashboard. */
+function isOfflineMaintenanceError(error: unknown) {
+  const message = typeof error === 'string' ? error : (error as { message?: unknown })?.message
+
+  return typeof message === 'string' && (/\b409\b/.test(message) || /exclusive maintenance refused/i.test(message))
 }
 
 /** Remove only the exact rejected room seat. A replacement written while the
@@ -339,11 +359,20 @@ async function sweepBotProfileSessions(nowSeconds = Date.now() / 1000) {
         })
 
         const rows = Array.isArray(res?.sessions) ? res.sessions : []
-        await Promise.all(
-          rows
-            .filter(row => isBotModeSweepCandidate(row, nowSeconds))
-            .map(row => Promise.resolve(hidePersistedBotSession(bot, row.id, profile)).catch(() => undefined))
-        )
+        for (const row of rows) {
+          if (!isBotModeSweepCandidate(row, nowSeconds)) {
+            continue
+          }
+          try {
+            await hidePersistedBotSession(bot, row.id, profile)
+          } catch (error) {
+            if (isOfflineMaintenanceError(error)) {
+              // Live gateway owns this profile; offline maintenance is refused.
+              // Abort remaining rows for this bot to prevent request storms.
+              break
+            }
+          }
+        }
       } catch {
         /* older gateway / unreachable source — leave this profile alone */
       }

@@ -283,4 +283,15 @@ describe('the title half: each roster bot’s own profile listing', () => {
 
     expect(hiddenCalls().map(([, options]) => options.sessionId)).toEqual(['room-core-a'])
   })
+
+  it('aborts remaining rows for a bot profile when a 409 exclusive maintenance refusal occurs', async () => {
+    hostMock.setPersistedSessionHidden.mockRejectedValueOnce(
+      new Error('409: {"detail":"Exclusive maintenance refused: Gateway runtime already owns profile"}')
+    )
+
+    await runSweep()
+
+    // Alpha had 4 candidates (a-1, a-2, a-3, a-8). With 409 on the first, remaining 3 must be skipped.
+    expect(hiddenCalls().filter(([, options]) => options.profile === 'alpha')).toHaveLength(1)
+  })
 })
