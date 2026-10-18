@@ -268,7 +268,7 @@ def reject_pending_native(subsystem: str, pending_id: str) -> dict:
 
 def consolidate_pending_native(
     subsystem: str,
-    pending_ids: List[str],
+    pending_ids: list[str],
     *,
     memory_store=None,
 ) -> dict:
@@ -367,7 +367,7 @@ def _canonical_skill_identity(target: str, resolved: dict) -> str:
         return str(path)
 
 
-def _find_canonical_skill_matches(name: str) -> List[Path]:
+def _find_canonical_skill_matches(name: str) -> list[Path]:
     """Return every active skill directory whose basename matches ``name``.
 
     Governance preflight uses native ``_find_skill`` resolver to match
@@ -397,7 +397,7 @@ def _find_canonical_skill_matches(name: str) -> List[Path]:
     return matches
 
 
-def _pending_payload_fingerprints(records: List[dict]) -> dict:
+def _pending_payload_fingerprints(records: list[dict]) -> dict:
     """Create stable evidence that read-only preflight did not rewrite payloads."""
     import hashlib
 
@@ -430,7 +430,11 @@ def preflight_pending_skill_review() -> dict:
     for record in records:
         payload = record.get("payload") or {}
         target = payload.get("name")
+        if not target and isinstance(payload.get("operations"), list) and payload["operations"] and isinstance(payload["operations"][0], dict):
+            target = payload["operations"][0].get("name")
         action = payload.get("action")
+        if action == "batch" and isinstance(payload.get("operations"), list) and payload["operations"] and isinstance(payload["operations"][0], dict):
+            action = payload["operations"][0].get("action")
         if target and target not in parents and action != "write_file":
             parents[target] = record["id"]
 
@@ -438,16 +442,44 @@ def preflight_pending_skill_review() -> dict:
     for record in records:
         payload = record.get("payload") or {}
         target = payload.get("name")
+        if not target and isinstance(payload.get("operations"), list) and payload["operations"] and isinstance(payload["operations"][0], dict):
+            target = payload["operations"][0].get("name")
+        action = payload.get("action")
+        if action == "batch" and isinstance(payload.get("operations"), list) and payload["operations"] and isinstance(payload["operations"][0], dict):
+            action = payload["operations"][0].get("action")
         matches = _find_canonical_skill_matches(target) if target else []
         parent_id = parents.get(target)
-        is_dependent = payload.get("action") == "write_file" and parent_id is not None and parent_id != record["id"]
+        is_dependent = action == "write_file" and parent_id is not None and parent_id != record["id"]
 
-        if len(matches) == 1:
+        if action == "create":
+            if len(matches) == 0:
+                result = {
+                    "pending_id": record["id"],
+                    "target": target,
+                    "canonical_target": None,
+                    "governance_verdict": "APPROVE",
+                    "native_disposition": "NOT_ATTEMPTED",
+                    "effective_status": "APPROVE",
+                    "dependency_on": None,
+                }
+            else:
+                result = {
+                    "pending_id": record["id"],
+                    "target": target,
+                    "canonical_target": _canonical_skill_identity(
+                        str(target or ""), {"path": matches[0]}
+                    ),
+                    "governance_verdict": "REVISE",
+                    "native_disposition": "NOT_ATTEMPTED",
+                    "effective_status": "REVISE",
+                    "dependency_on": None,
+                }
+        elif len(matches) == 1:
             result = {
                 "pending_id": record["id"],
                 "target": target,
                 "canonical_target": _canonical_skill_identity(
-                    target, {"path": matches[0]}
+                    str(target or ""), {"path": matches[0]}
                 ),
                 "governance_verdict": "REVISE",
                 "native_disposition": "NOT_ATTEMPTED",
@@ -575,7 +607,7 @@ def format_executive_summary_digest(governance_result: dict) -> str:
     records = governance_result.get("records", [])
     
     lines = [
-        f"📋 **Pending Skills Governance Digest**",
+        "📋 **Pending Skills Governance Digest**",
         f"• Status: {exec_status} (Governance: {gov_status})",
         f"• Total Records Processed: {len(records)}",
     ]

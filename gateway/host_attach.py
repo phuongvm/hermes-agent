@@ -140,6 +140,17 @@ def _identify(home: Path) -> Optional[dict]:
         return None
 
 
+def _extract_profile_names(served: list) -> tuple[str, ...]:
+    names = []
+    for entry in served:
+        if isinstance(entry, dict):
+            home = entry.get("home") or entry.get("profile_id")
+            names.append(profile_name_for_home(str(home)) if home else "default")
+        else:
+            names.append(str(entry))
+    return tuple(names)
+
+
 def _served_from_identity(identity: dict) -> tuple[str, ...]:
     """Served set from a live ``identify``. A STANDALONE gateway publishes no ``served_profiles``;
     it serves its own profile and nothing else, which is not the same as "unknown".
@@ -215,7 +226,7 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
         )
         served = status.get("served_profiles")
         if isinstance(served, list) and served:
-            served_tuple = tuple(str(p) for p in served)
+            served_tuple = _extract_profile_names(served)
         else:
             from hermes_cli.profiles import get_active_profile
             served_tuple = (get_active_profile() or "default",)
@@ -274,7 +285,7 @@ def request_serve_profile(profile: str, *, timeout: float = 8.0,
     served = answer.get("served_profiles")
     rescanned = HostGateway(
         gateway.pid, gateway.home,
-        tuple(str(p) for p in served) if isinstance(served, list) else (),
+        _extract_profile_names(served) if isinstance(served, list) else (),
         standalone=answer.get("multiplex") is False)
     return rescanned if rescanned.standalone or rescanned.serves(profile) else None
 
