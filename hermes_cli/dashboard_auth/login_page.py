@@ -508,7 +508,7 @@ def _apply_proxy_prefix(html_out: str, prefix: str) -> str:
 
 
 def render_native_provider_choice_html(
-        *, providers, authorize_path: str, code_challenge: str,
+        *, providers: Iterable[DashboardAuthProvider], authorize_path: str, code_challenge: str,
         code_challenge_method: str, redirect_uri: str, state: str,
         prefix: str = "") -> str:
     """Provider picker for a native authorize request with more than one interactive provider.
@@ -566,37 +566,4 @@ def _render_password_form(provider, next_path: str, *, prefix: str = "") -> str:
         f'        <div class="form-error" role="alert" hidden></div>\n'
         f'        <button class="provider-btn" type="submit">Sign in</button>\n'
         f'      </form>'
-    )
-
-
-def render_native_provider_choice_html(
-    *,
-    providers: Iterable[DashboardAuthProvider],
-    authorize_path: str,
-    code_challenge: str,
-    code_challenge_method: str,
-    redirect_uri: str,
-    state: str,
-) -> str:
-    """Render a native OAuth provider chooser preserving desktop PKCE state."""
-    buttons = []
-    common_params = {
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-        "redirect_uri": redirect_uri,
-        "state": state,
-    }
-
-    for provider in providers:
-        query = urlencode({**common_params, "provider": provider.name})
-        href = html.escape(f"{authorize_path}?{query}", quote=True)
-        label = html.escape(provider.display_name)
-        buttons.append(f'  <a class="provider-btn" href="{href}">Sign in with {label}</a>')
-
-    if not buttons:
-        return _EMPTY_HTML
-
-    return _LOGIN_HTML_TEMPLATE.format(
-        provider_buttons="\n".join(buttons),
-        password_script="",
     )

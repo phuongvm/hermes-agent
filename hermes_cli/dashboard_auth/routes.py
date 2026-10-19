@@ -278,14 +278,11 @@ def _validate_loopback_redirect_uri(raw: str) -> str:
 
 def _select_native_provider(provider: str):
     """Resolve the provider for a native authorize request. An empty ``provider`` auto-selects
-    the single brokerable (non-password) session provider — so an OIDC+basic deployment does not
-    fail with "Unknown provider"; with none, a lone password provider is still returned so the
-    caller emits a 400 rather than 404."""
+    the ONLY interactive session provider (password providers included — native sign-in brokers
+    them via ``/login``); with several the caller renders a chooser instead of guessing."""
     if provider:
         return get_provider(provider)
-    sess_providers = list_session_providers()
-    native_eligible = [pp for pp in sess_providers if not getattr(pp, "supports_password", False)]
-    candidates = native_eligible or sess_providers
+    candidates = list_session_providers()
     return candidates[0] if len(candidates) == 1 else None
 
 
