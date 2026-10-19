@@ -428,7 +428,14 @@ import {
 import { wireOauthSessionResponse } from './oauth-session-response'
 import { listWindowsProcesses, reapPackageRootedProcesses } from './package-process-reap'
 import { createParentStartMarkerResolver } from './parent-process-identity'
-import { bundledPayload, installIdForRoot, type PayloadInfo, payloadPythonPath } from './payload-backend'
+import {
+  bundledPayload,
+  installIdForRoot,
+  type PayloadInfo,
+  payloadPythonPath,
+  payloadTicketRuntime,
+  requireBundledPayload
+} from './payload-backend'
 import { petOverlayClickThrough, shouldPopInOnOverlayClosed } from './pet-overlay'
 import { placePetOverlay, registerPetOverlayIpc } from './pet-overlay-ipc'
 import {
@@ -551,6 +558,7 @@ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './re
 import { loadInstallStamp as loadInstallStampInternal, resolveHermesVersionLadder } from './runtime-version'
 import { fetchRosterSourceData } from './roster-source-fetch'
 import { rosterSourceStatus } from './roster-source-status'
+import { registerSaveDialogIpc } from './save-text-file'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -3687,21 +3695,6 @@ function createNativePackagedStrategy(
 }
 
 /**
- * The bundled Python payload for a strategy whose update check runs inside
- * it. A stamp that names such a mechanism without a payload is a broken
- * install; say so instead of failing on `payload.storePython`.
- */
-function requireBundledPayload(mechanism: UpdaterStrategy['mechanism']): PayloadInfo {
-  const payload: PayloadInfo | null = bundledPayload(process.resourcesPath)
-
-  if (!payload) {
-    throw new Error(`${mechanism} updates require the bundled application payload, which this install has none of`)
-  }
-
-  return payload
-}
-
-/**
  * The checkout updater strategy (windows-handoff / posix-handoff). The flow
  * lives in updater/checkout.ts; this is the composition root that hands it
  * the app shell's impure edges. The public checkUpdates/applyUpdates
@@ -5038,6 +5031,7 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
       command: payload.shim,
       args: [...backendArgs],
       env: { ...buildDesktopBackendEnv(), HERMES_RUNTIME_DIR: payload.toolsDir },
+      ...payloadTicketRuntime(payload),
       root: payload.repoDir,
       bootstrap: false,
       shell: false,
@@ -5221,6 +5215,8 @@ interface ResolvedHermesBackend {
   shell: boolean
   local?: string
   root?: string
+  ticketCommand?: string
+  ticketEnv?: NodeJS.ProcessEnv
   installStamp?: Readonly<InstallStamp> | null
   activeRoot?: string
   isPackaged?: boolean
@@ -16792,20 +16788,10 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   return true
 })
 
-// Native save-location picker (profile export etc.) — the write itself happens
-// elsewhere (the backend, for profile archives); this only picks the path.
-ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
-  const result = await dialog.showSaveDialog(mainWindow, {
-    title: options?.title || 'Save',
-    defaultPath: options?.defaultPath ? String(options.defaultPath) : undefined,
-    filters: Array.isArray(options?.filters) ? options.filters : undefined
-  })
-
-  if (result.canceled || !result.filePath) {
-    return null
-  }
-
-  return result.filePath
+// Save dialogs: the path picker (profile export) and /save's main-process write (save-text-file.ts).
+registerSaveDialogIpc(ipcMain, {
+  defaultDir: () => app.getPath('documents'),
+  showSaveDialog: options => dialog.showSaveDialog(mainWindow, options)
 })
 
 // Paired reader for the GUI terminal's paste chord: the renderer's
