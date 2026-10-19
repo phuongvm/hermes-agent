@@ -242,10 +242,6 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float,
                          snapshot: Optional[dict[str, Any]],
                          event: str = "shutdown_watchdog_fired") -> None:
     """Best-effort faulthandler + metadata dump before hard-exit."""
-    try:
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
     header = {"event": event, "pid": os.getpid(), "delay_s": delay_s,
               "fired_at": datetime.now(UTC).isoformat(), "snapshot": snapshot or {}}
     with contextlib.suppress(OSError):  # unwritable dir: skip only the file copy, stderr still runs
