@@ -183,6 +183,12 @@ export interface TriggerAcceptInput {
  * pre-highlighted row would swap the prose the user is mid-sentence on for a
  * subcommand they never chose. Enter still accepts once the user has arrowed
  * to a row deliberately, so the highlight never lies about what Enter will do.
+ *
+ * Space is also the delimiter after a command name (`/clean `, an inline
+ * `/skill `, a partial `/com `). At that stage the highlight is only the list's
+ * default first row, so Space types a space unless the user arrowed to a row
+ * deliberately — then it commits that row, the same pick Enter makes. In a
+ * finite options stage (`/personality alic`) Space still picks the match.
  */
 export function acceptsTriggerCompletion({
   activeExplicit,
@@ -199,9 +205,16 @@ export function acceptsTriggerCompletion({
     return !freeTextArgStage || activeExplicit
   }
 
-  // Space is slash-only (an `@` mention takes a literal space) and gated to a
-  // non-empty query so a bare `/ ` still types a space.
-  return key === ' ' && kind === '/' && Boolean(query.trim()) && !freeTextArgStage
+  // Space is slash-only (an `@` mention takes a literal space), gated to a
+  // non-empty query (a bare `/ ` types a space), and never takes over prose.
+  if (key !== ' ' || kind !== '/' || !query.trim() || freeTextArgStage) {
+    return false
+  }
+
+  // At the command-name stage the highlight is only the list's default first
+  // row, so Space is the delimiter before arguments unless the user arrowed to
+  // a row deliberately. In a finite options stage Space still picks the match.
+  return slashArgStage(query) || activeExplicit
 }
 
 export interface QueueEditState {

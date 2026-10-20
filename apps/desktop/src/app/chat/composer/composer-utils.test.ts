@@ -109,6 +109,32 @@ describe('acceptsTriggerCompletion', () => {
   it('keeps Tab as the explicit accept even over free text', () => {
     expect(press('Tab', { freeTextArgStage: true, query: 'goal stat' })).toBe(true)
   })
+
+  // Command-name stage: the highlight is only the list's default first row, so
+  // Space is the delimiter before arguments unless the user arrowed to a row.
+  it('types a literal space after a command name with the default highlight', () => {
+    expect(press(' ', { query: 'clean' })).toBe(false)
+    expect(press(' ', { query: 'com' })).toBe(false)
+  })
+
+  it('accepts on Space at the command-name stage once a row was arrowed to', () => {
+    expect(press(' ', { activeExplicit: true, query: 'com' })).toBe(true)
+  })
+
+  it('keeps Space accepting a finite option with or without an arrowed row', () => {
+    expect(press(' ', { activeExplicit: false, query: 'personality alic' })).toBe(true)
+    expect(press(' ', { activeExplicit: true, query: 'personality alic' })).toBe(true)
+  })
+
+  it('never accepts on Space in a free-text argument, even after arrowing', () => {
+    expect(press(' ', { activeExplicit: false, freeTextArgStage: true, query: 'goal ship the' })).toBe(false)
+    expect(press(' ', { activeExplicit: true, freeTextArgStage: true, query: 'goal ship the' })).toBe(false)
+  })
+
+  it('takes a literal space for an `@` mention and a bare `/ ` even after arrowing', () => {
+    expect(press(' ', { activeExplicit: true, kind: '@', query: 'src/comp' })).toBe(false)
+    expect(press(' ', { activeExplicit: true, query: '' })).toBe(false)
+  })
 })
 
 describe('implicitSlashAcceptIndex', () => {
