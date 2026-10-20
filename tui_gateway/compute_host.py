@@ -66,7 +66,7 @@ class ComputeHost:
 
     def __init__(
         self, *, stdout: Any = None, max_workers: int | None = None,
-        heartbeat_secs: int | float | None = None,
+        heartbeat_secs: float | None = None,
         max_active_turns: int | None = None,
         max_queued_turns: int | None = None,
         queue_timeout_secs: float | None = None) -> None:
