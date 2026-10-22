@@ -179,7 +179,7 @@ dependencies = [
   # libs required for the codecs we use, so it's safe to ship in the base
   # install rather than gating it behind an extra + a mid-session lazy install
   # (which deadlocked the CLI under prompt_toolkit — see #40490).
-  "Pillow==12.3.0; python_version >= '3.14'",
+  "Pillow==13.0.0; python_version >= '3.14'",
   # HEIF/HEIC/AVIF decode for the vision tools. iPhone photos and screenshots
   # are HEIC (frequently mislabeled .jpg by upload pipelines); Pillow has no
   # built-in HEIF codec, so without this the vision resolver rejects them as
@@ -637,6 +637,9 @@ override-dependencies = [
   # never builds a misaki G2P. The never-true marker removes it from the lock.
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
+  # browser-harness 0.1.13 pins pillow==12.3.0 which has 28 known vulnerabilities (GHSA-332p-7hrc-92wf, etc.).
+  # Force override to Pillow 13.0.0.
+  "pillow==13.0.0",
 ]
 # oauthlib arrives only through google-auth-oauthlib -> requests-oauthlib
 # (>=3.0.0). 4.0.0 fixes GHSA-hj66-6f7g-4r5v and GHSA-xpv3-w29h-x7cv; its two

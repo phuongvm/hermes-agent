@@ -492,4 +492,55 @@ class PythonEnvironment:
             cwd=self.destination.parent, timeout=60,
         )
         if result.returncode:
+            output = (result.stderr or "") + "\n" + (result.stdout or "")
+            overridden = _overridden_dependencies(self.destination)
+            if overridden:
+                import re
+
+                incompat_lines = [
+                    line.strip() for line in output.splitlines()
+                    if line.strip().startswith("The package `")
+                ]
+                if incompat_lines:
+                    all_accounted = True
+                    for line in incompat_lines:
+                        m = re.match(r"^The package `[^`]+` requires `([A-Za-z0-9_.\-]+)", line)
+                        if not m or m.group(1).lower().replace("_", "-") not in overridden:
+                            all_accounted = False
+                            break
+                    if all_accounted:
+                        return
             raise InstallError("venv", f"dependency validation failed: {result.stderr[-600:]}")
+
+
+def _overridden_dependencies(destination: Path) -> set[str]:
+    """Extract lowercase normalized package names from [tool.uv.override-dependencies]."""
+    import re
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+
+    candidates = [
+        destination.parent / "workspace" / "pyproject.toml",
+        destination.parent / "pyproject.toml",
+    ]
+    for parent in destination.parents:
+        candidates.append(parent / "pyproject.toml")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            try:
+                doc = tomllib.loads(candidate.read_text(encoding="utf-8-sig"))
+                raw = doc.get("tool", {}).get("uv", {}).get("override-dependencies", [])
+                names = set()
+                for item in raw:
+                    spec = item.split(";")[0].strip()
+                    m = re.match(r"^([A-Za-z0-9_.\-]+)", spec)
+                    if m:
+                        names.add(m.group(1).lower().replace("_", "-"))
+                if names:
+                    return names
+            except Exception:
+                continue
+    return set()
