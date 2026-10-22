@@ -88,6 +88,8 @@ _EXCLUDED_DIRS = {
     ".venv", "venv", "site-packages",
     # Tool / build caches — all regeneratable.
     ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    # Ephemeral scheduler admission tickets.
+    "admissions",
 }
 
 # Hermes-managed runtime downloads are regenerable. Match only profile roots:
@@ -125,7 +127,10 @@ _SQLITE_SIDECAR_SUFFIXES = (".db-wal", ".db-shm", ".db-journal")
 _EXCLUDED_SUFFIXES = (".pyc", ".pyo", *_SQLITE_SIDECAR_SUFFIXES)
 
 # File names to skip (runtime state that's meaningless on another machine)
-_EXCLUDED_NAMES = {".backup.lock", "gateway.pid", "cron.pid"}
+_EXCLUDED_NAMES = {
+    ".backup.lock", "gateway.pid", "cron.pid",
+    "interrupted_turns.json", "interrupted_turns.json.lock",
+}
 
 # The desktop updater's pre-flight drops ``state.db.pre-update-emergency-<ts>.bak`` at the root
 # — a backup artifact like ``backups/``. Prefix-matched because the name carries a timestamp;
@@ -525,6 +530,10 @@ def _write_zip_entries(
                 _write_zip_file(zf, abs_path, str(rel_path))
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
+        except FileNotFoundError:
+            # File was removed concurrently during the backup walk (e.g. transient locks/tickets).
+            logger.info("backup file vanished before archive: %s", rel_path)
+            continue
         except (PermissionError, OSError, ValueError) as exc:
             on_error(rel_path, exc)
             continue

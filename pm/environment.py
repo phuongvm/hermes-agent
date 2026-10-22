@@ -487,10 +487,12 @@ class PythonEnvironment:
             raise InstallError("uv", f"cache pruning failed: {result.stderr[-600:]}")
 
     def check(self) -> None:
-        result = self._run(
-            ["pip", "check", "--no-config", "--python", str(self.executable)],
-            cwd=self.destination.parent, timeout=60,
-        )
+        env = _base_environment(self.env)
+        env.update(UV_PYTHON=native(self.python), UV_PROJECT_ENVIRONMENT=native(self.destination),
+                   UV_CACHE_DIR=native(self.cache), UV_PYTHON_DOWNLOADS="never")
+        command = [native(self.uv), "pip", "check", "--no-config", "--python", str(self.executable)]
+        result = subprocess.run(command, cwd=native(self.destination.parent), env=env, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=60, check=False)
         if result.returncode:
             output = (result.stderr or "") + "\n" + (result.stdout or "")
             overridden = _overridden_dependencies(self.destination)
@@ -524,6 +526,7 @@ def _overridden_dependencies(destination: Path) -> set[str]:
     candidates = [
         destination.parent / "workspace" / "pyproject.toml",
         destination.parent / "pyproject.toml",
+        Path(__file__).resolve().parent.parent / "pyproject.toml",
     ]
     for parent in destination.parents:
         candidates.append(parent / "pyproject.toml")

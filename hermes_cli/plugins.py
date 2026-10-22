@@ -745,10 +745,9 @@ class PluginContext:
             return
         launch_scope = hermes_home_key(get_process_hermes_home())
         if self._manager.scope_key != launch_scope:
-            logger.warning(
-                "Plugin '%s' tried to register dashboard-auth provider %r "
-                "from profile scope %s; ignoring it because dashboard auth "
-                "is owned by launch scope %s.",
+            logger.debug(
+                "Plugin '%s' dashboard-auth provider %r skipped from profile scope %s: "
+                "dashboard auth is owned by launch scope %s.",
                 self.manifest.name,
                 provider.name,
                 self._manager.scope_key,
@@ -1452,6 +1451,14 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Route one winning manifest per :func:`gate_manifest`: load now, defer, or record as
         skipped (introspection-only placeholder). Returns True only for plugins that go through the
         dependency-ordered load pass."""
+        launch_scope = hermes_home_key(get_process_hermes_home())
+        if self.scope_key != launch_scope:
+            key = manifest_key(manifest)
+            if key.startswith("dashboard_auth/") or (manifest.kind == "backend" and "dashboard_auth" in (manifest.path or "")):
+                self._plugins[key] = LoadedPlugin(
+                    manifest=manifest, enabled=False, error="dashboard auth is owned by launch scope"
+                )
+                return False
         verdict = gate_manifest(manifest, disabled, enabled)
         if verdict.action == "load":
             return True
