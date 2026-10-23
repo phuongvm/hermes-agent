@@ -434,14 +434,19 @@ acp = ["agent-client-protocol==0.9.0"]
 # pm (stt.mistral / tts.mistral) at first use — deliberately
 # NOT re-added to [all] so a future quarantined release can't break fresh
 # installs (see [all] policy comment below).
-mistral = ["mistralai==2.4.8"]
+# 2.9.4 is the newest 2.x: 2.4.8-2.9.0 cap opentelemetry-semantic-conventions
+# <0.61, which blocks the opentelemetry-api 1.45.1 security floor below; the
+# client.audio.speech/transcriptions API Hermes calls is unchanged across 2.x.
+mistral = ["mistralai==2.9.4"]
 # OTLP gateway monitoring export (optional). Provides the OpenTelemetry SDK +
 # OTLP/HTTP exporter for monitoring.gateway_health_export. Lazy-installed via
 # PM on first use; never a core dependency and deliberately
 # NOT in [all].
 otlp = [
-  "opentelemetry-sdk==1.39.1",
-  "opentelemetry-exporter-otlp-proto-http==1.39.1",
+  # 1.45.1 fixes GHSA-xcq7-p3pf-p88h (unbounded tracestate parsing in
+  # opentelemetry-api, which opentelemetry-sdk pins exactly).
+  "opentelemetry-sdk==1.45.1",
+  "opentelemetry-exporter-otlp-proto-http==1.45.1",
 ]
 bedrock = ["boto3==1.42.89"]
 vertex = ["google-auth==2.55.1"]
@@ -657,7 +662,20 @@ override-dependencies = [
 # (>=3.0.0). 4.0.0 fixes GHSA-hj66-6f7g-4r5v and GHSA-xpv3-w29h-x7cv; its two
 # breaking changes are server-side (revocation JSONP, grant validation order),
 # and Hermes only runs client flows.
-constraint-dependencies = ["oauthlib>=4.0.0"]
+#
+# multidict and opentelemetry-api arrive transitively (aiohttp/yarl/grpclib and
+# langfuse/mcp/daytona/google-cloud-pubsub). PM seeds plugin-workspace locks from
+# the previously resolved lock, which keeps an old compatible version, so the
+# advisory floors must be explicit constraints, not just a bump in uv.lock:
+# multidict 6.9.1 fixes GHSA-54p9-h82j-f925 / PYSEC-2026-4244;
+# opentelemetry-api 1.45.1 fixes GHSA-xcq7-p3pf-p88h.
+# Capped at the current major: PM's generated workspaces drop the release-age
+# cutoff, so an open floor would jump straight to the newest major release.
+constraint-dependencies = [
+  "oauthlib>=4.0.0",
+  "multidict>=6.9.1,<7",
+  "opentelemetry-api>=1.45.1,<2",
+]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
 # check), never on users' machines: PM installs from this vetted lock and drops the
