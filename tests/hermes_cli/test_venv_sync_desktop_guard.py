@@ -243,7 +243,8 @@ def test_probe_without_a_release_tree_is_empty(tmp_path, monkeypatch):
     assert venv_sync._live_desktop_processes_in_release(tmp_path / "apps/desktop") == []
 
 
-def test_probe_never_raises_when_the_process_table_is_unreadable(tmp_path, monkeypatch):
+def test_probe_reports_unknown_when_the_process_table_is_unreadable(tmp_path, monkeypatch):
+    """An unreadable table is "unknown" (None), never "nothing running" ([])."""
     import psutil
 
     root, _ = _desktop_checkout(tmp_path)
@@ -252,7 +253,80 @@ def test_probe_never_raises_when_the_process_table_is_unreadable(tmp_path, monke
         raise psutil.AccessDenied()
 
     monkeypatch.setattr(psutil, "process_iter", denied)
-    assert venv_sync._live_desktop_processes_in_release(root / "apps/desktop") == []
+    assert venv_sync._live_desktop_processes_in_release(root / "apps/desktop") is None
+
+
+def test_probe_reports_unknown_when_the_walk_breaks_part_way(tmp_path, monkeypatch):
+    """A walk cut short may have missed the Desktop: what it did find is not the answer."""
+    import psutil
+
+    root, _ = _desktop_checkout(tmp_path)
+    outside = tmp_path / "elsewhere/other.exe"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"MZ")
+
+    def broken(attrs=None):
+        yield _FakeProc(4_000_002, str(outside))
+        raise psutil.AccessDenied()
+
+    monkeypatch.setattr(psutil, "process_iter", broken)
+    assert venv_sync._live_desktop_processes_in_release(root / "apps/desktop") is None
+
+
+def test_probe_reports_unknown_without_psutil(tmp_path, monkeypatch):
+    import sys
+
+    root, _ = _desktop_checkout(tmp_path)
+    monkeypatch.setitem(sys.modules, "psutil", None)  # `import psutil` raises ImportError
+    assert venv_sync._live_desktop_processes_in_release(root / "apps/desktop") is None
+
+
+# ------------------------------------- the decision fails closed when the probe cannot see
+
+
+def test_decision_omits_desktop_when_the_process_table_is_unreadable(tmp_path, monkeypatch, capsys):
+    """Reviewer repro: AccessDenied on the walk must not read as "no Desktop running"."""
+    import psutil
+
+    root, _ = _desktop_checkout(tmp_path)
+
+    def denied(attrs=None):
+        raise psutil.AccessDenied()
+
+    monkeypatch.setattr(psutil, "process_iter", denied)
+    assert venv_sync._desktop_tail_requested(root / "apps/desktop", exe_locks_release=True) is False
+    err = capsys.readouterr().err
+    assert "Skipped rebuilding Hermes Desktop" in err
+    assert "could not check" in err
+    assert "hermes desktop" in err
+
+
+def test_decision_omits_desktop_without_psutil(tmp_path, monkeypatch):
+    import sys
+
+    root, _ = _desktop_checkout(tmp_path)
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert venv_sync._desktop_tail_requested(root / "apps/desktop", exe_locks_release=True) is False
+
+
+def test_decision_still_passes_desktop_for_a_confirmed_empty_table(tmp_path, monkeypatch, capsys):
+    import psutil
+
+    root, _ = _desktop_checkout(tmp_path)
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: iter([]))
+    assert venv_sync._desktop_tail_requested(root / "apps/desktop", exe_locks_release=True) is True
+    assert "Skipped rebuilding Hermes Desktop" not in capsys.readouterr().err
+
+
+@pytest.mark.platforms("windows")
+def test_tail_omits_desktop_when_the_probe_cannot_see_on_windows(tail, monkeypatch, capsys):
+    monkeypatch.setattr(venv_sync, "_live_desktop_processes_in_release", lambda desktop_app: None)
+
+    argv = tail()
+
+    assert "--desktop" not in argv, "inspection uncertainty must not re-enter the killer path"
+    assert "--finish-update" in argv
+    assert "could not check" in capsys.readouterr().err
 
 
 def test_probe_sees_every_process_the_build_would_stop(tmp_path, monkeypatch):

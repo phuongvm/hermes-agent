@@ -506,17 +506,24 @@ def _desktop_exe_locks_release(platform: str | None = None) -> bool:
     return platform == "win32"
 
 
-def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
+def _live_desktop_processes_in_release(desktop_app: Path) -> list[int] | None:
     """PIDs (sorted) of processes whose executable lives inside ``<desktop_app>/release``.
 
     Read-only: it never signals anything. It matches exactly what
     ``main_desktop._stop_desktop_processes_locking_build`` would stop (an exe
-    inside the release tree), minus this process. It does not raise for the
-    failures a process-table walk can hit: no psutil (``ImportError``), a
-    denied or vanished process (``psutil.Error``), an unreadable path
-    (``OSError``), a symlink loop (``RuntimeError`` from ``Path.resolve`` before
-    Python 3.13) or a malformed exe path (``ValueError``). The process is
-    skipped, or the walk stops early, and is logged at debug level.
+    inside the release tree), minus this process.
+
+    Three answers, because the caller must fail closed: a list (possibly
+    empty) means the whole process table was read; ``None`` means it could
+    not be -- no psutil (``ImportError``), an unreadable release path
+    (``OSError``, or ``RuntimeError`` for a symlink loop before Python 3.13)
+    or a walk that broke part way (``psutil.Error``) -- so a Desktop may be
+    running unseen. A single process that is denied, vanishes or has a
+    malformed exe path is skipped (``psutil.Error``, ``OSError``,
+    ``RuntimeError``, ``ValueError``): the user's own Desktop is readable by
+    the user, and treating every unreadable system process as a possible
+    Desktop would skip every rebuild. Nothing raises; each skip is logged at
+    debug level.
     """
     import logging
 
@@ -529,7 +536,7 @@ def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
         import psutil
     except (ImportError, OSError, RuntimeError) as exc:
         log.debug("desktop guard: cannot inspect %s: %s", release_dir, exc)
-        return []
+        return None
     path_errors = (psutil.Error, OSError, RuntimeError, ValueError)
     me = os.getpid()
     found: set[int] = set()
@@ -545,7 +552,8 @@ def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
             except path_errors as exc:
                 log.debug("desktop guard: skipped process %s: %s", getattr(proc, "pid", "?"), exc)
     except psutil.Error as exc:
-        log.debug("desktop guard: process table unreadable, reporting %d found: %s", len(found), exc)
+        log.debug("desktop guard: process table unreadable after %d found: %s", len(found), exc)
+        return None
     return sorted(found)
 
 
@@ -556,10 +564,12 @@ def _desktop_tail_requested(desktop_app: Path, *, exe_locks_release: bool | None
     ``release``), and never on Windows while a Desktop runs from ``release``:
     packaging there must free the exe lock, so ``build_prepared_desktop`` stops
     every release Desktop that is not our ancestor -- the user's live session,
-    killed by a CLI command they typed elsewhere. The skipped app keeps its
-    stale content stamp, so a later ``hermes desktop`` (or Update now in the
-    app) rebuilds it once it is closed. ``exe_locks_release`` defaults to this
-    host (``_desktop_exe_locks_release()``).
+    killed by a CLI command they typed elsewhere. When the process table
+    cannot be read the answer is the same: an unseen Desktop is still a live
+    session, so uncertainty skips the rebuild rather than risking it. The
+    skipped app keeps its stale content stamp, so a later ``hermes desktop``
+    (or Update now in the app) rebuilds it once it is closed.
+    ``exe_locks_release`` defaults to this host (``_desktop_exe_locks_release()``).
     """
     import sys
 
@@ -570,10 +580,14 @@ def _desktop_tail_requested(desktop_app: Path, *, exe_locks_release: bool | None
     if not installed or not exe_locks_release:
         return installed
     live = _live_desktop_processes_in_release(desktop_app)
-    if not live:
+    if live == []:
         return True
-    print(f"hermes: Skipped rebuilding Hermes Desktop: it is running (pid {', '.join(map(str, live))}),",
-          file=sys.stderr, flush=True)
+    if live is None:
+        print("hermes: Skipped rebuilding Hermes Desktop: could not check whether it is running,",
+              file=sys.stderr, flush=True)
+    else:
+        print(f"hermes: Skipped rebuilding Hermes Desktop: it is running (pid {', '.join(map(str, live))}),",
+              file=sys.stderr, flush=True)
     print("  and rebuilding would stop it. Quit Hermes Desktop and run `hermes desktop` to rebuild it.",
           file=sys.stderr, flush=True)
     return False
