@@ -511,23 +511,30 @@ def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
 
     Read-only: it never signals anything. It matches exactly what
     ``main_desktop._stop_desktop_processes_locking_build`` would stop (an exe
-    inside the release tree), minus this process. Never raises; an unreadable
-    process table reports nothing.
+    inside the release tree), minus this process. It does not raise for the
+    failures a process-table walk can hit: no psutil (``ImportError``), a
+    denied or vanished process (``psutil.Error``), an unreadable path
+    (``OSError``), a symlink loop (``RuntimeError`` from ``Path.resolve`` before
+    Python 3.13) or a malformed exe path (``ValueError``). The process is
+    skipped, or the walk stops early, and is logged at debug level.
     """
+    import logging
+
+    log = logging.getLogger(__name__)
     release_dir = desktop_app / "release"
     try:
         if not release_dir.is_dir():
             return []
         release_dir = release_dir.resolve()
         import psutil
-
-        procs = psutil.process_iter(["pid", "exe"])
-    except Exception:
+    except (ImportError, OSError, RuntimeError) as exc:
+        log.debug("desktop guard: cannot inspect %s: %s", release_dir, exc)
         return []
+    path_errors = (psutil.Error, OSError, RuntimeError, ValueError)
     me = os.getpid()
     found: set[int] = set()
     try:
-        for proc in procs:
+        for proc in psutil.process_iter(["pid", "exe"]):
             try:
                 info = proc.info
                 pid, exe = info.get("pid"), info.get("exe")
@@ -535,10 +542,10 @@ def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
                     continue
                 if release_dir in Path(exe).resolve().parents:
                     found.add(int(pid))
-            except Exception:
-                continue
-    except Exception:
-        pass
+            except path_errors as exc:
+                log.debug("desktop guard: skipped process %s: %s", getattr(proc, "pid", "?"), exc)
+    except psutil.Error as exc:
+        log.debug("desktop guard: process table unreadable, reporting %d found: %s", len(found), exc)
     return sorted(found)
 
 
