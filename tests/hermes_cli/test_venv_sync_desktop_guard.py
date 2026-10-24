@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -90,10 +89,14 @@ def tail(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------- _finish_source_update
+#
+# The exe-lock guard is Windows behaviour, so its tail arms run on Windows and the
+# POSIX arm runs on POSIX (tests/AGENTS.md "Don't fake the host OS"). Only the
+# process table is substituted; the host platform is always the real one.
 
 
+@pytest.mark.platforms("windows")
 def test_tail_omits_desktop_while_a_release_desktop_runs_on_windows(tail, monkeypatch, capsys):
-    monkeypatch.setattr(venv_sync, "_desktop_exe_locks_release", lambda: True)
     probed: list[Path] = []
 
     def probe(desktop_app):
@@ -113,8 +116,8 @@ def test_tail_omits_desktop_while_a_release_desktop_runs_on_windows(tail, monkey
     assert "hermes desktop" in err, "the notice must tell the user how to rebuild it later"
 
 
-def test_tail_passes_desktop_when_no_release_desktop_runs(tail, monkeypatch, capsys):
-    monkeypatch.setattr(venv_sync, "_desktop_exe_locks_release", lambda: True)
+@pytest.mark.platforms("windows")
+def test_tail_passes_desktop_when_no_release_desktop_runs_on_windows(tail, monkeypatch, capsys):
     monkeypatch.setattr(venv_sync, "_live_desktop_processes_in_release", lambda desktop_app: [])
 
     argv = tail()
@@ -123,31 +126,9 @@ def test_tail_passes_desktop_when_no_release_desktop_runs(tail, monkeypatch, cap
     assert "Skipped rebuilding Hermes Desktop" not in capsys.readouterr().err
 
 
-def test_tail_passes_desktop_for_a_source_build_with_no_release_desktop(tail, monkeypatch):
-    shutil.rmtree(tail.root / "apps/desktop/release")
-    dist = tail.root / "apps/desktop/dist/index.html"
-    dist.parent.mkdir(parents=True)
-    dist.write_text("<html></html>", encoding="utf-8")
-    monkeypatch.setattr(venv_sync, "_desktop_exe_locks_release", lambda: True)
-
-    assert "--desktop" in tail()
-
-
-def test_tail_without_an_installed_desktop_never_probes(tail, monkeypatch):
-    shutil.rmtree(tail.root / "apps/desktop")
-    monkeypatch.setattr(venv_sync, "_desktop_exe_locks_release", lambda: True)
-
-    def probe(desktop_app):
-        raise AssertionError("no Desktop is installed: nothing to probe")
-
-    monkeypatch.setattr(venv_sync, "_live_desktop_processes_in_release", probe)
-
-    assert "--desktop" not in tail()
-
-
-def test_guard_is_windows_only(tail, monkeypatch):
+@pytest.mark.platforms("linux", "macos")
+def test_tail_never_probes_on_posix(tail, monkeypatch):
     """POSIX can rename a running app's files away; the pack never needs the exe lock freed."""
-    monkeypatch.setattr(venv_sync, "_desktop_exe_locks_release", lambda: False)
 
     def probe(desktop_app):
         raise AssertionError("the Windows exe-lock guard must not run on POSIX")
@@ -157,26 +138,72 @@ def test_guard_is_windows_only(tail, monkeypatch):
     assert "--desktop" in tail()
 
 
-def test_exe_lock_predicate_follows_the_platform(monkeypatch):
-    monkeypatch.setattr(sys, "platform", "win32")
+def test_tail_passes_desktop_for_a_source_build_with_no_release_desktop(tail):
+    shutil.rmtree(tail.root / "apps/desktop/release")
+    dist = tail.root / "apps/desktop/dist/index.html"
+    dist.parent.mkdir(parents=True)
+    dist.write_text("<html></html>", encoding="utf-8")
+
+    assert "--desktop" in tail()
+
+
+def test_tail_without_an_installed_desktop_never_probes(tail, monkeypatch):
+    shutil.rmtree(tail.root / "apps/desktop")
+
+    def probe(desktop_app):
+        raise AssertionError("no Desktop is installed: nothing to probe")
+
+    monkeypatch.setattr(venv_sync, "_live_desktop_processes_in_release", probe)
+
+    assert "--desktop" not in tail()
+
+
+# ------------------------------------------------- the decision, platform as data
+
+
+def test_exe_lock_predicate_takes_the_platform_as_data():
+    assert venv_sync._desktop_exe_locks_release("win32") is True
+    assert venv_sync._desktop_exe_locks_release("linux") is False
+    assert venv_sync._desktop_exe_locks_release("darwin") is False
+
+
+@pytest.mark.platforms("windows")
+def test_exe_lock_predicate_defaults_to_this_host_on_windows():
     assert venv_sync._desktop_exe_locks_release() is True
-    monkeypatch.setattr(sys, "platform", "linux")
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_exe_lock_predicate_defaults_to_this_host_on_posix():
     assert venv_sync._desktop_exe_locks_release() is False
 
 
-def test_desktop_tail_requested_end_to_end_with_the_real_probe(tmp_path, monkeypatch):
+def test_desktop_tail_requested_end_to_end_with_the_real_probe(tmp_path, monkeypatch, capsys):
     """The decision helper with the real probe over a fake process table."""
     import psutil
 
     root, exe = _desktop_checkout(tmp_path)
-    monkeypatch.setattr(venv_sync, "_desktop_exe_locks_release", lambda: True)
     live = _FakeProc(4_000_001, str(exe))
     monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: iter([live]))
-    assert venv_sync._desktop_tail_requested(root / "apps/desktop") is False
+    assert venv_sync._desktop_tail_requested(root / "apps/desktop", exe_locks_release=True) is False
     assert live.signalled == [], "the guard must never signal the Desktop it protects"
+    assert "4000001" in capsys.readouterr().err
 
     monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: iter([]))
-    assert venv_sync._desktop_tail_requested(root / "apps/desktop") is True
+    assert venv_sync._desktop_tail_requested(root / "apps/desktop", exe_locks_release=True) is True
+
+
+def test_desktop_tail_requested_without_the_exe_lock_never_probes(tmp_path, monkeypatch):
+    root, _ = _desktop_checkout(tmp_path)
+
+    def probe(desktop_app):
+        raise AssertionError("no exe lock: nothing to protect, nothing to probe")
+
+    monkeypatch.setattr(venv_sync, "_live_desktop_processes_in_release", probe)
+    assert venv_sync._desktop_tail_requested(root / "apps/desktop", exe_locks_release=False) is True
+
+
+def test_desktop_tail_requested_without_an_installed_desktop(tmp_path):
+    assert venv_sync._desktop_tail_requested(tmp_path / "apps/desktop", exe_locks_release=True) is False
 
 
 # ---------------------------------------------------------- the read-only probe

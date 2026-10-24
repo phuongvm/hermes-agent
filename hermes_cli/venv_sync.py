@@ -494,11 +494,16 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     return python if not current or not same else None
 
 
-def _desktop_exe_locks_release() -> bool:
-    """True where a running packaged Desktop locks its ``release`` files (Windows)."""
-    import sys
+def _desktop_exe_locks_release(platform: str | None = None) -> bool:
+    """True where a running packaged Desktop locks its ``release`` files (Windows).
 
-    return sys.platform == "win32"
+    ``platform`` is a ``sys.platform`` value; ``None`` means this host.
+    """
+    if platform is None:
+        import sys
+
+        platform = sys.platform
+    return platform == "win32"
 
 
 def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
@@ -537,7 +542,7 @@ def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
     return sorted(found)
 
 
-def _desktop_tail_requested(desktop_app: Path) -> bool:
+def _desktop_tail_requested(desktop_app: Path, *, exe_locks_release: bool | None = None) -> bool:
     """Whether the launch-time tail may rebuild the desktop app (``--desktop``).
 
     Only when a desktop app is installed (a source ``dist`` or a packaged
@@ -546,13 +551,16 @@ def _desktop_tail_requested(desktop_app: Path) -> bool:
     every release Desktop that is not our ancestor -- the user's live session,
     killed by a CLI command they typed elsewhere. The skipped app keeps its
     stale content stamp, so a later ``hermes desktop`` (or Update now in the
-    app) rebuilds it once it is closed.
+    app) rebuilds it once it is closed. ``exe_locks_release`` defaults to this
+    host (``_desktop_exe_locks_release()``).
     """
     import sys
 
     installed = ((desktop_app / "dist/index.html").is_file()
                  or any((desktop_app / "release").glob("*")))
-    if not installed or not _desktop_exe_locks_release():
+    if exe_locks_release is None:
+        exe_locks_release = _desktop_exe_locks_release()
+    if not installed or not exe_locks_release:
         return installed
     live = _live_desktop_processes_in_release(desktop_app)
     if not live:
