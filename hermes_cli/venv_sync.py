@@ -494,6 +494,76 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     return python if not current or not same else None
 
 
+def _desktop_exe_locks_release() -> bool:
+    """True where a running packaged Desktop locks its ``release`` files (Windows)."""
+    import sys
+
+    return sys.platform == "win32"
+
+
+def _live_desktop_processes_in_release(desktop_app: Path) -> list[int]:
+    """PIDs (sorted) of processes whose executable lives inside ``<desktop_app>/release``.
+
+    Read-only: it never signals anything. It matches exactly what
+    ``main_desktop._stop_desktop_processes_locking_build`` would stop (an exe
+    inside the release tree), minus this process. Never raises; an unreadable
+    process table reports nothing.
+    """
+    release_dir = desktop_app / "release"
+    try:
+        if not release_dir.is_dir():
+            return []
+        release_dir = release_dir.resolve()
+        import psutil
+
+        procs = psutil.process_iter(["pid", "exe"])
+    except Exception:
+        return []
+    me = os.getpid()
+    found: set[int] = set()
+    try:
+        for proc in procs:
+            try:
+                info = proc.info
+                pid, exe = info.get("pid"), info.get("exe")
+                if not exe or pid is None or pid == me:
+                    continue
+                if release_dir in Path(exe).resolve().parents:
+                    found.add(int(pid))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return sorted(found)
+
+
+def _desktop_tail_requested(desktop_app: Path) -> bool:
+    """Whether the launch-time tail may rebuild the desktop app (``--desktop``).
+
+    Only when a desktop app is installed (a source ``dist`` or a packaged
+    ``release``), and never on Windows while a Desktop runs from ``release``:
+    packaging there must free the exe lock, so ``build_prepared_desktop`` stops
+    every release Desktop that is not our ancestor -- the user's live session,
+    killed by a CLI command they typed elsewhere. The skipped app keeps its
+    stale content stamp, so a later ``hermes desktop`` (or Update now in the
+    app) rebuilds it once it is closed.
+    """
+    import sys
+
+    installed = ((desktop_app / "dist/index.html").is_file()
+                 or any((desktop_app / "release").glob("*")))
+    if not installed or not _desktop_exe_locks_release():
+        return installed
+    live = _live_desktop_processes_in_release(desktop_app)
+    if not live:
+        return True
+    print(f"hermes: Skipped rebuilding Hermes Desktop: it is running (pid {', '.join(map(str, live))}),",
+          file=sys.stderr, flush=True)
+    print("  and rebuilding would stop it. Quit Hermes Desktop and run `hermes desktop` to rebuild it.",
+          file=sys.stderr, flush=True)
+    return False
+
+
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     """Sync dependencies when they are stale, then run the tail the marker still owes."""
     import sys
@@ -528,9 +598,7 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     # Those builds need PM's selected interpreter with its dependencies
     # activated, so hand that file THIS interpreter and let it re-exec
     # itself, exactly as the installers do.
-    desktop_app = root / "apps/desktop"
-    desktop = ((desktop_app / "dist/index.html").is_file()
-               or any((desktop_app / "release").glob("*")))
+    desktop = _desktop_tail_requested(root / "apps/desktop")
     # The tail's progress lines go to stderr: this is an automatic repair in
     # front of whatever command the user ran, and that command may be
     # emitting machine-readable stdout (a JSON probe, a piped query).
