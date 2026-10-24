@@ -124,3 +124,64 @@ def test_oauth_routes_load_the_provider_from_the_requested_profile(tmp_path, mon
         start = client.post("/api/memory/providers/honcho/oauth/start", params={"profile": profile})
         assert start.status_code == 200, start.text
         assert start.json()["profile"] == profile
+
+
+@pytest.fixture
+def _restore_multiplex_state():
+    """Multi-profile hosting is a one-way process latch; restore it for sibling suites."""
+    from agent import secret_scope
+    from tui_gateway import launch_profile_policy
+
+    was_active = secret_scope.is_multiplex_active()
+    snapshot = launch_profile_policy._snapshot
+    try:
+        yield
+    finally:
+        secret_scope.set_multiplex_active(was_active)
+        launch_profile_policy._snapshot = snapshot
+
+
+def test_oauth_status_binds_the_profile_secret_scope_under_multiplex(
+    tmp_path, monkeypatch, _restore_multiplex_state
+):
+    """Under multiplex an unscoped ``get_secret`` raises UnscopedSecretError; the OAuth routes must
+    bind the requested (or current/default) profile's secret scope so the flow reads that profile's
+    own HERMES_HONCHO_HOST instead of answering HTTP 500."""
+    import plugins.memory as memory_pkg
+    from agent import secret_scope
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+    from starlette.testclient import TestClient
+
+    default_home = tmp_path / ".hermes"
+    work_home = default_home / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    (work_home / "profile.yaml").write_text("name: work\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.delenv("HERMES_HONCHO_HOST", raising=False)
+    monkeypatch.setattr(memory_pkg, "_MEMORY_PLUGINS_DIR", tmp_path / "no-bundled")
+
+    flow_src = (
+        "from agent.secret_scope import get_secret\n"
+        "def get_flow_status():\n"
+        "    return {'state': 'idle', 'host': get_secret('HERMES_HONCHO_HOST', '')}\n"
+        "def start_loopback_flow_background():\n"
+        "    return {'state': 'pending', 'host': get_secret('HERMES_HONCHO_HOST', '')}\n"
+    )
+    for home, host in ((default_home, "default-host"), (work_home, "work-host")):
+        (home / ".env").write_text(f"HERMES_HONCHO_HOST={host}\n", encoding="utf-8")
+        plugin_dir = home / "plugins" / "honcho"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text('"""register_memory_provider"""\n', encoding="utf-8")
+        (plugin_dir / "oauth_flow.py").write_text(flow_src, encoding="utf-8")
+
+    secret_scope.set_multiplex_active(True)
+    client = TestClient(app, headers={_SESSION_HEADER_NAME: _SESSION_TOKEN})
+    for params, expected in (({}, "default-host"), ({"profile": "current"}, "default-host"),
+                             ({"profile": "default"}, "default-host"), ({"profile": "work"}, "work-host")):
+        status = client.get("/api/memory/providers/honcho/oauth/status", params=params)
+        assert status.status_code == 200, status.text
+        assert status.json()["host"] == expected, params
+        start = client.post("/api/memory/providers/honcho/oauth/start", params=params)
+        assert start.status_code == 200, start.text
+        assert start.json()["host"] == expected, params

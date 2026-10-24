@@ -24,28 +24,14 @@ def _resolve_flow(provider: str):
 
 @contextmanager
 def _scope_to_profile(profile: Optional[str]):
-    """Scope config resolution to ``profile`` so the flow's eager path resolve targets that profile's
-    honcho.json. None/""/"current" leaves it untouched."""
-    requested = (profile or "").strip()
-    if not requested or requested.lower() == "current":
+    """Scope config AND secret resolution to ``profile`` so the flow's eager path resolve targets that
+    profile's honcho.json and its ``get_secret`` reads (``HERMES_HONCHO_HOST``) resolve from that
+    profile. None/""/"current" bind the dashboard's own (effective) profile's secret scope: under
+    multiplex an unscoped read raises ``UnscopedSecretError`` and the route answered HTTP 500."""
+    from hermes_cli.web_server_profiles import _config_profile_scope
+
+    with _config_profile_scope(profile):
         yield
-        return
-
-    from hermes_cli import profiles as profiles_mod
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-    try:
-        profiles_mod.validate_profile_name(requested)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not profiles_mod.profile_exists(requested):
-        raise HTTPException(status_code=404, detail=f"Profile '{requested}' does not exist.")
-
-    token = set_hermes_home_override(str(profiles_mod.get_profile_dir(requested)))
-    try:
-        yield
-    finally:
-        reset_hermes_home_override(token)
 
 
 @router.post("/{provider}/oauth/start")

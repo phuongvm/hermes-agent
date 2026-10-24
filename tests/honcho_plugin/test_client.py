@@ -289,6 +289,23 @@ class TestResolveActiveHost:
         with patch.dict(os.environ, {"HERMES_HONCHO_HOST": "hermes.coder"}):
             assert resolve_active_host() == "hermes.coder"
 
+    def test_unscoped_multiplex_read_falls_back_to_profile_host(self, monkeypatch):
+        """Under multiplex with no secret scope bound, the HERMES_HONCHO_HOST read raises
+        UnscopedSecretError; resolution must fall back to the active profile's host key and
+        never borrow the process environ (another profile's value)."""
+        from agent import secret_scope
+
+        monkeypatch.setenv("HERMES_HONCHO_HOST", "leaked-from-environ")
+        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "coder")
+        was_active = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        try:
+            with pytest.raises(secret_scope.UnscopedSecretError):
+                secret_scope.get_secret("HERMES_HONCHO_HOST", "")
+            assert resolve_active_host() == "hermes_coder"
+        finally:
+            secret_scope.set_multiplex_active(was_active)
+
 
 
 
