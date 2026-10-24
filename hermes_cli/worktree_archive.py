@@ -302,7 +302,9 @@ def snapshot_worktree(repo_root: str, wt_path, *, reason: str, max_untracked_mb:
     finally:
         for leftover in (tmp_index, tmp_index.with_name(tmp_index.name + ".lock"), pathspec):
             leftover.unlink(missing_ok=True)
-    ref = _create_ref(repo_root, wt.name, sha, env)
+    # commit-tree wrote ``sha`` into the TREE's object store; a ref in any other repository (a
+    # superproject whose .worktrees hosts a submodule's tree) would name a missing object.
+    ref = _create_ref(str(wt), wt.name, sha, env)
     logger.info("Archived worktree %s -> %s (%s)", wt, ref, reason)
     return Archive(ref=ref, name=ref[len(ARCHIVE_PREFIX):], sha=sha, created=meta["created"], meta=meta,
                    staged=staged)

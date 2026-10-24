@@ -262,9 +262,7 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
 
     now = time.time()
     records: list[TreeRecord] = []
-    for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir():
-            continue
+    for entry in _ops.owned_worktree_entries(repo_root, worktrees_dir):  # other repos' trees: theirs
         try:
             age_days = (now - entry.stat().st_mtime) / 86400.0
         except Exception:

@@ -1003,16 +1003,97 @@ def prune_tier_hours(name: str, max_age_hours: float) -> float:
     return max_age_hours if name.startswith(_AUTO_TREE_PREFIXES) else max_age_hours * 3
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _repo_common_dir(repo_root: str) -> Optional[Path]:
+    """Absolute git common dir of *repo_root* (shared by all its worktrees), or None."""
+    try:
+        common = _git_out(["rev-parse", "--git-common-dir"], repo_root, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not common:
+        return None
+    return Path(os.path.realpath(Path(repo_root) / (_normalize_git_bash_path(common) or common)))
+
+
+def _tree_common_dir(tree: Path) -> Optional[Path]:
+    """Git common dir *tree* belongs to, read from disk (no git spawn), or None when *tree* has
+    no ``.git`` or an unreadable one. A ``.git`` directory is its own common dir (a standalone
+    clone); a ``gitdir:`` file names a worktree admin dir (``<common>/worktrees/<name>``, whose
+    ``commondir`` file is authoritative) or a submodule's repository (``<super>/.git/modules/<sub>``)."""
+    dot_git = tree / ".git"
+    try:
+        if dot_git.is_dir():
+            return Path(os.path.realpath(dot_git))
+        if not dot_git.is_file():
+            return None
+        link = dot_git.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    if not link.startswith("gitdir:"):
+        return None
+    target = link[len("gitdir:"):].strip()
+    admin = Path(os.path.realpath(tree / (_normalize_git_bash_path(target) or target)))
+    try:
+        commondir = (admin / "commondir").read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        commondir = ""
+    if commondir:
+        return Path(os.path.realpath(admin / commondir))
+    if admin.parent.name == "worktrees":  # admin dir already pruned: infer from its location
+        return admin.parent.parent
+    return admin
+
+
+def is_foreign_worktree(repo_root: str, tree, *, repo_common: Optional[Path] = None) -> bool:
+    """True when *tree* (a dir under ``<repo_root>/.worktrees``) is provably a checkout of ANOTHER
+    repository: a submodule's or sibling repo's worktree, or a standalone clone, sharing the
+    directory. Unknown (no ``.git``, unreadable pointer, *repo_root* not a repo) is False, so the
+    caller's preserve-biased classifier still sees it; nothing is hidden on doubt."""
+    common = repo_common if repo_common is not None else _repo_common_dir(repo_root)
+    if common is None:
+        return False
+    owner = _tree_common_dir(Path(tree))
+    return owner is not None and not _same_path(owner, common)
+
+
+def owned_worktree_entries(repo_root: str, worktrees_dir: Optional[Path] = None) -> list:
+    """Sorted directories under ``<repo_root>/.worktrees`` that are not foreign to *repo_root*.
+
+    A shared ``.worktrees`` (e.g. a superproject whose submodules park their trees there too)
+    holds trees this repo cannot classify, archive or remove: their objects, refs and admin
+    dirs live in another repository. They are skipped silently; that repo's own sweep owns them.
+    """
+    worktrees_dir = Path(worktrees_dir) if worktrees_dir is not None else Path(repo_root) / ".worktrees"
+    try:
+        entries = sorted(e for e in worktrees_dir.iterdir() if e.is_dir())
+    except OSError:
+        return []
+    common = _repo_common_dir(repo_root)
+    if common is None:
+        return entries
+    owned = []
+    for entry in entries:
+        if is_foreign_worktree(repo_root, entry, repo_common=common):
+            logger.debug("Skipping %s: a worktree of another repository", entry)
+            continue
+        owned.append(entry)
+    return owned
+
+
 def _prune_candidates(worktrees_dir: Path, max_age_hours: int, now: float) -> list:
     """Phase 1, stat-only age filter -> ``[(entry, mtime, force)]`` for trees past their soft cutoff.
 
     Kanban trees (``t_<hex>``) belong to the kanban gc. Hermes-made trees age on *max_age_hours*,
     deliberately named trees at 3x (``prune_tier_hours``); *force* marks the hard (3x) tier.
+    Trees of other repositories sharing the directory are not candidates (``owned_worktree_entries``).
     """
     kanban_re = re.compile(r"^t_[0-9a-f]+$")
     candidates: list = []
-    for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir() or kanban_re.match(entry.name):
+    for entry in owned_worktree_entries(str(worktrees_dir.parent), worktrees_dir):
+        if kanban_re.match(entry.name):
             continue
         tier_hours = prune_tier_hours(entry.name, max_age_hours)
         try:

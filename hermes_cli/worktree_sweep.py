@@ -261,8 +261,8 @@ def plan_sweep(repo_root: str, max_age_hours: int = 24, settings: Optional[dict]
     candidates = ops._prune_candidates(worktrees_dir, max_age_hours, now)
     doomed_names = {entry.name for entry, _m, _f in candidates}
     decisions: list[Decision] = []
-    for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir() or entry.name in doomed_names:
+    for entry in ops.owned_worktree_entries(repo_root, worktrees_dir):  # other repos' trees: theirs
+        if entry.name in doomed_names:
             continue
         try:
             age = (now - entry.stat().st_mtime) / 3600
