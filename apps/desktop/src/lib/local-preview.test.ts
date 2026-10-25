@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { remoteMode, readDesktopFileDataUrl, readDesktopFileText } = vi.hoisted(() => ({
   remoteMode: { value: true },
@@ -226,7 +226,7 @@ describe('cross-platform local preview paths', () => {
     ['\\\\server\\share\\a.md', '\\\\server\\share\\a.md'],
     ['O:relative.md', 'O:/base/O:relative.md'],
     ['relative/a.md', 'O:/base/relative/a.md'],
-    ['../a.md', 'O:/base/../a.md'],
+    ['../a.md', 'O:/a.md'],
     ['folder with spaces/café.md', 'O:/base/folder with spaces/café.md']
   ])('normalizes %s without changing its path category', (raw, expected) => {
     expect(localPreviewTarget(raw, 'O:/base')?.path).toBe(expected)
@@ -238,6 +238,10 @@ describe('preview filesystem authority', () => {
     vi.clearAllMocks()
     remoteMode.value = true
     readDesktopFileText.mockResolvedValue({ content: 'remote', binary: false, byteSize: 6 })
+  })
+
+  afterEach(() => {
+    remoteMode.value = true
   })
 
   it('bypasses Desktop-local normalization for a Gateway-owned remote path', async () => {
