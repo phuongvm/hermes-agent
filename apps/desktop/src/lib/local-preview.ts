@@ -1,3 +1,4 @@
+import { fileUrlToNativePath } from '@hermes/shared'
 import DOMPurify from 'dompurify'
 
 import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileText } from '@/lib/desktop-fs'
@@ -85,11 +86,11 @@ function joinPath(base: string, rel: string) {
   return `${root}${parts.join('/')}`
 }
 
-function isCrossPlatformAbsolutePath(path: string) {
-  return path.startsWith('/') || /^[a-z]:[\\/]/i.test(path) || path.startsWith('\\\\')
-}
+export function pathToFileUrl(path: string) {
+  if (/^(?:blob:|data:|https?:)/i.test(path)) {
+    return path
+  }
 
-function pathToFileUrl(path: string) {
   const isWindowsUnc = path.startsWith('\\\\')
   const normalized = isWindowsUnc || /^[a-z]:[\\/]/i.test(path) ? path.replace(/\\/g, '/') : path
 
@@ -241,12 +242,9 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
   let path = raw
 
   if (/^file:\/\//i.test(raw)) {
-    try {
-      path = decodeURIComponent(new URL(raw).pathname)
-    } catch {
-      path = raw.replace(/^file:\/\//i, '')
-    }
-  } else if (!isCrossPlatformAbsolutePath(raw) && cwd) {
+    // A URL that does not parse, or encodes a separator, keeps its text undecoded.
+    path = fileUrlToNativePath(raw) ?? raw.replace(/^file:\/\//i, '')
+  } else if (!raw.startsWith('/') && !isWindowsAbsolutePath(raw) && cwd) {
     path = joinPath(cwd, raw)
   }
 

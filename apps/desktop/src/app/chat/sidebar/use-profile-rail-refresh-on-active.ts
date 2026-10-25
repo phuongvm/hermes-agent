@@ -18,13 +18,16 @@ import { $connection, $gatewayState } from '@/store/session'
  * a deleted profile's square lingers in the rail until the user happens to
  * open Manage Profiles (whose own refresh() call was the only other reader).
  *
- * Suppressed when gateway state is not 'open' (e.g. 'connecting', 'closed',
- * 'idle') or when the active connection is in terminal signed-out state to
- * prevent IPC timeout / network storms.
+ * Suppressed when `enabled` is false, when gateway state is not 'open' (e.g.
+ * 'connecting', 'closed', 'idle'), or when the active connection is in terminal
+ * signed-out state to prevent IPC timeout / network storms.
  * Any suppressed refresh is deferred and coalesced into a single refresh
  * when the gateway transitions back to 'open' and authenticated.
  */
-export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): void {
+export function useProfileRailRefreshOnActive(enabledOrGatewayStateOverride: boolean | string = true): void {
+  const enabled = typeof enabledOrGatewayStateOverride === 'boolean' ? enabledOrGatewayStateOverride : true
+  const gatewayStateOverride =
+    typeof enabledOrGatewayStateOverride === 'string' ? enabledOrGatewayStateOverride : undefined
   const storeGatewayState = useStore($gatewayState)
   const gatewayState = gatewayStateOverride ?? storeGatewayState
   const connection = useStore($connection)
@@ -37,6 +40,10 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
 
   // eslint-disable-next-line no-restricted-syntax -- resume sync handler resets deferred refresh sentinel
   useEffect(() => {
+    if (!enabled) {
+      return
+    }
+
     return registerResumeSyncHandler(baseUrl => {
       const currentBaseUrl = normalizeBaseUrl($connection.get()?.baseUrl || '')
 
@@ -45,10 +52,14 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
         void refreshActiveProfile()
       }
     })
-  }, [])
+  }, [enabled])
 
   // eslint-disable-next-line no-restricted-syntax -- tracks transition edges between gateway/signed-out states
   useEffect(() => {
+    if (!enabled) {
+      return
+    }
+
     const isInitial = prevGatewayStateRef.current === null
     const prevGateway = prevGatewayStateRef.current
     const prevSignedOut = prevSignedOutRef.current
@@ -66,10 +77,14 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
         hasDeferredRefreshRef.current = true
       }
     }
-  }, [gatewayState, isSignedOut, signedOutUrls])
+  }, [enabled, gatewayState, isSignedOut, signedOutUrls])
 
   // eslint-disable-next-line no-restricted-syntax -- sets deferred refresh flag on active visibility change
   useEffect(() => {
+    if (!enabled) {
+      return
+    }
+
     const onActive = () => {
       if (document.visibilityState === 'hidden') {
         return
@@ -91,5 +106,5 @@ export function useProfileRailRefreshOnActive(gatewayStateOverride?: string): vo
       window.removeEventListener('focus', onActive)
       document.removeEventListener('visibilitychange', onActive)
     }
-  }, [gatewayState, connection?.baseUrl])
+  }, [enabled, gatewayState, connection?.baseUrl])
 }

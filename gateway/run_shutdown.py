@@ -2092,7 +2092,14 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested and self._restart_command_source is None:
-            self._write_planned_restart_notification_marker()
+            # One writer for the marker (gateway/restart_notice.py): the CLI restart stamps the same
+            # file, and a rename on either side must not strand the other's write.
+            from gateway.restart_notice import write_planned_restart_marker
+            with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                write_planned_restart_marker(
+                    via_service=bool(self._restart_via_service),
+                    detached=bool(self._restart_detached),
+                )
         if self._restart_requested and self._restart_via_service:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
             self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
