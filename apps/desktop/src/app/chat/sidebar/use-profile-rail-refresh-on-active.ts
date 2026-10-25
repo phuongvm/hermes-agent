@@ -26,8 +26,10 @@ import { $connection, $gatewayState } from '@/store/session'
  */
 export function useProfileRailRefreshOnActive(enabledOrGatewayStateOverride: boolean | string = true): void {
   const enabled = typeof enabledOrGatewayStateOverride === 'boolean' ? enabledOrGatewayStateOverride : true
+
   const gatewayStateOverride =
     typeof enabledOrGatewayStateOverride === 'string' ? enabledOrGatewayStateOverride : undefined
+
   const storeGatewayState = useStore($gatewayState)
   const gatewayState = gatewayStateOverride ?? storeGatewayState
   const connection = useStore($connection)
