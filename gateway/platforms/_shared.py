@@ -148,6 +148,9 @@ def profile_scoped() -> bool:
 # (apply_yaml_config_fn, #25443)
 # ---------------------------------------------------------------------------
 
+_YAML_BRIDGED_ENV_KEYS: set[str] = set()
+
+
 def yaml_env_setter() -> Callable[[str, Any], None]:
     """``set_env(name, value)`` for ``apply_yaml_config_fn`` hooks: writes ``os.environ[name]`` only
     when the var is unset (explicit env wins over YAML) and NEVER while a multiplexed secondary
@@ -160,9 +163,10 @@ def yaml_env_setter() -> Callable[[str, Any], None]:
     skip = profile_scoped()
 
     def set_env(name: str, value: Any) -> None:
-        if value is None or skip or os.getenv(name):
+        if value is None or skip or (os.getenv(name) and name not in _YAML_BRIDGED_ENV_KEYS):
             return
         os.environ[name] = ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        _YAML_BRIDGED_ENV_KEYS.add(name)
 
     return set_env
 

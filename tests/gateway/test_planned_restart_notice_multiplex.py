@@ -239,3 +239,25 @@ async def test_a_served_profiles_reconnect_replays_the_owed_notice(multiplex_run
     coder.send.assert_awaited_once()
     assert coder.send.await_args.args[:2] == ("coder-home", ONLINE_NOTICE)
     assert not marker.exists(), "the owed target was reached on reconnect: the obligation is discharged"
+
+
+@pytest.mark.asyncio
+async def test_shared_home_chat_without_secondary_adapter_discharges_marker(multiplex_runner):
+    """When a secondary profile configures the same shared home channel as the launch
+    profile but has no adapter of its own because the launch profile owns the shared credential,
+    delivering to the launch profile's home chat discharges the secondary's owed entry and unlinks
+    ``.restart_pending.json`` so subsequent restarts are not suppressed by a stale delivered_targets list.
+    """
+    runner, marker = multiplex_runner
+    shared_channel = "f87c8cd6-9d12-49df-9481-ef95c53d1083"
+    runner.config = _home_config(Platform.DISCORD, shared_channel)
+    launch = _adapter()
+    runner.adapters[Platform.DISCORD] = launch
+    runner._profile_configs = {"coder": _home_config(Platform.DISCORD, shared_channel)}
+    runner._profile_adapters = {"coder": {}}
+
+    await runner._replay_pending_planned_restart_notification()
+
+    launch.send.assert_awaited_once()
+    assert not marker.exists(), "shared home chat notified via primary adapter must discharge secondary and unlink marker"
+

@@ -1020,7 +1020,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             return False
         return True
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(self: Any) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
@@ -1034,6 +1034,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        delivered_notices: set[tuple[str, str, Optional[str]]] = set()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1073,6 +1074,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     adapter, chat_id, msg, "active chat", platform_str, metadata=metadata
                 ):
                     notified.add(dedup_key)
+                    delivered_notices.add(dedup_key)
             from gateway.warning_notifications import present_notification
             from gateway.run import _async_profile_runtime_scope
             scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
@@ -1093,41 +1095,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
-        # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
-        # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
-        # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
-        # a fatal path (_handle_fatal) that pops the adapter -> "dictionary changed size during iteration".
-        profile_adapters = getattr(self, "_profile_adapters", None) or {}
-        for profile, platform, platform_cfg in list(self._served_home_channel_configs()):
-            home = platform_cfg.home_channel
-            if not home or not home.chat_id:
-                continue
-            adapter = (self.adapters if profile is None else profile_adapters.get(profile) or {}).get(platform)
-            if adapter is None:
-                continue
-            if not self._notice_allowed(platform, "home channel", platform_cfg):
-                continue
-            dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
-            if dedup_key in notified:
-                continue
-            try:
-                metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
-            except Exception as e:
-                logger.debug(
-                    "Failed to send shutdown notification to home channel %s:%s: %s", platform.value, home.chat_id, e,
-                )
-                continue
-            async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata):
-                if await self._send_shutdown_notice(
-                    adapter, str(home.chat_id), msg, "home channel", platform.value, metadata=metadata,
-                ):
-                    notified.add(dedup_key)
-            from gateway.warning_notifications import present_notification
-            from gateway.run import _async_profile_runtime_scope
-            # present_notification reads the ACTIVE profile's display settings: bind the served one's.
-            profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
-            async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
-                await present_notification(_send_home, platform=platform)
+        await self._notify_home_channels_of_shutdown(msg, notified, delivered_notices)
 
     # Agent finalization / resource cleanup
     @staticmethod
@@ -2106,11 +2074,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _step("Shared SessionDB close error", _close_shared)
         logger.info("Shutdown phase: SessionDB close done at +%.2fs", ctx.elapsed())
 
-    async def _stop_persist_exit_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
+    async def _stop_persist_exit_state(self: Any, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Clean-shutdown marker, restart markers, terminal runtime status; process bootstrap
         releases PID/lock ownership after the writer drain."""
-        from gateway.run import _hermes_home, _planned_restart_notification_path, _shutdown_gateway_health_export
-        from utils import atomic_json_write
+        from gateway.run import _hermes_home, _shutdown_gateway_health_export
         if getattr(self, "_startup_cleanup_only", False):  # start never ran: keep startup_failed + crash markers
             return _shutdown_gateway_health_export(self)
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
@@ -2125,16 +2092,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested and self._restart_command_source is None:
-            with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
-                atomic_json_write(
-                    _planned_restart_notification_path(),
-                    {
-                        "requested_at": time.time(),
-                        "via_service": bool(self._restart_via_service),
-                        "detached": bool(self._restart_detached),
-                    },
-                    indent=None,
-                )
+            self._write_planned_restart_notification_marker()
         if self._restart_requested and self._restart_via_service:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
             self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE

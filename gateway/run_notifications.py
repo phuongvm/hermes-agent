@@ -457,7 +457,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 continue
             yield platform, platform_cfg, home, transport
 
-    def _served_home_channel_configs(self):
+    def _served_home_channel_configs(self: Any):
         """``(profile, platform, platform_cfg)`` for every SERVED profile's configured home channel.
 
         ``self.config`` is the launch profile's alone, but one host process multiplexes every
@@ -465,10 +465,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         secondary configs are the ones ``_load_secondary_profile_config`` already cached at
         adapter start; ``profile`` is ``None`` for the launch profile.
         """
+        relay_cfg = self.config.platforms.get(Platform.RELAY)
+        relay_enabled = bool(relay_cfg and relay_cfg.enabled)
         for platform, platform_cfg in self.config.platforms.items():
+            if not platform_cfg.enabled and not relay_enabled:
+                continue
             yield None, platform, platform_cfg
         for profile, profile_cfg in (getattr(self, "_profile_configs", None) or {}).items():
+            p_relay = profile_cfg.platforms.get(Platform.RELAY)
+            p_relay_enabled = bool(p_relay and p_relay.enabled)
             for platform, platform_cfg in profile_cfg.platforms.items():
+                if not platform_cfg.enabled and not p_relay_enabled:
+                    continue
                 yield profile, platform, platform_cfg
 
     def _served_home_channel_transports(self):
@@ -512,6 +520,81 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return False
 
     _planned_restart_notice_lock: Optional[asyncio.Lock] = None
+
+    def _write_planned_restart_notification_marker(self) -> None:
+        """Persist ``.restart_pending.json`` so the next startup sends ``gateway.startup.online``
+        to every configured home channel.
+        """
+        from gateway.run import _planned_restart_notification_path
+        from utils import atomic_json_write
+        with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+            atomic_json_write(
+                _planned_restart_notification_path(),
+                {
+                    "requested_at": time.time(),
+                    "via_service": bool(getattr(self, "_restart_via_service", False)),
+                    "detached": bool(getattr(self, "_restart_detached", False)),
+                },
+            )
+
+    async def _notify_home_channels_of_shutdown(
+        self: Any,
+        msg: str,
+        notified: set[tuple[str, str, Optional[str]]],
+        delivered_notices: set[tuple[str, str, Optional[str]]],
+    ) -> None:
+        """Broadcast shutdown/restart notice to every served profile's home channel and arm
+        ``.restart_pending.json`` when any home channel receives the notice."""
+        from gateway.run import _async_profile_runtime_scope
+        from gateway.warning_notifications import present_notification
+        with _log_suppressed(logging.DEBUG, "Failed to refresh home channel config at shutdown: %s"):
+            from gateway.config import load_gateway_config
+            fresh_cfg = load_gateway_config()
+            for plat, pcfg in fresh_cfg.platforms.items():
+                if pcfg.home_channel and pcfg.home_channel.chat_id and plat in self.config.platforms:
+                    self.config.platforms[plat].home_channel = pcfg.home_channel
+        profile_adapters = getattr(self, "_profile_adapters", None) or {}
+        marker_written = False
+        if any(k in delivered_notices for k in notified):
+            self._write_planned_restart_notification_marker()
+            marker_written = True
+        for profile, platform, platform_cfg in list(self._served_home_channel_configs()):
+            home = platform_cfg.home_channel
+            if not home or not home.chat_id:
+                continue
+            adapter = (self.adapters if profile is None else profile_adapters.get(profile) or {}).get(platform)
+            if adapter is None or not self._notice_allowed(platform, "home channel", platform_cfg):
+                continue
+            dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
+            if dedup_key in notified:
+                if dedup_key in delivered_notices and not marker_written:
+                    self._write_planned_restart_notification_marker()
+                    marker_written = True
+                continue
+            try:
+                metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
+            except Exception as e:
+                logger.debug(
+                    "Failed to send shutdown notification to home channel %s:%s: %s",
+                    platform.value, home.chat_id, e, exc_info=True,
+                )
+                continue
+
+            async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata, dedup_key=dedup_key):
+                nonlocal marker_written
+                if not marker_written:
+                    self._write_planned_restart_notification_marker()
+                    marker_written = True
+                if await self._send_shutdown_notice(
+                    adapter, str(home.chat_id), msg, "home channel", platform.value, metadata=metadata,
+                ):
+                    notified.add(dedup_key)
+                    delivered_notices.add(dedup_key)
+
+            profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
+            scope = _async_profile_runtime_scope(profile_home) if profile_home else contextlib.nullcontext()
+            async with scope:
+                await present_notification(_send_home, platform=platform)
 
     async def _replay_pending_planned_restart_notification(self) -> None:
         """Send the planned-restart online notice to every home channel still owed one; clear
@@ -569,9 +652,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         targets = list(self._served_home_channel_transports())
         # A chat already notified for ANOTHER profile is not notified again.
         notified_chats = {
-            _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
-            for profile, platform, _cfg, home, _transport in targets
-            if _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id) in skipped
+            _delivery_target_key(
+                platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id, profile=profile
+            )
+            for profile, platform, cfg in self._served_home_channel_configs()
+            if cfg.home_channel
+            and cfg.home_channel.chat_id
+            and _served_notice_target_key(
+                profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id
+            ) in skipped
         }
         for profile, platform, platform_cfg, home, transport in targets:
             if not platform_cfg.gateway_restart_notification:
@@ -593,6 +682,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 notified_chats.add(chat)
                 delivered.add(target)
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
+        for profile, platform, platform_cfg in self._served_home_channel_configs():
+            home = platform_cfg.home_channel
+            if not home or not home.chat_id or not platform_cfg.gateway_restart_notification:
+                continue
+            chat = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
+            if chat in notified_chats:
+                delivered.add(_served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id))
         return delivered
 
     async def _send_session_db_warning_notifications(self) -> None:

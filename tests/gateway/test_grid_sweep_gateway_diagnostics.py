@@ -4,6 +4,7 @@ requested outcomes (an in-chat /restart's own ack, the requested background resu
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +20,7 @@ def _configure(tmp_path, monkeypatch, setting):
     home = tmp_path / f"home-{setting}"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("gateway.run._hermes_home", home)
     display = {} if setting is None else {"suppress_warning_notifications": setting}
     (home / "config.yaml").write_text(json.dumps({"display": display}))
     return home
@@ -32,6 +34,7 @@ MODES = (None, False, True)
 async def test_shutdown_notice_to_active_chats_and_home_channel_honors_policy(tmp_path, monkeypatch, setting):
     _configure(tmp_path, monkeypatch, setting)
     runner, adapter = make_restart_runner()
+    test_adapter: Any = adapter
     source = make_restart_source(thread_id="42")
     session_key = build_session_key(source)
     runner._running_agents = {session_key: MagicMock()}
@@ -41,12 +44,20 @@ async def test_shutdown_notice_to_active_chats_and_home_channel_honors_policy(tm
 
     await runner._notify_active_sessions_of_shutdown()
 
-    chats = [c for c, _m, _meta in adapter.sent_calls]
+    chats = [c for c, _m, _meta in test_adapter.sent_calls]
+    from gateway.run import _planned_restart_notification_path
     if setting is True:
-        assert chats == [], adapter.sent_calls
+        assert chats == [], test_adapter.sent_calls
+        assert not _planned_restart_notification_path().exists()
     else:
         assert sorted(chats) == sorted([source.chat_id, "home-chat"])
-        assert all("Hermes is shutting down" in m for _c, m, _meta in adapter.sent_calls)
+        assert all("Hermes is shutting down" in m for _c, m, _meta in test_adapter.sent_calls)
+        assert _planned_restart_notification_path().exists()
+        test_adapter.sent_calls.clear()
+        await runner._replay_pending_planned_restart_notification()
+        assert [c for c, _m, _meta in test_adapter.sent_calls] == ["home-chat"]
+        assert all("Gateway online" in m for _c, m, _meta in test_adapter.sent_calls)
+        assert not _planned_restart_notification_path().exists()
 
 
 @pytest.mark.asyncio
