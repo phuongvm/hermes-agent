@@ -384,12 +384,6 @@ import {
 import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { isMediaCapturePermission } from './media-capture-permission'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL, mediaProtocolDownloadName } from './media-protocol'
-import {
-  executeWithNativeBearerSingleReplay,
-  oauthSessionIsLive,
-  resolveJsonBody,
-  resolveReadinessProbeAuth
-} from './native-auth-decisions'
 import { fetchLocalMedia } from './media-range'
 import { createMinimizeToTray } from './minimize-to-tray'
 import {
@@ -397,6 +391,12 @@ import {
   type NativeAccessTokenOptions,
   NativeAuthChangedError
 } from './native-access-token'
+import {
+  executeWithNativeBearerSingleReplay,
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -505,13 +505,13 @@ import {
   quitPromptFor,
   shouldGuardWindowClose
 } from './quit-guard'
-import { reauthModalLatch } from './reauth-modal-latch'
 import {
   backendQuitNeedsWait,
   backendTeardownOptions,
   createQuitTeardownCoordinator,
   type QuitTeardownTask
 } from './quit-teardown'
+import { reauthModalLatch } from './reauth-modal-latch'
 import {
   boundedInstallId,
   createPrimaryInstallIdResolver,
@@ -549,9 +549,9 @@ import { missingRendererAssets, presentRendererIndexes } from './renderer-bundle
 import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
-import { loadInstallStamp as loadInstallStampInternal, resolveHermesVersionLadder } from './runtime-version'
 import { fetchRosterSourceData } from './roster-source-fetch'
 import { rosterSourceStatus } from './roster-source-status'
+import { resolveHermesVersionLadder } from './runtime-version'
 import { registerSaveDialogIpc } from './save-text-file'
 import {
   classifyStoredSecret,
