@@ -137,6 +137,7 @@ export {
   ReconnectBackoffTracker,
   STREAK_RESET_WINDOW_MS
 } from './reconnect-backoff'
+export { randomUuid } from './session-http-mutations'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,
