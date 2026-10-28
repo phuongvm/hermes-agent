@@ -18,7 +18,8 @@ vi.mock('@/components/pane-shell/tree/store', async () => {
     $collapsedTreeSides: atom(new Set()),
     $hiddenTreePanes: atom(new Set()),
     $layoutTree: atom(null),
-    $narrowViewport: atom(false)
+    $narrowViewport: atom(false),
+    revealTreePane: vi.fn()
   }
 })
 vi.mock('@/contrib/events', () => ({ onGatewayEvent: vi.fn() }))

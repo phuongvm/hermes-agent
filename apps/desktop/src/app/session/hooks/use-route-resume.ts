@@ -242,6 +242,11 @@ export function useRouteResume({
       // A fresh draft is a real navigation — any later resume homes normally.
       bootResumeRef.current = false
       startFreshSessionDraft({ replaceRoute: true, rotateFreshDraftKey: false })
+    } else if (isNewChatRoute(locationPathname) && freshDraftReady && !rawHashLooksLikeSession()) {
+      // Booting on `/` with an already-ready draft has no initial session route to restore;
+      // clear bootResumeRef so the first session opened afterward (e.g. via "Open chat" from
+      // a route-tile like `/crew`) homes focus to the workspace instead of calling markSelectionRestore().
+      bootResumeRef.current = false
     }
   }, [
     activeSessionId,

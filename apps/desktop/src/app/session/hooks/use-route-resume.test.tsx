@@ -437,6 +437,43 @@ describe('useRouteResume', () => {
     expect(markSelectionRestore).toHaveBeenCalledTimes(1)
   })
 
+  it('does not arm the boot-restore one-shot when the window booted on a ready fresh draft', () => {
+    // Booting on `/` with the draft already staged restores nothing, so the
+    // first session opened afterwards ("Open chat" from the `/crew` route tile)
+    // is a real navigation: it must home focus normally, not consume the
+    // ⌘R restore one-shot meant for a reload that landed on /:sid.
+    vi.mocked(markSelectionRestore).mockClear()
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+
+    const props = {
+      activeSessionId: null,
+      activeSessionIdRef: { current: null } as MutableRefObject<null | string>,
+      creatingSessionRef: { current: false },
+      currentView: 'chat',
+      gatewayState: 'open',
+      resumeSession,
+      runtimeIdByStoredSessionIdRef: { current: new Map() },
+      selectedStoredSessionId: null,
+      selectedStoredSessionIdRef: { current: null } as MutableRefObject<null | string>,
+      startFreshSessionDraft
+    }
+
+    const { rerender } = render(
+      <RouteResumeHarness {...props} freshDraftReady locationPathname="/" routedSessionId={null} />
+    )
+
+    expect(startFreshSessionDraft).not.toHaveBeenCalled()
+    expect(resumeSession).not.toHaveBeenCalled()
+
+    rerender(
+      <RouteResumeHarness {...props} freshDraftReady={false} locationPathname="/session-1" routedSessionId="session-1" />
+    )
+
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true)
+    expect(markSelectionRestore).not.toHaveBeenCalled()
+  })
+
   it('resumes the selected route again when the gateway reconnects', () => {
     const resumeSession = vi.fn(async () => undefined)
     const startFreshSessionDraft = vi.fn()

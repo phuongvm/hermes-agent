@@ -1057,6 +1057,17 @@ export const host = {
             })
           } else {
             openSession(storedSessionId, navigate, intent)
+
+            // When a plugin page mounted as a center route-tile (e.g. `route-tile:/crew`)
+            // opens a session in-place into main, `frontMainIfSelected` inside `openSession`
+            // runs before the async HashRouter hashchange updates `$selectedStoredSessionId`.
+            // Reveal the `workspace` pane immediately so the chat tab fronts over the route-tile.
+            if (
+              (intent === 'in-place' || intent === 'main') &&
+              !$sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId)
+            ) {
+              revealTreePane('workspace')
+            }
           }
 
           // Judge the main surface AFTER the open: on a cold start the persisted
