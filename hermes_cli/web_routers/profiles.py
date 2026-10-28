@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import copy
 import functools
+# Invariant INV-6: Coalesced profile read 10s timeout with task eviction and fallback
 from hermes_cli.web_read_coalescing import coalesced_read
 import inspect
 import json
