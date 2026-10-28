@@ -25,7 +25,7 @@ import { capabilityScoped, getApiRequestConnection } from '@/api/client'
 import { mutateSessionFenced } from '@/api/sessions'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
-import { syncWorkspaceRoute } from '@/app/routes'
+import { routePathname, SIDEBAR_NAV_AREA, type SidebarNavContribution, syncWorkspaceRoute } from '@/app/routes'
 import type { ClientSessionState } from '@/app/types'
 import {
   $newSessionTabAction,
@@ -76,6 +76,7 @@ import {
   setActiveProfile,
   setShowAllProfiles
 } from '@/store/profile'
+import { openRouteTile } from '@/store/route-tiles'
 import {
   $activeSessionId,
   $connection,
@@ -642,6 +643,26 @@ export const host = {
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
   navigate: (path: string) => {
     const to = path.startsWith('#') ? path.slice(1) : path
+    const basePath = routePathname(to)
+
+    // A route whose sidebar row says `asTile: true` (e.g. Crew's `/crew`) lives
+    // in its own center tile, the same place a click on that row opens it
+    // (`selectSidebarItem` → `openRouteTile(route, 'center')`). Writing the hash
+    // would swap the active chat out of `workspace`; open/front the tile
+    // instead. The plugin carries any query (`?card=<id>`) to its page itself.
+    const tiled = registry
+      .getArea(SIDEBAR_NAV_AREA)
+      .some(c => {
+        const data = c.data as Partial<SidebarNavContribution> | undefined
+
+        return data?.path === basePath && data.asTile === true
+      })
+
+    if (tiled) {
+      openRouteTile(basePath, 'center')
+
+      return
+    }
 
     window.location.hash = `#${to}`
     // The router follows the hash and fronts the workspace pane on a route
