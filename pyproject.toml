@@ -673,9 +673,6 @@ override-dependencies = [
   # never builds a misaki G2P. The never-true marker removes it from the lock.
   # Remove this line when misaki drops it or a 3.14-capable release fits.
   "spacy-curated-transformers; sys_platform == 'never'",
-  # browser-harness 0.1.13 pins pillow==12.3.0 which has 28 known vulnerabilities (GHSA-332p-7hrc-92wf, etc.).
-  # Force override to Pillow 13.0.0.
-  "pillow==13.0.0",
 ]
 # oauthlib arrives only through google-auth-oauthlib -> requests-oauthlib
 # (>=3.0.0). 4.0.0 fixes GHSA-hj66-6f7g-4r5v and GHSA-xpv3-w29h-x7cv; its two
@@ -746,8 +743,6 @@ include = [
   "hermes_platform.*",
   "pm",
   "pm.*",
-  "tools",
-  "tools.*",
 ]
 
 [tool.setuptools.package-data]
