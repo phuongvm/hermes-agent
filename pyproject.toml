@@ -453,7 +453,8 @@ termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.8",
   # 6.5.9+: GHSA-c2m8-h5v5-343r, GHSA-chx6-46f5-w4vp, GHSA-3hv7-mjh2-fv65.
-  "tornado==6.5.10",
+  # 6.6: GHSA-pcg2-g6cj-q92c, GHSA-r4j5-9xpp-3985, GHSA-pw9p-v7r6-gx4p.
+  "tornado==6.6",
   "hermes-agent[cron]",
   "hermes-agent[mcp]",
   "hermes-agent[acp]",
@@ -670,7 +671,12 @@ override-dependencies = [
 # multidict 6.9.1 fixes GHSA-54p9-h82j-f925 / PYSEC-2026-4244;
 # opentelemetry-api 1.45.1 fixes GHSA-xcq7-p3pf-p88h;
 # filelock (via torch/huggingface-hub/virtualenv) 4.2.1 fixes GHSA-v4x8-3wr5-3wq8,
-# GHSA-567q-5qvw-pf92 and GHSA-9vhv-jxww-xfm5.
+# GHSA-567q-5qvw-pf92 and GHSA-9vhv-jxww-xfm5;
+# msgpack (via fal-client) 1.2.3 fixes GHSA-j586-36cw-2gc2 (HIGH, C-extension
+# memory leak) and tornado (via python-telegram-bot[webhooks]) 6.6 fixes
+# GHSA-pcg2-g6cj-q92c / GHSA-r4j5-9xpp-3985 / GHSA-pw9p-v7r6-gx4p. The committed
+# uv.lock already resolves msgpack 1.2.3, but a PM venv generation seeded from an
+# older resolved lock keeps 1.2.1, so the floors must be explicit constraints.
 # Capped at the current major: PM's generated workspaces drop the release-age
 # cutoff, so an open floor would jump straight to the newest major release.
 constraint-dependencies = [
@@ -678,6 +684,8 @@ constraint-dependencies = [
   "multidict>=6.9.1,<7",
   "opentelemetry-api>=1.45.1,<2",
   "filelock>=4.2.1,<5",
+  "msgpack>=1.2.3,<2",
+  "tornado>=6.6,<7",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
