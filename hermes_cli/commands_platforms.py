@@ -186,7 +186,7 @@ def _prioritize_telegram_menu_candidates(
 def _iter_gateway_skills(platform: str):
     """Yield ``(cmd_key, info, rel_parts)`` for skills eligible as gateway slash commands.
 
-    Scan roots: ``SKILLS_DIR`` plus ``skills.external_dirs`` / trusted project skills dirs;
+    Scan roots: ``SKILLS_DIR`` plus ``skills.create_dir`` / ``skills.external_dirs`` / trusted project skills dirs;
     anything elsewhere or under ``SKILLS_DIR/.hub`` is skipped, as are skills disabled for
     *platform*. Paths are resolved on both sides (symlinked roots still match) and matched per
     path component (``/my-skills`` never admits ``/my-skills-extra``). ``rel_parts`` is the skill
@@ -197,7 +197,8 @@ def _iter_gateway_skills(platform: str):
 
     from agent.skill_commands import get_skill_commands
     from agent.skill_utils import (
-        get_disabled_skill_names, get_external_skills_dirs, get_project_skills_dirs)
+        get_disabled_skill_names, get_external_skills_dirs, get_project_skills_dirs,
+        get_skill_create_dir_roots)
     from tools.skills_tool import SKILLS_DIR
 
     try:
@@ -206,7 +207,7 @@ def _iter_gateway_skills(platform: str):
         disabled = set()
     hub_dir = (SKILLS_DIR / ".hub").resolve()
     roots = [SKILLS_DIR.resolve()]
-    for getter in (get_external_skills_dirs, get_project_skills_dirs):
+    for getter in (get_skill_create_dir_roots, get_external_skills_dirs, get_project_skills_dirs):
         try:
             for d in getter():
                 try:

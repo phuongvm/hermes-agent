@@ -383,6 +383,13 @@ def get_skill_create_dir() -> Optional[Path]:
     return resolved
 
 
+def get_skill_create_dir_roots() -> list[Path]:
+    """``[skills.create_dir]`` when configured and present on disk, else ``[]``; the shape
+    lookup helpers extend their trusted-root lists with (alongside the external dirs)."""
+    create_dir = get_skill_create_dir()
+    return [create_dir] if create_dir is not None and create_dir.is_dir() else []
+
+
 def display_skill_create_dir() -> str:
     """User-facing path where new skills are created (``~/`` shorthand when
     possible); tool schema descriptions and prompts follow ``skills.create_dir``."""
@@ -681,7 +688,7 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     except Exception:
         primary_root = get_skills_dir()
     trusted_roots = [primary_root]
-    for getter in (get_project_skills_dirs, get_external_skills_dirs):
+    for getter in (get_skill_create_dir_roots, get_project_skills_dirs, get_external_skills_dirs):
         try:
             trusted_roots.extend(getter())
         except Exception:
@@ -715,6 +722,7 @@ def is_external_skill_path(path) -> bool:
     candidate = _resolve_for_skill_ownership(path)
     roots: list[Path] = list(get_external_skills_dirs())
     try:
+        roots.extend(get_skill_create_dir_roots())
         roots.extend(get_project_skills_dirs())
     except Exception:
         pass
