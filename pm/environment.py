@@ -323,8 +323,15 @@ class PythonEnvironment:
             env = {key: value for key, value in env.items() if not is_index_redirect(key)}
         # uv is a child: it gets the ordinary spelling of store paths (pm.filesystem.native),
         # or the venv it writes would record the extended-length one in pyvenv.cfg.
+        # Fence upward `.git` discovery at self.cache: when HERMES_HOME sits inside a parent
+        # git worktree, an aborted `git init` in `git-v*/db/<bucket>` leaves an empty dir whose
+        # git probes would otherwise walk into the parent repo and wedge `git clone`.
+        ceiling = native(self.cache)
+        if env.get("GIT_CEILING_DIRECTORIES"):
+            ceiling = f"{ceiling}{os.pathsep}{env['GIT_CEILING_DIRECTORIES']}"
         env.update(UV_PYTHON=native(self.python), UV_PROJECT_ENVIRONMENT=native(self.destination),
-                   UV_CACHE_DIR=native(self.cache), UV_PYTHON_DOWNLOADS="never")
+                   UV_CACHE_DIR=native(self.cache), UV_PYTHON_DOWNLOADS="never",
+                   GIT_CEILING_DIRECTORIES=ceiling)
         with tempfile.TemporaryDirectory(prefix="pm-uv-config-") as config:
             env.update(XDG_CONFIG_HOME=config, XDG_CONFIG_DIRS=config)
             command = [native(self.uv), *map(native, args)]

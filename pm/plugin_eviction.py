@@ -238,6 +238,71 @@ class PluginEviction:
             durable_write_bytes(path, proposed)
 
 
+def _member_content_stamp(plugin_dir: Path) -> str:
+    """Content digest of *plugin_dir*'s Python build inputs, independent of which profile owns it."""
+    import os
+    import tomllib
+    from pm.plugin_declarations import read_python_declaration
+    from pm.workspace import _member_ignored
+
+    resolved_dir = plugin_dir.resolve()
+    h = hashlib.sha256()
+    declaration = read_python_declaration(resolved_dir)
+    for source in declaration.files:
+        h.update(source.name.encode("utf-8"))
+        h.update(source.read_bytes())
+        h.update(b"\0")
+    pyproject = resolved_dir / "pyproject.toml"
+    if pyproject.is_file():
+        doc = tomllib.loads(pyproject.read_text(encoding="utf-8-sig"))
+        for sources in doc.get("tool", {}).get("uv", {}).get("sources", {}).values():
+            for spec in sources if isinstance(sources, list) else [sources]:
+                if isinstance(spec, dict) and "path" in spec and not Path(spec["path"]).is_absolute():
+                    target = (resolved_dir / spec["path"]).resolve()
+                    if not target.is_relative_to(resolved_dir):
+                        h.update(target.as_posix().encode("utf-8"))
+                        h.update(b"\0")
+        for directory, dirs, files in os.walk(resolved_dir):
+            dirs[:] = sorted(set(dirs) - set(_member_ignored(directory, dirs)))
+            for name in sorted(set(files) - set(_member_ignored(directory, files))):
+                path = Path(directory) / name
+                h.update(path.relative_to(resolved_dir).as_posix().encode("utf-8"))
+                h.update(b"\0")
+                h.update(os.readlink(path).encode("utf-8") if path.is_symlink() else path.read_bytes())
+                h.update(b"\0")
+    return h.hexdigest()
+
+
+def _verify_core_workspace_locks(package, *, explicit: bool) -> None:
+    """Prove core's own manifest resolves under workspace policy before blaming plugins for a fetch/tool failure."""
+    import tempfile
+    import tomllib
+    import tomli_w
+    from pm.environment import managed_environment
+    from pm.native_build import source_build_environment
+    from pm.workspace import _copy_core_inputs, _solve_only_for, _without_release_age
+
+    project = package.project_root()
+    with tempfile.TemporaryDirectory(prefix="pm-core-lock-") as scratch:
+        root = Path(scratch) / "workspace"
+        root.mkdir()
+        environment = managed_environment(
+            Path(scratch) / "venv", env=source_build_environment(project),
+            explicit=explicit, output=None,
+        )
+        document = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8-sig"))
+        uv_policy = document.setdefault("tool", {}).setdefault("uv", {})
+        uv_policy.pop("exclude-newer", None)
+        uv_policy.pop("exclude-newer-package", None)
+        _solve_only_for(uv_policy, environment.python)
+        _copy_core_inputs(project, root)
+        (root / "pyproject.toml").write_text(_without_release_age(tomli_w.dumps(document)), encoding="utf-8")
+        lock = project / "uv.lock"
+        if lock.is_file():
+            (root / "uv.lock").write_bytes(lock.read_bytes())
+        environment.lock(root)
+
+
 def _trial(package, enabled, explicit: bool, plugin_dirs: list[Path]) -> tuple[str, bool] | None:
     """Why the last of *plugin_dirs* cannot join the build, and whether that is a verdict on the
     plugin (a resolver proof or its build failing) rather than the moment; None when it builds."""
@@ -302,6 +367,7 @@ class _EvictingUpdate:
         self.retrying = list(recorded)
         self.tried: dict[Path, str] = {}
         self.verdicts: list[Path] = []  # disabled on a verdict about the plugin: fingerprinted at commit
+        self._failed_trials: dict[tuple[tuple[Path, ...], str], tuple[str, bool]] = {}
         self.base = _target_selection(package, fact, inputs={"plugin_dirs": []}, repair=False, **selection)[0]
 
         def fits(plugin_dir: Path) -> bool:
@@ -368,11 +434,18 @@ class _EvictingUpdate:
     def try_member(self, fitting: list[Path], member: Path) -> bool:
         """Add *member* to *fitting* when it builds on top; else record why. Only a verdict on the
         plugin is fingerprinted: a fetch failure is the moment, so the next update retries it."""
-        verdict = _trial(self.package, self.base, self.explicit, [*fitting, member])
-        if verdict is None:
-            fitting.append(member)
+        resolved = member.resolve()
+        if any(existing.resolve() == resolved for existing in fitting):
             return True
-        self.reasons[member.resolve()] = verdict[0]
+        trial_key = (tuple(existing.resolve() for existing in fitting), _member_content_stamp(resolved))
+        verdict = self._failed_trials.get(trial_key)
+        if verdict is None:
+            verdict = _trial(self.package, self.base, self.explicit, [*fitting, member])
+            if verdict is None:
+                fitting.append(member)
+                return True
+            self._failed_trials[trial_key] = verdict
+        self.reasons[resolved] = verdict[0]
         if verdict[1]:
             self.verdicts.append(member)
         return False
@@ -383,6 +456,8 @@ class _EvictingUpdate:
         if not self.kept:
             raise failure
         try:
+            if not isinstance(failure, (ResolutionConflict, BuildFailure)):
+                _verify_core_workspace_locks(self.package, explicit=self.explicit)
             self.package.apply(self.base, explicit=self.explicit, plugin_dirs=[], skip_invalid_secondary=True)
         except InstallError:
             raise failure from None
