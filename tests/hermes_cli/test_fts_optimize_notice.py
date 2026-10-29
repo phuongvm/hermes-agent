@@ -123,3 +123,24 @@ def test_doctor_collects_pending_rebuild_with_settled_layout(tmp_path, monkeypat
     monkeypatch.setattr(doctor_state, "STATE_DB_SIZE_WARN_BYTES", 0)
     rows = doctor_state._render_state_db_stats(stats)
     assert any("hermes sessions optimize-storage" in detail for _, _, detail in rows) is pending
+
+
+def test_large_state_db_with_auto_prune_enabled_is_informational(monkeypatch):
+    """Advising "enable sessions.auto_prune" when it is already on is a false, unfixable warning."""
+    from hermes_cli import doctor_state
+
+    monkeypatch.setattr(doctor_state, "STATE_DB_SIZE_WARN_BYTES", 0)
+    stats = {"logical_size_bytes": 5 * 1024 ** 3, "fts_storage_upgrade_needed": False,
+             "fts_rebuild_pending": False, "fts_teardown_pending": False}
+
+    off = doctor_state._render_state_db_stats(stats)
+    assert any(kind == "warn" and "auto_prune" in detail for kind, _, detail in off)
+
+    on = doctor_state._render_state_db_stats(stats, auto_prune_days=90)
+    assert not any(kind == "warn" for kind, _, _ in on)
+    assert any("auto_prune is enabled" in text and "90" in text for kind, text, _ in on if kind == "info")
+
+    # A pending structural FTS upgrade is still actionable even with auto_prune on.
+    stats["fts_storage_upgrade_needed"] = True
+    still = doctor_state._render_state_db_stats(stats, auto_prune_days=90)
+    assert any(kind == "warn" and "hermes sessions optimize-storage" in detail for kind, _, detail in still)

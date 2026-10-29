@@ -61,11 +61,34 @@ def host_gateway_note() -> str:
     return f" ({topology.describe()})" if topology is not None else ""
 
 
-def _render_state_db_stats(stats: dict, holders=None, host_note: str = "") -> list:
+def _auto_prune_days(hermes_home: Path | None = None) -> int | None:
+    """Retention window in days when ``sessions.auto_prune`` is already enabled, else None.
+
+    The oversized-DB advisory must not tell an operator to enable what is already on: with
+    auto_prune active the DB is bounded by retention, so the size is informational.
+    """
+    from hermes_cli.config_backend import config_exists
+    from hermes_cli.doctor import HERMES_HOME
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        config_path = (hermes_home if hermes_home is not None else HERMES_HOME) / "config.yaml"
+        if not config_exists(config_path):
+            return None
+        section = load_user_config_effective(config_path).get("sessions")
+        if not isinstance(section, dict) or not section.get("auto_prune"):
+            return None
+        days = section.get("retention_days", 90)
+        return days if isinstance(days, int) and not isinstance(days, bool) and days > 0 else 90
+    except Exception:
+        return None
+
+
+def _render_state_db_stats(stats: dict, holders=None, host_note: str = "", auto_prune_days: int | None = None) -> list:
     """Turn a collect_state_db_stats() dict into ``(kind, text, detail)`` rows, kind 'info' / 'warn'.
 
     Pure formatting — no I/O — so it is unit-testable without the doctor CLI. Tolerates None in every field.
     ``host_note`` names the shared host gateway among the holders (see :func:`host_gateway_note`).
+    ``auto_prune_days`` is the retention window when ``sessions.auto_prune`` is already on (see :func:`_auto_prune_days`).
     """
     lines: list = []
     stats = stats or {}
@@ -107,11 +130,19 @@ def _render_state_db_stats(stats: dict, holders=None, host_note: str = "") -> li
     # pending, an earlier run stopped before tearing down the old index, or the stored FTS layout is an
     # older release's (not just a lagging marker).
     if logical is not None and logical > STATE_DB_SIZE_WARN_BYTES:
-        detail = "consider enabling sessions.auto_prune in config.yaml to bound growth"
         structural_fts_upgrade = bool(stats.get("fts_storage_upgrade_needed"))
-        if stats.get("fts_rebuild_pending") or stats.get("fts_teardown_pending") or structural_fts_upgrade:
-            detail += "; run 'hermes sessions optimize-storage' offline (with the host gateway stopped) to compact FTS storage"
-        lines.append(("warn", f"state.db is large ({_human_bytes(logical)})", f"({detail})"))
+        needs_optimize = bool(stats.get("fts_rebuild_pending") or stats.get("fts_teardown_pending") or structural_fts_upgrade)
+        optimize = "run 'hermes sessions optimize-storage' offline (with the host gateway stopped) to compact FTS storage"
+        if auto_prune_days is None:
+            detail = "consider enabling sessions.auto_prune in config.yaml to bound growth"
+            if needs_optimize:
+                detail += "; " + optimize
+            lines.append(("warn", f"state.db is large ({_human_bytes(logical)})", f"({detail})"))
+        elif needs_optimize:
+            lines.append(("warn", f"state.db is large ({_human_bytes(logical)})", f"({optimize})"))
+        else:
+            lines.append(("info", f"state.db is large ({_human_bytes(logical)}); sessions.auto_prune is enabled "
+                          f"(retention {auto_prune_days}d), so size tracks the retention window", ""))
     # WAL runaway is deliberately NOT warned here: _state_db_wal already warns above 50 MB and offers --fix.
     return lines
 
@@ -419,7 +450,7 @@ def _state_db_stats(issues: list, state_db_path: Path) -> None:
     with warn_on_error("state.db stats unavailable ({e})", "", report=lambda t, _d: check_info(t)):
         from hermes_state_dbfile import collect_state_db_stats, count_db_holders
         rows = _render_state_db_stats(collect_state_db_stats(state_db_path), holders=count_db_holders(state_db_path),
-                                      host_note=host_gateway_note())
+                                      host_note=host_gateway_note(), auto_prune_days=_auto_prune_days(state_db_path.parent))
         for _kind, _text, _detail in rows:
             if _kind != "warn":
                 check_info(_text + (f" {_detail}" if _detail else ""))
