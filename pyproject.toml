@@ -505,9 +505,9 @@ google = [
   # The Google SDKs permit older vulnerable transitives, so unlocked installs
   # must carry the same fixed floors as uv.lock and the runtime installers:
   # httplib2 0.32.0 (GHSA-j5g9-f88f-gfj3 decompression bomb DoS),
-  # pyasn1 0.6.4, google-auth 2.55.1.
+  # pyasn1 0.6.5, google-auth 2.55.1.
   "httplib2==0.32.0",
-  "pyasn1==0.6.4",
+  "pyasn1==0.6.5",
 ]
 youtube = [
   # Required by skills/media/youtube-content and
@@ -701,6 +701,7 @@ constraint-dependencies = [
   "filelock>=4.2.1,<5",
   "msgpack>=1.2.3,<2",
   "tornado>=6.6,<7",
+  "pyasn1>=0.6.5,<0.8",
 ]
 # Release-age check: Hermes's dependencies must be at least 3 days old when Hermes
 # locks them. It runs where uv.lock is resolved (`hermes pm lock`, and CI's lock
