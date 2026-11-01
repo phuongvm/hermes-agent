@@ -138,7 +138,7 @@ def test_operator_exempt_ips_are_never_denied(rig):
 
 
 def _records(rig):
-    return [json.loads(x) for x in rig.deny_log.read_text(encoding="utf-8").splitlines()]
+    return [json.loads(x) for x in rig.deny_log.read_text(encoding="utf-8-sig").splitlines()]
 
 
 def test_exempt_peer_listed_in_policy_is_forwarded_and_audited_as_ignored(rig):
@@ -148,7 +148,7 @@ def test_exempt_peer_listed_in_policy_is_forwarded_and_audited_as_ignored(rig):
         rig.peer = peer
         for _ in range(4):
             assert rig.client.get("/?token=SECRET", headers={"Authorization": "Bearer SECRET"}).status_code == 200
-    assert not rig.deny_log.exists() or rig.deny_log.read_text() == ""  # nothing per-request
+    assert not rig.deny_log.exists() or rig.deny_log.read_text(encoding="utf-8-sig") == ""  # nothing per-request
     rig.clock.advance(61)
     rig.mw.flush()
     recs = {r["ip"]: r for r in _records(rig)}
@@ -156,7 +156,7 @@ def test_exempt_peer_listed_in_policy_is_forwarded_and_audited_as_ignored(rig):
     for rec in recs.values():
         assert rec["event"] == "exempt_ignored" and rec["reason"] == "hard_exempt"
         assert rec["count"] == 4 and rec["source"] == "ingress" and rec["ts"] and rec["first"] <= rec["last"]
-    assert "SECRET" not in rig.deny_log.read_text(encoding="utf-8")
+    assert "SECRET" not in rig.deny_log.read_text(encoding="utf-8-sig")
     assert (_sha(rig.policy), rig.policy.stat().st_mtime_ns) == before
 
 
@@ -284,17 +284,17 @@ def test_ingress_deny_audit_is_one_rate_limited_aggregate_per_ip(rig):
         rig.client.get("/auth/password-login?token=SECRET", headers={"Authorization": "Bearer SECRET"},
                        cookies={"s": "SECRET"})
         rig.clock.advance(0.5)
-    assert not rig.deny_log.exists() or rig.deny_log.read_text() == ""  # nothing per-request
+    assert not rig.deny_log.exists() or rig.deny_log.read_text(encoding="utf-8-sig") == ""  # nothing per-request
     rig.clock.advance(61)
     rig.mw.flush()
-    lines = [json.loads(line) for line in rig.deny_log.read_text(encoding="utf-8").splitlines()]
+    lines = [json.loads(line) for line in rig.deny_log.read_text(encoding="utf-8-sig").splitlines()]
     assert len(lines) == 1
     rec = lines[0]
     assert rec["ip"] == BLOCKED and rec["count"] == n and rec["first"] <= rec["last"]
-    assert "SECRET" not in rig.deny_log.read_text(encoding="utf-8")
+    assert "SECRET" not in rig.deny_log.read_text(encoding="utf-8-sig")
     assert set(rec) == {"ts", "ip", "count", "first", "last", "source"}
     rig.mw.flush()  # nothing new -> nothing appended
-    assert len(rig.deny_log.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(rig.deny_log.read_text(encoding="utf-8-sig").splitlines()) == 1
     assert (_sha(rig.policy), rig.policy.stat().st_mtime_ns) == before
 
 
@@ -304,7 +304,7 @@ def test_deny_aggregate_flushes_itself_after_the_interval_without_per_request_li
         rig.client.get("/")
     rig.mono.advance(61)
     rig.client.get("/")  # interval elapsed: this deny triggers the flush of the previous window
-    lines = [json.loads(x) for x in rig.deny_log.read_text(encoding="utf-8").splitlines()]
+    lines = [json.loads(x) for x in rig.deny_log.read_text(encoding="utf-8-sig").splitlines()]
     assert sum(r["count"] for r in lines) >= 3
 
 
