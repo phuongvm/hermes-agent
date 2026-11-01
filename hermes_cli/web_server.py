@@ -209,6 +209,7 @@ def _get_pty_active_session_files(app: FastAPI) -> dict[str, Path]:
 app = FastAPI(title="Hermes Agent", version=get_version_info().base_version, lifespan=app_lifespan)
 
 from hermes_cli.dashboard_auth.body_limit import AuthBodyLimitMiddleware
+from hermes_cli.dashboard_auth.ip_policy import RadarIpPolicyMiddleware
 
 # Register first (innermost): auth gates run before this, JSON parsing after it.
 app.add_middleware(AuthBodyLimitMiddleware)
@@ -646,6 +647,10 @@ class _LocalOriginCORSMiddleware(CORSMiddleware):
 # Without this, an OPTIONS preflight from a cross-origin SPA hits the auth
 # middlewares before CORS can answer, producing 401 instead of 204 + headers.
 app.add_middleware(_LocalOriginCORSMiddleware, allow_methods=["*"], allow_headers=["*"])
+
+# Radar IP policy ingress deny: registered after CORS so it is the outermost layer (a blocked client never
+# reaches host-header, auth, body-limit or audit work). Read-only on the policy file; see dashboard_auth/ip_policy.py.
+app.add_middleware(RadarIpPolicyMiddleware)
 
 
 # Authenticated-route self-test: one in-process request per minute against a
