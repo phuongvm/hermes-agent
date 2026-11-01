@@ -246,7 +246,8 @@ class RadarIpPolicyMiddleware:
             denied = bool(ip) and self._is_denied(ip)
             if denied:
                 self._count(str(_canonical(ip)))
-        except Exception:  # never raise into the request path
+        except Exception:  # health: allow BLE001 -- ASGI fail-open boundary: a policy-check fault must never 500 the Dashboard
+            logger.warning("radar ip policy check failed; request forwarded", exc_info=True)
             denied = False
         if not denied:
             await self.app(scope, receive, send)

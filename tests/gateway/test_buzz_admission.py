@@ -6,12 +6,20 @@ own pre-filter is checked through the ``_allowed_pubkeys`` set it builds from ``
 """
 import pytest
 
-from tests.gateway.test_buzz_authz import (
-    _isolate_env,
-    _make_runner_with_adapter,
-    _make_source,
-    buzz_registered,
-)
+from tests.gateway import test_buzz_authz as authz
+
+# Fixtures are re-exported as module attributes (pytest collects them by name); plain imports would be
+# shadowed by the test parameters of the same name (F811).
+buzz_registered = authz.buzz_registered
+_make_runner_with_adapter = authz._make_runner_with_adapter
+_make_source = authz._make_source
+
+
+@pytest.fixture(autouse=True)
+def _clean_buzz_auth_env(monkeypatch):
+    for var in authz._AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
 
 ALLOWED = "6eeda0568fee98409dc571d2d809dff0a92772fa42fe69171e8a859bb9c65a45"
 STRANGER = "b" * 64
