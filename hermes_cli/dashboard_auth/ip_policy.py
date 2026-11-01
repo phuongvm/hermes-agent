@@ -12,6 +12,8 @@ Invariants:
     keeps the last good snapshot; nothing here raises into the request path;
   * the only write is a per-IP deny aggregate appended to ``logs/ingress-deny.log`` at most once per interval.
     It is deliberately not ``dashboard-auth.log`` (Radar tails that file). No request data is recorded.
+    A blocked entry that matches an exempt peer is forwarded and recorded in the same log as an
+    ``exempt_ignored`` aggregate (ts, ip, source, reason, count), also at most once per IP per interval.
 """
 from __future__ import annotations
 
@@ -106,6 +108,7 @@ class RadarIpPolicyMiddleware:
         self._exempt: tuple = ()
         self._warned: str | None = None
         self._counts: dict[str, dict] = {}
+        self._ignored: dict[str, dict] = {}
         self._last_flush = self._mono()
 
     # ------------------------------------------------------------------ policy cache
@@ -166,13 +169,35 @@ class RadarIpPolicyMiddleware:
         if not self._blocked:
             return False
         addr = _canonical(ip)
-        if addr is None or is_exempt(addr, self._exempt):
+        if addr is None:
             return False
         now = self._now()
-        return any(
+        listed = any(
             addr in net and (expires is None or expires > now)
             for net, expires in self._blocked if net.version == addr.version
         )
+        if not listed:
+            return False
+        if is_exempt(addr):
+            self._count_ignored(str(addr), "hard_exempt")
+            return False
+        if is_exempt(addr, self._exempt):
+            self._count_ignored(str(addr), "operator_exempt")
+            return False
+        return True
+
+    def _count_ignored(self, ip: str, reason: str) -> None:
+        """Aggregate a policy entry that was bypassed because the peer is exempt (never denied)."""
+        now = self._now()
+        slot = self._ignored.get(ip)
+        if slot is None:
+            if len(self._ignored) >= MAX_ENTRIES:
+                return  # bounded: drop new keys until the next flush
+            slot = self._ignored[ip] = {"count": 0, "first": now, "last": now, "reason": reason}
+        slot["count"] += 1
+        slot["last"] = now
+        if self._mono() - self._last_flush >= FLUSH_INTERVAL_S:
+            self.flush()
 
     # ------------------------------------------------------------------ deny aggregate
     def _count(self, ip: str) -> None:
@@ -184,21 +209,28 @@ class RadarIpPolicyMiddleware:
             self.flush()
 
     def flush(self) -> None:
-        """Append one aggregate line per denied IP to ``ingress-deny.log`` and reset the counters."""
+        """Append one aggregate line per denied / exempt-ignored IP to ``ingress-deny.log`` and reset the counters."""
         self._last_flush = self._mono()
-        if not self._counts:
+        if not self._counts and not self._ignored:
             return
         counts, self._counts = self._counts, {}
+        ignored, self._ignored = self._ignored, {}
         ts = self._now()
+        records = [
+            {"ts": ts, "ip": ip, "count": slot["count"], "first": slot["first"],
+             "last": slot["last"], "source": "ingress"}
+            for ip, slot in counts.items()
+        ] + [
+            {"ts": ts, "ip": ip, "count": slot["count"], "first": slot["first"],
+             "last": slot["last"], "source": "ingress", "event": "exempt_ignored",
+             "reason": slot["reason"]}
+            for ip, slot in ignored.items()
+        ]
         try:
             path = self._log_path_fn()
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as fh:
-                fh.writelines(
-                    json.dumps({"ts": ts, "ip": ip, "count": slot["count"], "first": slot["first"],
-                                "last": slot["last"], "source": "ingress"}) + "\n"
-                    for ip, slot in counts.items()
-                )
+                fh.writelines(json.dumps(rec) + "\n" for rec in records)
         except OSError as exc:
             self._warn(f"ingress-deny log unwritable: {exc.__class__.__name__}")
 

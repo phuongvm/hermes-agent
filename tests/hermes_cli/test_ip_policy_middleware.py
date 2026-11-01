@@ -137,6 +137,59 @@ def test_operator_exempt_ips_are_never_denied(rig):
     assert rig.client.get("/").status_code == 200
 
 
+def _records(rig):
+    return [json.loads(x) for x in rig.deny_log.read_text(encoding="utf-8").splitlines()]
+
+
+def test_exempt_peer_listed_in_policy_is_forwarded_and_audited_as_ignored(rig):
+    _write(rig.policy, {"127.0.0.1": _entry(), "192.168.100.10": _entry(), "::1": _entry()})
+    before = (_sha(rig.policy), rig.policy.stat().st_mtime_ns)
+    for peer in ("127.0.0.1", "192.168.100.10", "::1"):
+        rig.peer = peer
+        for _ in range(4):
+            assert rig.client.get("/?token=SECRET", headers={"Authorization": "Bearer SECRET"}).status_code == 200
+    assert not rig.deny_log.exists() or rig.deny_log.read_text() == ""  # nothing per-request
+    rig.clock.advance(61)
+    rig.mw.flush()
+    recs = {r["ip"]: r for r in _records(rig)}
+    assert set(recs) == {"127.0.0.1", "192.168.100.10", "::1"}
+    for rec in recs.values():
+        assert rec["event"] == "exempt_ignored" and rec["reason"] == "hard_exempt"
+        assert rec["count"] == 4 and rec["source"] == "ingress" and rec["ts"] and rec["first"] <= rec["last"]
+    assert "SECRET" not in rig.deny_log.read_text(encoding="utf-8")
+    assert (_sha(rig.policy), rig.policy.stat().st_mtime_ns) == before
+
+
+def test_operator_exempt_entry_is_audited_with_its_own_reason(rig):
+    _write(rig.policy, {BLOCKED: _entry()}, exempt_ips=[BLOCKED])
+    assert rig.client.get("/").status_code == 200
+    rig.mw.flush()
+    (rec,) = _records(rig)
+    assert (rec["ip"], rec["event"], rec["reason"], rec["count"]) == (BLOCKED, "exempt_ignored", "operator_exempt", 1)
+
+
+def test_exempt_peer_not_listed_or_expired_is_not_audited(rig):
+    _write(rig.policy, {BLOCKED: _entry(), "10.9.9.9": _entry(expires_at=NOW - 5)})
+    rig.peer = "127.0.0.1"
+    assert rig.client.get("/").status_code == 200  # exempt, but no policy entry matches it
+    rig.peer = "10.9.9.9"
+    assert rig.client.get("/").status_code == 200  # entry expired -> nothing was ignored
+    rig.mw.flush()
+    assert not rig.deny_log.exists()
+
+
+def test_exempt_ignored_audit_is_rate_limited_and_self_flushes(rig):
+    _write(rig.policy, {"127.0.0.1": _entry()})
+    rig.peer = "127.0.0.1"
+    for _ in range(50):
+        rig.client.get("/")
+    assert not rig.deny_log.exists()
+    rig.mono.advance(61)
+    rig.client.get("/")  # interval elapsed -> previous window flushed as one line
+    lines = _records(rig)
+    assert len(lines) == 1 and lines[0]["count"] == 51
+
+
 def test_spoofed_forwarded_for_header_is_ignored(rig):
     _write(rig.policy, {BLOCKED: _entry()})
     resp = rig.client.get("/", headers={"X-Forwarded-For": "127.0.0.1", "CF-Connecting-IP": "127.0.0.1"})
