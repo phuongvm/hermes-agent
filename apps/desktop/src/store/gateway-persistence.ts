@@ -195,6 +195,7 @@ export function startPersistentGateways(): () => void {
     reauthPaused.clear()
     recheckLocalAndReconcile()
   })
+
   const offPrimary = $primaryGatewayRoute.listen(onPrimaryRoute)
   const timer = setInterval(reconcile, REDIAL_INTERVAL_MS)
 
