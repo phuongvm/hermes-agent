@@ -360,3 +360,33 @@ it('re-pauses when the redial after a registry update is rejected with reauth ag
 
   expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(0)
 })
+
+
+it('ignores a reauth rejection from a dial that started before the registry update (sign in wins)', async () => {
+  let rejectStale: (error: Error) => void = () => undefined
+  let homelabCalls = 0
+  openGatewayForAgent.mockImplementation((id: string) => {
+    if (id === 'homelab' && ++homelabCalls === 1) {
+      return new Promise<undefined>((_resolve, reject) => {
+        rejectStale = reject
+      })
+    }
+
+    return Promise.resolve(undefined)
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+
+  // Sign in re-arms while the pre-sign-in dial is still pending.
+  $connectionsRegistry.set(registry(['local', 'homelab', 'vps']))
+  await vi.advanceTimersByTimeAsync(0)
+  expect(homelabCalls).toBe(2)
+
+  // The stale attempt now fails; it must not re-park the gateway.
+  rejectStale(new GatewayReauthRequiredError('Gateway sign-in required'))
+  await vi.advanceTimersByTimeAsync(0)
+  openGatewayForAgent.mockClear()
+  await vi.advanceTimersByTimeAsync(30_000)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(1)
+})

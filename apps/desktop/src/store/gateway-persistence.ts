@@ -76,6 +76,10 @@ export function startPersistentGateways(): () => void {
   // Gateways whose last dial was rejected for reauth: skipped by timer ticks
   // until the registry changes (sign in / edit) or they go live.
   const reauthPaused = new Set<string>()
+  // Bumped on every registry update and on teardown. A dial started under an
+  // older generation may reject after sign-in already re-armed the gateway;
+  // its failure is stale and must not park the fresh attempt again.
+  let reauthGeneration = 0
 
   // This device's install verdict. "Installed" is re-checked before every
   // dial (an install can go away while the window lives, and dialing it then
@@ -160,8 +164,10 @@ export function startPersistentGateways(): () => void {
       // The kept route itself: another profile's open socket on the same
       // gateway does not carry this one.
       if (!gatewayRouteState(connectionId, HOME_PROFILE).open && !reauthPaused.has(connectionId)) {
+        const dialReauthGeneration = reauthGeneration
+
         void dial(connectionId, localInstalled, () => stillWanted(connectionId, generation)).catch((error: unknown) => {
-          if (needsReauth(error)) {
+          if (dialReauthGeneration === reauthGeneration && needsReauth(error)) {
             reauthPaused.add(connectionId)
           }
         })
@@ -192,6 +198,7 @@ export function startPersistentGateways(): () => void {
 
   // A registry update (sign in, edit, reload) re-arms every paused gateway.
   const offRegistry = $connectionsRegistry.subscribe(() => {
+    reauthGeneration += 1
     reauthPaused.clear()
     recheckLocalAndReconcile()
   })
@@ -201,6 +208,7 @@ export function startPersistentGateways(): () => void {
 
   return () => {
     clearInterval(timer)
+    reauthGeneration += 1
     reauthPaused.clear()
     offRegistry()
     offPrimary()
