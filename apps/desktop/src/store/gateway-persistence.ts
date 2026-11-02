@@ -1,5 +1,6 @@
-import { LOCAL_CONNECTION_ID } from '@hermes/shared'
+import { isGatewayReauthRequired, LOCAL_CONNECTION_ID } from '@hermes/shared'
 
+import { isRemoteReauthError } from '@/components/boot-failure-reauth'
 import type { DesktopConnectionsRegistry, DesktopRegistryConnection } from '@/global'
 import { localBootstrapNeeded } from '@/lib/local-backend-probe'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
@@ -51,14 +52,30 @@ async function dial(
     return
   }
 
-  // A gateway that is down or needs sign-in fails this dial; the next tick
-  // (every REDIAL_INTERVAL_MS) tries again.
+  // A gateway that is down fails this dial and the next tick (every
+  // REDIAL_INTERVAL_MS) tries again; one that needs sign-in is parked instead.
   await openGatewayForAgent(connectionId, HOME_PROFILE)
+}
+
+/** The dial was rejected for want of a signed-in session. Electron IPC strips
+ *  `needsOauthLogin` off the Error, so the message is checked too. Redialing
+ *  cannot fix this; only the user signing in can. */
+function needsReauth(error: unknown): boolean {
+  if (isGatewayReauthRequired(error)) {
+    return true
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return isRemoteReauthError(message) || (message.includes('401') && message.toLowerCase().includes('no_cookie'))
 }
 
 /** Start keeping every registered gateway connected. Returns the teardown. */
 export function startPersistentGateways(): () => void {
   const pins = new Map<string, () => void>()
+  // Gateways whose last dial was rejected for reauth: skipped by timer ticks
+  // until the registry changes (sign in / edit) or they go live.
+  const reauthPaused = new Set<string>()
 
   // This device's install verdict. "Installed" is re-checked before every
   // dial (an install can go away while the window lives, and dialing it then
@@ -129,6 +146,12 @@ export function startPersistentGateways(): () => void {
       }
     }
 
+    for (const connectionId of reauthPaused) {
+      if (!wanted.has(connectionId) || gatewayRouteState(connectionId, HOME_PROFILE).open) {
+        reauthPaused.delete(connectionId)
+      }
+    }
+
     for (const connectionId of wanted) {
       if (!pins.has(connectionId)) {
         pins.set(connectionId, keepRoute(connectionId, HOME_PROFILE))
@@ -136,8 +159,12 @@ export function startPersistentGateways(): () => void {
 
       // The kept route itself: another profile's open socket on the same
       // gateway does not carry this one.
-      if (!gatewayRouteState(connectionId, HOME_PROFILE).open) {
-        void dial(connectionId, localInstalled, () => stillWanted(connectionId, generation)).catch(() => undefined)
+      if (!gatewayRouteState(connectionId, HOME_PROFILE).open && !reauthPaused.has(connectionId)) {
+        void dial(connectionId, localInstalled, () => stillWanted(connectionId, generation)).catch((error: unknown) => {
+          if (needsReauth(error)) {
+            reauthPaused.add(connectionId)
+          }
+        })
       }
     }
   }
@@ -163,12 +190,17 @@ export function startPersistentGateways(): () => void {
     }
   }
 
-  const offRegistry = $connectionsRegistry.subscribe(recheckLocalAndReconcile)
+  // A registry update (sign in, edit, reload) re-arms every paused gateway.
+  const offRegistry = $connectionsRegistry.subscribe(() => {
+    reauthPaused.clear()
+    recheckLocalAndReconcile()
+  })
   const offPrimary = $primaryGatewayRoute.listen(onPrimaryRoute)
   const timer = setInterval(reconcile, REDIAL_INTERVAL_MS)
 
   return () => {
     clearInterval(timer)
+    reauthPaused.clear()
     offRegistry()
     offPrimary()
 

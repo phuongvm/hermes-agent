@@ -1,3 +1,4 @@
+import { GatewayReauthRequiredError } from '@hermes/shared'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import type { DesktopConnectionsRegistry } from '@/global'
@@ -54,7 +55,8 @@ beforeEach(() => {
   live.clear()
   liveNamedProfile.clear()
   keepRoute.mockClear()
-  openGatewayForAgent.mockClear()
+  openGatewayForAgent.mockReset()
+  openGatewayForAgent.mockResolvedValue(undefined)
   $primaryGatewayRoute.set({ connectionId: 'local', mode: 'local' })
   $connectionsRegistry.set(registry(['local', 'homelab', 'vps']))
 })
@@ -278,4 +280,83 @@ it('drops a This device dial still waiting on its probe once the primary route i
   answer({ bootstrapNeeded: false })
   await vi.advanceTimersByTimeAsync(0)
   expect(dialedRoutes()).not.toContainEqual(['local', 'default'])
+})
+
+const IPC_REAUTH = new Error(
+  `Error invoking remote method 'hermes:connection:for': Error: Remote Hermes gateway uses OAuth, but you are not signed in. Open Settings → Gateway and click "Sign in", or switch back to Local.`
+)
+
+it('keeps redialing a transient network failure on every tick', async () => {
+  openGatewayForAgent.mockImplementation(async (id: string) => {
+    if (id === 'homelab') {
+      throw new Error('ECONNREFUSED')
+    }
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+  openGatewayForAgent.mockClear()
+
+  await vi.advanceTimersByTimeAsync(30_000)
+  await vi.advanceTimersByTimeAsync(30_000)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(2)
+})
+
+it.each([
+  ['GatewayReauthRequiredError', () => new GatewayReauthRequiredError('Gateway sign-in required')],
+  ['needsOauthLogin flag', () => Object.assign(new Error('x'), { needsOauthLogin: true })],
+  ['IPC-serialized reauth message', () => IPC_REAUTH],
+  ['401 no_cookie', () => new Error('ws-ticket failed: 401 no_cookie')]
+])('pauses the 30s redial of a gateway that rejects with reauth (%s) and keeps dialing the others', async (_n, make) => {
+  openGatewayForAgent.mockImplementation(async (id: string) => {
+    if (id === 'homelab') {
+      throw make()
+    }
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(1)
+  openGatewayForAgent.mockClear()
+
+  await vi.advanceTimersByTimeAsync(30_000)
+  await vi.advanceTimersByTimeAsync(30_000)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(0)
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'vps')).toHaveLength(2)
+})
+
+it('resumes dialing a reauth-paused gateway immediately when the registry updates on sign in', async () => {
+  let signedIn = false
+  openGatewayForAgent.mockImplementation(async (id: string) => {
+    if (id === 'homelab' && !signedIn) {
+      throw new GatewayReauthRequiredError('Gateway sign-in required')
+    }
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+  await vi.advanceTimersByTimeAsync(30_000)
+  openGatewayForAgent.mockClear()
+
+  signedIn = true
+  $connectionsRegistry.set(registry(['local', 'homelab', 'vps']))
+  await vi.advanceTimersByTimeAsync(0)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(1)
+})
+
+it('re-pauses when the redial after a registry update is rejected with reauth again', async () => {
+  openGatewayForAgent.mockImplementation(async (id: string) => {
+    if (id === 'homelab') {
+      throw IPC_REAUTH
+    }
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+  $connectionsRegistry.set(registry(['local', 'homelab', 'vps']))
+  await vi.advanceTimersByTimeAsync(0)
+  openGatewayForAgent.mockClear()
+
+  await vi.advanceTimersByTimeAsync(60_000)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(0)
 })
