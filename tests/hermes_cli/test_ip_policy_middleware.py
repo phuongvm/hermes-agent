@@ -331,6 +331,10 @@ def test_is_exempt(ip, expected):
 def test_registered_outermost_in_web_server():
     import hermes_cli.web_server as ws
 
-    names = [m.cls.__name__ for m in ws.app.user_middleware]
-    assert names[0] == "RadarIpPolicyMiddleware"  # Starlette: index 0 = outermost
-    assert "CORSMiddleware" in names and names.index("CORSMiddleware") > 0
+    from starlette.middleware.cors import CORSMiddleware
+
+    classes = [m.cls for m in ws.app.user_middleware]
+    assert classes[0].__name__ == "RadarIpPolicyMiddleware"  # Starlette: index 0 = outermost
+    # CORS may be a CORSMiddleware subclass (e.g. _LocalOriginCORSMiddleware).
+    cors_idx = [i for i, c in enumerate(classes) if issubclass(c, CORSMiddleware)]
+    assert cors_idx and cors_idx[0] > 0
