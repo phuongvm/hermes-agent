@@ -390,3 +390,53 @@ it('ignores a reauth rejection from a dial that started before the registry upda
 
   expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(1)
 })
+
+it('resumes dialing a reauth-paused gateway immediately when the primary route changes', async () => {
+  let rejected = false
+  openGatewayForAgent.mockImplementation(async (id: string) => {
+    if (id === 'homelab' && !rejected) {
+      rejected = true
+      throw IPC_REAUTH
+    }
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+  openGatewayForAgent.mockClear()
+
+  // Paused: the 30s tick does not redial it.
+  await vi.advanceTimersByTimeAsync(30_000)
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(0)
+
+  $primaryGatewayRoute.set({ connectionId: 'vps', mode: 'remote' })
+  await vi.advanceTimersByTimeAsync(0)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(1)
+})
+
+it('ignores a reauth rejection from a dial that started before the primary route changed', async () => {
+  let rejectStale: (error: Error) => void = () => undefined
+  let homelabCalls = 0
+  openGatewayForAgent.mockImplementation((id: string) => {
+    if (id === 'homelab' && ++homelabCalls === 1) {
+      return new Promise<undefined>((_resolve, reject) => {
+        rejectStale = reject
+      })
+    }
+
+    return Promise.resolve(undefined)
+  })
+  stop = startPersistentGateways()
+  await vi.advanceTimersByTimeAsync(0)
+
+  // Route change (local -> vps) re-arms while the earlier dial is still pending.
+  $primaryGatewayRoute.set({ connectionId: 'vps', mode: 'remote' })
+  await vi.advanceTimersByTimeAsync(0)
+  expect(homelabCalls).toBe(2)
+
+  rejectStale(IPC_REAUTH)
+  await vi.advanceTimersByTimeAsync(0)
+  openGatewayForAgent.mockClear()
+  await vi.advanceTimersByTimeAsync(30_000)
+
+  expect(openGatewayForAgent.mock.calls.filter(([id]) => id === 'homelab')).toHaveLength(1)
+})

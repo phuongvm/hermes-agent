@@ -1,7 +1,6 @@
 import {
   type ConnectionState,
   type GatewayEvent,
-  isGatewayReauthRequired,
   isStableOpen,
   reconnectBackoffDelayMs,
   registryBackendScopeKey,
@@ -20,6 +19,7 @@ import {
   LIVENESS_REPROBE_DELAY_MS,
   probeGatewayLiveness
 } from '@/lib/gateway-liveness-policy'
+import { isGatewayReauthError } from '@/lib/gateway-reauth-error'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { traceIdentityChange } from '@/lib/identity-trace'
 import { isPermanentLocalGatewayEnsureError } from '@/lib/local-gateway-ensure-failure'
@@ -759,8 +759,11 @@ async function openSecondary(entry: Secondary): Promise<void> {
   try {
     await pending
   } catch (error) {
-    if (isGatewayReauthRequired(error) && g.secondaries.get(entry.scope) === entry) {
-      g.reauthFailures.set(entry.scope, { connectionId: entry.connectionId, error })
+    if (isGatewayReauthError(error) && g.secondaries.get(entry.scope) === entry) {
+      g.reauthFailures.set(entry.scope, {
+        connectionId: entry.connectionId,
+        error: error instanceof Error ? error : new Error(String(error))
+      })
       entry.wantOpen = false
       clearTimer(entry)
     }
@@ -822,7 +825,7 @@ function rearmSecondary(entry: Secondary, priority: SpawnPriority = 'foreground'
 
 function recordDialFailure(entry: Secondary, error?: unknown): void {
   // Auth rejection has its own ledger (reauthFailures) that already fails background callers fast.
-  if (error !== undefined && isGatewayReauthRequired(error)) {
+  if (error !== undefined && isGatewayReauthError(error)) {
     return
   }
 
@@ -899,7 +902,7 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
     // could slip a dial in between two ladder attempts on an older, expired window.
     recordDialFailure(entry, error)
 
-    if (isGatewayReauthRequired(error)) {
+    if (isGatewayReauthError(error)) {
       notifyError(error, translateNow('boot.errors.gatewaySignInRequired'), { action: RECOVERY_ACTIONS.openGateways() })
 
       return

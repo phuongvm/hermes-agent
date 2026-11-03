@@ -1,7 +1,7 @@
-import { isGatewayReauthRequired, LOCAL_CONNECTION_ID } from '@hermes/shared'
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 
-import { isRemoteReauthError } from '@/components/boot-failure-reauth'
 import type { DesktopConnectionsRegistry, DesktopRegistryConnection } from '@/global'
+import { isGatewayReauthError } from '@/lib/gateway-reauth-error'
 import { localBootstrapNeeded } from '@/lib/local-backend-probe'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { gatewayRouteState, openGatewayForAgent } from '@/store/gateway'
@@ -55,19 +55,6 @@ async function dial(
   // A gateway that is down fails this dial and the next tick (every
   // REDIAL_INTERVAL_MS) tries again; one that needs sign-in is parked instead.
   await openGatewayForAgent(connectionId, HOME_PROFILE)
-}
-
-/** The dial was rejected for want of a signed-in session. Electron IPC strips
- *  `needsOauthLogin` off the Error, so the message is checked too. Redialing
- *  cannot fix this; only the user signing in can. */
-function needsReauth(error: unknown): boolean {
-  if (isGatewayReauthRequired(error)) {
-    return true
-  }
-
-  const message = error instanceof Error ? error.message : String(error ?? '')
-
-  return isRemoteReauthError(message) || (message.includes('401') && message.toLowerCase().includes('no_cookie'))
 }
 
 /** Start keeping every registered gateway connected. Returns the teardown. */
@@ -167,7 +154,7 @@ export function startPersistentGateways(): () => void {
         const dialReauthGeneration = reauthGeneration
 
         void dial(connectionId, localInstalled, () => stillWanted(connectionId, generation)).catch((error: unknown) => {
-          if (dialReauthGeneration === reauthGeneration && needsReauth(error)) {
+          if (dialReauthGeneration === reauthGeneration && isGatewayReauthError(error)) {
             reauthPaused.add(connectionId)
           }
         })
@@ -190,6 +177,9 @@ export function startPersistentGateways(): () => void {
     primaryRoute = route
 
     if (changed) {
+      // A different primary route re-arms every paused gateway, like a registry update.
+      reauthGeneration += 1
+      reauthPaused.clear()
       recheckLocalAndReconcile()
     } else {
       reconcile()

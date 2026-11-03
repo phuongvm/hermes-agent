@@ -317,4 +317,32 @@ describe('background remote turn reconnect', () => {
       expect(sockets.filter(socket => socket.url === remoteUrl)).toHaveLength(2)
     }
   )
+
+  it('parks a secondary whose reconnect is rejected with an IPC-serialized reauth error', async () => {
+    const submitted = requestForSessionProfile(owner, ambient, 'prompt.submit', {
+      session_id: sessionId,
+      text: 'background work'
+    })
+
+    await vi.advanceTimersByTimeAsync(10)
+    await submitted
+    publish('message.start', {})
+
+    const getConnectionFor = vi.mocked(window.hermesDesktop!.getConnectionFor!)
+    // Electron structured clone keeps only the message: no class, no needsOauthLogin.
+    getConnectionFor.mockClear()
+    getConnectionFor.mockRejectedValue(
+      new Error(
+        `Error invoking remote method 'hermes:connection:for': Error: Remote Hermes gateway uses OAuth, but you are not signed in. Open Settings → Gateway and click "Sign in", or switch back to Local.`
+      )
+    )
+
+    sockets.find(socket => socket.url === remoteUrl)!.networkDrop()
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    // One failed reconnect attempt parks the gateway: no backoff ladder, no new sockets.
+    expect(getConnectionFor).toHaveBeenCalledTimes(1)
+    expect(sockets.filter(socket => socket.url === remoteUrl)).toHaveLength(1)
+  })
 })
