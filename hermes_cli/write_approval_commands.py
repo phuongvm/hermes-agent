@@ -22,6 +22,7 @@ EFFECTIVE_STATUSES = frozenset({
     "BLOCKED_SECURITY_SCAN_PREEXISTING",
     "REVISE_DEPENDENCY_BLOCKED",
     "BLOCKED_MANIFEST",
+    "BLOCKED_LAYER0_EVAL",
     "FAILED",
 })
 EXECUTION_STATUSES = frozenset({"NOT_STARTED", "COMPLETED", "PARTIAL", "FAILED", "BLOCKED"})
@@ -214,6 +215,38 @@ def _new_pending_result(subsystem: str, pending_id: str) -> dict:
     }
 
 
+def _run_layer0_eval(skill_dir: Path, timeout_s: float = 5.0):
+    """Layer 0 evaluator seam (isolated interpreter, hard timeout). Tests replace this callable."""
+    from hermes_cli.pending_skill_layer0 import run_layer0_eval
+    return run_layer0_eval(skill_dir, timeout_s=timeout_s)
+
+
+def _evaluate_pending_skill_layer0_staged(
+    record: dict, canonical_match: Optional[Path] = None, *, timeout_s: float = 5.0
+) -> dict:
+    """Fail-closed staged Layer 0 gate for one pending skill record.
+
+    Stages the candidate skill state in a temp dir and runs ``evaluate_skill_layer0`` on it; the live skill
+    directory and the pending queue are never touched. A failed verdict or ANY staging/import/timeout/
+    malformed-verdict error returns ``effective_status == "BLOCKED_LAYER0_EVAL"`` (see
+    :mod:`hermes_cli.pending_skill_layer0`).
+    """
+    try:
+        from hermes_cli.pending_skill_layer0 import evaluate_pending_skill_layer0_staged
+    except Exception as exc:  # the gate module itself is unavailable: still fail closed
+        return {
+            "passed": False, "success": False, "governance_verdict": "REVISE",
+            "native_disposition": "NOT_ATTEMPTED", "effective_status": "BLOCKED_LAYER0_EVAL",
+            "replayed": False, "discarded": False, "layer0_verdict": None,
+            "layer0_error": f"{type(exc).__name__}: {exc}"[:500],
+        }
+    return evaluate_pending_skill_layer0_staged(
+        record, canonical_match, timeout_s=timeout_s,
+        resolve_canonical=_find_canonical_skill_matches,
+        run_eval=lambda skill_dir: _run_layer0_eval(skill_dir, timeout_s),
+    )
+
+
 def _dispose_pending_native(
     subsystem: str,
     pending_id: str,
@@ -232,6 +265,26 @@ def _dispose_pending_native(
         return result
     payload = record.get("payload") or {}
     result["target"] = payload.get("name") or payload.get("target")
+    if replay and subsystem == wa.SKILLS:
+        gate = _evaluate_pending_skill_layer0_staged(record)
+        if not gate.get("passed"):
+            return {
+                "success": False,
+                "subsystem": subsystem,
+                "pending_id": pending_id,
+                "target": result["target"],
+                "replayed": False,
+                "discarded": False,
+                "effective_status": "BLOCKED_LAYER0_EVAL",
+                "governance_verdict": "REVISE",
+                "native_disposition": "NOT_ATTEMPTED",
+                "layer0_verdict": gate.get("layer0_verdict"),
+                "layer0_error": gate.get("layer0_error"),
+                "error": gate.get("layer0_error") or "Layer 0 gate failed: " + "; ".join(
+                    ((gate.get("layer0_verdict") or {}).get("linter_errors") or [])
+                    or ["verdict.passed is False"]
+                ),
+            }
     if replay:
         ok, message, applier_result = _apply_one(subsystem, record, memory_store)
         if not ok:
@@ -510,6 +563,22 @@ def preflight_pending_skill_review() -> dict:
                 result["resolver_candidates"] = [
                     str(path.resolve()) for path in matches
                 ]
+        # Authoritative staged Layer 0 gate: every resolvable record (create with no canonical
+        # match, or a single canonical match) is judged on its staged candidate state before it can
+        # keep or receive an APPROVE/REVISE-eligible status. Read-only: staging lives in a temp dir.
+        if result["effective_status"] in {"APPROVE", "REVISE"} and (
+            (action == "create" and len(matches) == 0) or len(matches) == 1
+        ):
+            gate = _evaluate_pending_skill_layer0_staged(
+                record, matches[0] if len(matches) == 1 else None
+            )
+            result["layer0_passed"] = bool(gate.get("passed"))
+            if not gate.get("passed"):
+                result["governance_verdict"] = "REVISE"
+                result["native_disposition"] = "NOT_ATTEMPTED"
+                result["effective_status"] = "BLOCKED_LAYER0_EVAL"
+                result["layer0_verdict"] = gate.get("layer0_verdict")
+                result["layer0_error"] = gate.get("layer0_error")
         results.append(result)
 
     final_records = wa.list_pending(wa.SKILLS)
