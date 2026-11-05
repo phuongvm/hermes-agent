@@ -281,7 +281,7 @@ def _verify_core_workspace_locks(package, *, explicit: bool) -> None:
     import tomli_w
     from pm.environment import managed_environment
     from pm.native_build import source_build_environment
-    from pm.workspace import _copy_core_inputs, _solve_only_for, _without_release_age
+    from pm.workspace import _copy_core_inputs, _solve_only_for, _target_environment, _without_release_age
 
     project = package.project_root()
     with tempfile.TemporaryDirectory(prefix="pm-core-lock-") as scratch:
@@ -295,7 +295,7 @@ def _verify_core_workspace_locks(package, *, explicit: bool) -> None:
         uv_policy = document.setdefault("tool", {}).setdefault("uv", {})
         uv_policy.pop("exclude-newer", None)
         uv_policy.pop("exclude-newer-package", None)
-        _solve_only_for(uv_policy, environment.python)
+        _solve_only_for(uv_policy, _target_environment(environment.python))
         _copy_core_inputs(project, root)
         (root / "pyproject.toml").write_text(_without_release_age(tomli_w.dumps(document)), encoding="utf-8")
         lock = project / "uv.lock"
