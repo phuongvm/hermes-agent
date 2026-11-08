@@ -4658,7 +4658,6 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
-# ownership guard inserted below (PR #93084)
 def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
     """Return True when ``--replace`` must refuse to signal ``existing_pid``.
     A poisoned/stale PID record can point at another profile's LIVE gateway (cross-profile SIGTERM
@@ -4698,8 +4697,6 @@ def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
     # planned-stop watcher never gets a chance to drain. Reading the raw pidfile + lock records (no
     # validation, no unlink side effects) is strictly safer for a KILL exclusion list: a stale recorded PID
     # at worst spares one process this sweep, while a validation false-negative would kill a live gateway.
-    # The validated probe is still consulted for the runtime-status fallback PID it can surface when no
-    # pidfile exists.
     try:
         from gateway.status import (
             _get_pid_path, _get_process_hermes_home, _get_process_start_time, _pid_from_record,
@@ -4712,6 +4709,9 @@ def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
 
         # Bound claim: the record must name THIS pid with THIS live start time, else it proves nothing.
         record = _read_pid_record(_get_pid_path())
+        if _pid_from_record(record if isinstance(record, dict) else None) != existing_pid:
+            lock_rec = _read_pid_record(Path(our_home) / "gateway.lock")
+            record = lock_rec if isinstance(lock_rec, dict) and _pid_from_record(lock_rec) == existing_pid else record
         if not isinstance(record, dict) or not _record_looks_like_gateway(record):
             return refuse("no valid gateway pid record to prove ownership of PID %s.", existing_pid)
         record_pid = _pid_from_record(record)
@@ -4785,9 +4785,9 @@ def _looks_like_profile_conflict_from_cmdline(command: str, our_home) -> bool:
         value = _flag_value(flag)
         if value is None:
             continue
-        # Named-profile home: a DIFFERENT explicit profile contradicts it (legacy default argv never carried
-        # profile flags). Default/root home: ANY explicit named-profile flag contradicts it.
-        if profile_name is None or profile_name == "default" or value != profile_name:
+        # Named-profile home: a DIFFERENT explicit profile contradicts it. Default/root home:
+        # spawn_unmanaged_gateway passes ``--profile default``, so only a non-default flag contradicts it.
+        if value != (profile_name or "default"):
             return True
     home_value = _flag_value("--hermes-home") or _env_home_value()
     return bool(home_value is not None and _norm(home_value) != _norm(str(our_home)))

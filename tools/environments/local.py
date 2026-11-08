@@ -1155,6 +1155,15 @@ class LocalEnvironment(BaseEnvironment):
         if login:
             cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+        if _IS_WINDOWS and len(cmd_string) > 7000:
+            script_file = f"{self._snapshot_path}.tmp.cmd-{os.urandom(4).hex()}.sh"
+            quoted_script = _quote_bash_path(script_file)
+            Path(script_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(script_file).write_text(
+                f"rm -f -- {quoted_script} 2>/dev/null || true\n{cmd_string}",
+                encoding="utf-8",
+            )
+            cmd_string = f"source {quoted_script}"
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands

@@ -150,13 +150,11 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
     profile's value. Values stay in environment memory and never enter the command string."""
     save: list[str] = []
     restore: list[str] = []
-    for name in names:
-        marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
-        present, value = f"{marker}_PRESENT", f"{marker}_VALUE"
-        save += [f"{present}=${{{name}+x}}", f"{value}=${{{name}-}}"]
-        restore += [
-            f'if [ "${present}" = x ]; then export {name}="${value}"; else unset {name}; fi',
-            f"unset {present} {value}"]
+    for i, name in enumerate(names):
+        present, value = f"_hp{i}p", f"_hp{i}v"
+        save.append(f"{present}=${{{name}+x}} {value}=${{{name}-}}")
+        restore.append(
+            f'if [ "${present}" = x ]; then export {name}="${value}"; else unset {name}; fi; unset {present} {value}')
     return save, restore
 
 

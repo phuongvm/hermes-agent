@@ -237,3 +237,12 @@ def test_console_script_runs_in_the_selected_profile(tmp_path, flags, profile):
 
     served = [line for line in out.stdout.splitlines() if line.startswith("SERVED ")]
     assert served == [f"SERVED {root / 'profiles' / profile if profile else root}"], out.stdout + out.stderr
+
+
+def test_buzz_managed_agent_bypasses_gateway_acp_agent(monkeypatch):
+    """Under BUZZ_MANAGED_AGENT=1, HermesACPAgent() stays in-process instead of spawning GatewayACPAgent."""
+    from acp_adapter.server import HermesACPAgent
+
+    monkeypatch.setenv("BUZZ_MANAGED_AGENT", "1")
+    agent = HermesACPAgent()
+    assert isinstance(agent, HermesACPAgent)

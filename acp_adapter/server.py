@@ -282,7 +282,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     _EDIT_APPROVAL_POLICY_TO_MODE = _modes.EDIT_APPROVAL_POLICY_TO_MODE
 
     def __new__(cls, session_manager=None):
-        if session_manager is None:
+        if session_manager is None and not os.environ.get("BUZZ_MANAGED_AGENT"):
             from acp_adapter.gateway_server import GatewayACPAgent
             return GatewayACPAgent()
         return super().__new__(cls)

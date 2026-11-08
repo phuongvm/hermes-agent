@@ -268,6 +268,8 @@ class TestArgvConsistencyCheck:
         root = Path("/home/x/.hermes")
         assert conflict("python -m x --profile sam run", root) is True
         assert conflict("python -m x -p sam run", root) is True
+        assert conflict("python -m x --profile default run", root) is False
+        assert conflict("python -m x -p default run", root) is False
         assert conflict("python -m x run", root) is False
 
     def test_consistency_contradiction_refuses_even_with_agreeing_record(
