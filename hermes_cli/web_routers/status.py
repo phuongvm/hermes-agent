@@ -6,15 +6,19 @@ Extracted from ``hermes_cli.web_server``; app state and helpers are late-bound t
 """
 
 import concurrent.futures
+import copy
 import importlib
 import logging
 import re
 import asyncio
 import os
+import sqlite3
 import sys
+import threading
 import time
+from contextlib import closing
 from fastapi import APIRouter
-from hermes_cli.web_deps import LateState, late
+from hermes_cli.web_deps import LateState, _server, late
 from hermes_cli.web_server_gateway import _display_system_platform
 from starlette.concurrency import run_in_threadpool
 from fastapi import HTTPException, Request
@@ -31,7 +35,7 @@ from hermes_constants import get_process_hermes_home, profile_name_for_home
 from hermes_cli.web_models import CuratorPause, LearningNodeRef, LearningNodeEdit, DebugShareRequest
 from hermes_cli.web_routers._common import config_scoped_to_thread, destructive_profile, scoped_to_thread
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional, Tuple, TypedDict
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -65,22 +69,148 @@ _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.
 _STATUS_ACTIVE_SESSIONS_TIMEOUT = 0.75
 _GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
 _HEALTHY_PLATFORM_STATES = {"connected", "running", "ok"}
+_STATUS_ACTIVE_SESSION_WINDOW_S = 300.0
 
 
-def _safe_call(mod, fn_name: str, default):
+class StateDbStatusResult(TypedDict):
+    active_sessions: int
+    fts_rebuild: Optional[dict[str, Any]]
+    storage_component: dict[str, str]
+
+
+def _probe_sqlite_master_and_quickcheck(conn: sqlite3.Connection) -> dict[str, str]:
     try:
-        fn = getattr(mod, fn_name, None)
-        return fn() if callable(fn) else default
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+        row = conn.execute("PRAGMA quick_check(1)").fetchone()
+        if row and str(row[0]).lower() != "ok":
+            return {"status": "degraded", "reason": "corrupt"}
+        return {"status": "ok"}
+    except sqlite3.DatabaseError:
+        return {"status": "degraded", "reason": "corrupt"}
     except Exception:
-        return default
+        return {"status": "degraded"}
+
+
+def probe_state_db_status(
+    db_path: Path,
+    *,
+    active_window_s: float = _STATUS_ACTIVE_SESSION_WINDOW_S,
+    now: float | None = None,
+) -> StateDbStatusResult:
+    """Single-pass read-only inspection of state.db for /api/status.
+
+    Opens at most one SQLite connection (mode=ro, query_only=1) and extracts:
+    1. storage readiness (sqlite_master + quick_check),
+    2. active session count via idx_sessions_effective_activity without scanning messages,
+    3. deferred FTS rebuild progress from state_meta.
+
+    Never creates state.db or sidecars if missing.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        return {
+            "active_sessions": 0,
+            "fts_rebuild": None,
+            "storage_component": {"status": "ok"},
+        }
+
+    from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
+
+    if storage_state(path) == STORAGE_CORRUPT:
+        return {
+            "active_sessions": 0,
+            "fts_rebuild": None,
+            "storage_component": {"status": "degraded", "reason": "corrupt"},
+        }
+
+    wall_now = time.time() if now is None else float(now)
+    cutoff = wall_now - max(0.0, float(active_window_s))
+
+    try:
+        with closing(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1.5)) as conn:
+            conn.execute("PRAGMA query_only = ON")
+
+            # 1. Storage readiness
+            storage_comp = _probe_sqlite_master_and_quickcheck(conn)
+            if storage_comp.get("reason") == "corrupt":
+                note_storage_error(path, sqlite3.DatabaseError("corrupt state.db"))
+                return {
+                    "active_sessions": 0,
+                    "fts_rebuild": None,
+                    "storage_component": storage_comp,
+                }
+
+            # 2. Active sessions
+            active_count = 0
+            try:
+                table_info = conn.execute("PRAGMA table_info(sessions)").fetchall()
+                cols = {r[1] for r in table_info} if table_info else set()
+                if "id" in cols:
+                    where = ["ended_at IS NULL"]
+                    if "parent_session_id" in cols:
+                        where.append("parent_session_id IS NULL")
+                    if "hidden" in cols:
+                        where.append("COALESCE(hidden, 0) = 0")
+                    if "last_activity_at" in cols and "started_at" in cols:
+                        where.append("COALESCE(last_activity_at, started_at) >= ?")
+                    elif "last_activity_at" in cols:
+                        where.append("last_activity_at >= ?")
+                    elif "started_at" in cols:
+                        where.append("started_at >= ?")
+                    else:
+                        where.append("1 = ?")
+
+                    sql = f"SELECT COUNT(*) FROM sessions WHERE {' AND '.join(where)}"
+                    row = conn.execute(sql, (cutoff,)).fetchone()
+                    active_count = int(row[0]) if row else 0
+            except Exception as exc:
+                _log.debug("probe_state_db_status sessions query failed: %s", exc)
+                active_count = 0
+
+            # 3. FTS rebuild progress
+            fts_rebuild = None
+            try:
+                meta_rows = conn.execute(
+                    "SELECT key, value FROM state_meta WHERE key IN ('fts_rebuild_high_water', 'fts_rebuild_progress')"
+                ).fetchall()
+                meta = {r[0]: r[1] for r in meta_rows}
+                high_water = meta.get("fts_rebuild_high_water")
+                if high_water is not None and int(high_water) > 0:
+                    total = int(high_water)
+                    progress = int(meta.get("fts_rebuild_progress") or 0)
+                    fts_rebuild = {
+                        "pending": True,
+                        "total": total,
+                        "indexed": progress,
+                        "percent": min(100, int(100 * progress / total)),
+                    }
+            except Exception as exc:
+                _log.debug("probe_state_db_status fts_rebuild query failed: %s", exc)
+                fts_rebuild = None
+
+            return {
+                "active_sessions": active_count,
+                "fts_rebuild": fts_rebuild,
+                "storage_component": storage_comp,
+            }
+    except Exception as exc:
+        if note_storage_error(path, exc):
+            return {
+                "active_sessions": 0,
+                "fts_rebuild": None,
+                "storage_component": {"status": "degraded", "reason": "corrupt"},
+            }
+        return {
+            "active_sessions": 0,
+            "fts_rebuild": None,
+            "storage_component": {"status": "degraded"},
+        }
 
 
 def _count_status_active_sessions() -> int:
     """Best-effort status garnish. Opens read-only (via the shared stale-schema heal) so
     /api/status never routinely writes to state.db while another Hermes process uses it."""
     from hermes_state import _default_db_path
-    # The heal helper bootstraps a missing store; this garnish must not — on a fresh install
-    # /api/status polls would otherwise create state.db before the user's first session.
     if not Path(_default_db_path()).exists():
         return 0
     db = _open_session_db_for_profile(None, read_only=True)
@@ -91,6 +221,46 @@ def _count_status_active_sessions() -> int:
                    and (now - s.get("last_active", s.get("started_at", 0))) < 300)
     finally:
         db.close()
+
+
+def _fts_rebuild_status() -> Optional[dict[str, Any]]:
+    """Deferred FTS rebuild progress of this home's state.db (read-only open), or None."""
+    from hermes_state import SessionDB as _SDB
+    from hermes_constants import get_hermes_home as _ghh
+    _db_path = _ghh() / "state.db"
+    if not _db_path.exists():
+        return None
+    _sdb = _SDB(db_path=_db_path, read_only=True)
+    try:
+        return _sdb.fts_rebuild_status()
+    finally:
+        _sdb.close()
+
+
+_DEFAULT_COUNT_FN = _count_status_active_sessions
+_DEFAULT_FTS_FN = _fts_rebuild_status
+try:
+    from gateway.readiness import _probe_state_db as _DEFAULT_READINESS_PROBE_FN
+except Exception:
+    _DEFAULT_READINESS_PROBE_FN = None
+
+try:
+    from gateway.status import read_runtime_status as _DEFAULT_READ_RUNTIME_STATUS_FN
+except Exception:
+    _DEFAULT_READ_RUNTIME_STATUS_FN = None
+
+try:
+    from gateway.status_served import local_liveness_pid as _DEFAULT_LOCAL_LIVENESS_PID_FN
+except Exception:
+    _DEFAULT_LOCAL_LIVENESS_PID_FN = None
+
+
+def _safe_call(mod, fn_name: str, default):
+    try:
+        fn = getattr(mod, fn_name, None)
+        return fn() if callable(fn) else default
+    except Exception:
+        return default
 
 
 async def _status_active_sessions() -> int:
@@ -104,6 +274,101 @@ async def _status_active_sessions() -> int:
     except Exception as exc:
         _log.debug("/api/status active session count unavailable: %s", exc)
     return 0
+
+
+def _is_legacy_db_probe_monkeypatched() -> bool:
+    try:
+        from gateway.readiness import _probe_state_db as curr_readiness
+    except Exception:
+        curr_readiness = None
+    return (
+        _count_status_active_sessions is not _DEFAULT_COUNT_FN
+        or _fts_rebuild_status is not _DEFAULT_FTS_FN
+        or curr_readiness is not _DEFAULT_READINESS_PROBE_FN
+    )
+
+
+def _is_status_runtime_probe_monkeypatched() -> bool:
+    try:
+        from gateway.status import read_runtime_status as curr_read_status
+    except Exception:
+        curr_read_status = None
+    try:
+        from gateway.status_served import local_liveness_pid as curr_liveness
+    except Exception:
+        curr_liveness = None
+    return (
+        curr_read_status is not _DEFAULT_READ_RUNTIME_STATUS_FN
+        or curr_liveness is not _DEFAULT_LOCAL_LIVENESS_PID_FN
+    )
+
+
+_CONFIG_DERIVED_CACHE: dict[str, Any] = {
+    "local_reads_sig": None,
+    "local_reads": None,
+    "restart_drain_sig": None,
+    "restart_drain": None,
+}
+_CONFIG_DERIVED_LOCK = threading.Lock()
+
+
+def _stat_file_sig(path: Path) -> tuple[int, int]:
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return (-1, -1)
+
+
+def _reset_config_derived_cache() -> None:
+    with _CONFIG_DERIVED_LOCK:
+        _CONFIG_DERIVED_CACHE["local_reads_sig"] = None
+        _CONFIG_DERIVED_CACHE["local_reads"] = None
+        _CONFIG_DERIVED_CACHE["restart_drain_sig"] = None
+        _CONFIG_DERIVED_CACHE["restart_drain"] = None
+
+
+def _status_local_reads() -> dict[str, Any]:
+    """The probe's synchronous local reads: the raw config.yaml stamp, the install method, the
+    auth store and (first call only) git provenance. Cached by config.yaml stat signature."""
+    from hermes_cli.config import check_config_version
+    cfg_path = Path(get_config_path())
+    sig = (str(cfg_path), *_stat_file_sig(cfg_path), id(check_config_version))
+    with _CONFIG_DERIVED_LOCK:
+        cached = _CONFIG_DERIVED_CACHE.get("local_reads")
+        if _CONFIG_DERIVED_CACHE.get("local_reads_sig") == sig and cached is not None:
+            res = dict(cached)
+            res["nous_session_valid"] = _nous_session_validity()
+            return res
+
+    current_ver, latest_ver = check_config_version()
+    reads = {
+        "version": get_version_info().base_version,
+        "config_version": current_ver,
+        "latest_config_version": latest_ver,
+        "can_update_hermes": not _dashboard_local_update_managed_externally(),
+        "nous_session_valid": _nous_session_validity(),
+    }
+    with _CONFIG_DERIVED_LOCK:
+        _CONFIG_DERIVED_CACHE["local_reads_sig"] = sig
+        _CONFIG_DERIVED_CACHE["local_reads"] = dict(reads)
+    return reads
+
+
+def _resolve_restart_drain_timeout_cached() -> float:
+    drain_fn = _resolve_restart_drain_timeout
+    cfg_path = Path(get_config_path())
+    sig = (str(cfg_path), *_stat_file_sig(cfg_path), id(drain_fn))
+    with _CONFIG_DERIVED_LOCK:
+        cached = _CONFIG_DERIVED_CACHE.get("restart_drain")
+        if _CONFIG_DERIVED_CACHE.get("restart_drain_sig") == sig and cached is not None:
+            return float(cached)
+
+    val = float(drain_fn())
+    with _CONFIG_DERIVED_LOCK:
+        _CONFIG_DERIVED_CACHE["restart_drain_sig"] = sig
+        _CONFIG_DERIVED_CACHE["restart_drain"] = val
+    return val
 
 
 @router.get("/api/ssh/ownership")
@@ -433,7 +698,11 @@ def _nous_session_validity() -> str:
         return "unknown"
 
 
-async def _component_health(gateway: dict[str, Any]) -> dict[str, Any]:
+async def _component_health(
+    gateway: dict[str, Any],
+    *,
+    storage_component: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Component-level health rollup: counts and status enums only (public payload — no
     messages, paths or other detail that could carry secrets). The storage probe reuses the
     gateway readiness state_db check (read-only, 1s-bounded) off-loop."""
@@ -445,15 +714,19 @@ async def _component_health(gateway: dict[str, Any]) -> dict[str, Any]:
             "status": "ok" if gateway_running and gateway_state in {"running", "draining"} else "degraded",
             "state": gateway_state or ("running" if gateway_running else "stopped")},
         "dashboard": DASHBOARD_HEALTH.snapshot()}
-    try:
-        from gateway.readiness import _probe_state_db
-        storage_check = await run_in_threadpool(_probe_state_db, get_hermes_home())
-        components["storage"] = {"status": storage_check.get("status", "degraded")}
-        # The one reason enum consumers key off; same latch as readiness and the session lists.
-        if storage_check.get("detail") == "corrupt":
-            components["storage"]["reason"] = "corrupt"
-    except Exception:
-        components["storage"] = {"status": "degraded"}
+
+    if storage_component is not None and not _is_legacy_db_probe_monkeypatched():
+        components["storage"] = dict(storage_component)
+    else:
+        try:
+            from gateway.readiness import _probe_state_db
+            storage_check = await run_in_threadpool(_probe_state_db, get_hermes_home())
+            components["storage"] = {"status": storage_check.get("status", "degraded")}
+            # The one reason enum consumers key off; same latch as readiness and the session lists.
+            if storage_check.get("detail") == "corrupt":
+                components["storage"]["reason"] = "corrupt"
+        except Exception:
+            components["storage"] = {"status": "degraded"}
     # ``disabled`` entries are platforms the multiplexer deliberately does not run for a served profile
     # (shared ingress owned by the default) — informational, never a degraded verdict.
     platform_states = [str(value.get("state") or value.get("status") or "").lower()
@@ -465,7 +738,13 @@ async def _component_health(gateway: dict[str, Any]) -> dict[str, Any]:
     return components
 
 
-async def _advisory_pressure(status: dict[str, Any], home: Path) -> None:
+async def _advisory_pressure(
+    status: dict[str, Any],
+    home: Path,
+    *,
+    fts_rebuild: Optional[dict[str, Any]] = None,
+    fts_precomputed: bool = False,
+) -> None:
     """Memory / disk pressure rollups + deferred FTS rebuild progress (coarse numbers/enums
     only; public payload). Deliberately NOT folded into components/overall: pressure is
     advisory, not a liveness verdict, and flipping ``overall`` on it would page NAS's
@@ -479,38 +758,17 @@ async def _advisory_pressure(status: dict[str, Any], home: Path) -> None:
         except Exception:
             status[key] = {"pressure": "unknown"}
 
-    try:
-        # SQLite open + read: off the loop like the rest of the probe.
-        _rebuild = await run_in_threadpool(_fts_rebuild_status)
-        if _rebuild is not None:
-            status["fts_rebuild"] = _rebuild
-    except Exception:
-        pass
-
-
-def _status_local_reads() -> dict[str, Any]:
-    """The probe's synchronous local reads: the raw config.yaml stamp, the install method, the
-    auth store and (first call only) git provenance. Run on a worker thread: on the event loop that
-    also serves the session WebSocket they stalled every Desktop request behind the disk (#143561)."""
-    current_ver, latest_ver = check_config_version()
-    return {"version": get_version_info().base_version, "config_version": current_ver,
-            "latest_config_version": latest_ver,
-            "can_update_hermes": not _dashboard_local_update_managed_externally(),
-            "nous_session_valid": _nous_session_validity()}
-
-
-def _fts_rebuild_status() -> Optional[dict[str, Any]]:
-    """Deferred FTS rebuild progress of this home's state.db (read-only open), or None."""
-    from hermes_state import SessionDB as _SDB
-    from hermes_constants import get_hermes_home as _ghh
-    _db_path = _ghh() / "state.db"
-    if not _db_path.exists():
-        return None
-    _sdb = _SDB(db_path=_db_path, read_only=True)
-    try:
-        return _sdb.fts_rebuild_status()
-    finally:
-        _sdb.close()
+    if fts_precomputed and not _is_legacy_db_probe_monkeypatched():
+        if fts_rebuild is not None:
+            status["fts_rebuild"] = fts_rebuild
+    else:
+        try:
+            # SQLite open + read: off the loop like the rest of the probe.
+            _rebuild = await run_in_threadpool(_fts_rebuild_status)
+            if _rebuild is not None:
+                status["fts_rebuild"] = _rebuild
+        except Exception:
+            pass
 
 
 #: What the gateway's Webapp answers a caller who has not signed in: liveness, version and the
@@ -541,6 +799,351 @@ async def _webapp_caller_signed_out(request: Request) -> bool:
     return False
 
 
+async def _collect_canonical_status_snapshot(
+    hermes_home: Path,
+    requested_profile: str,
+    profile_dir: Optional[Path],
+    gateway_health_url: str,
+) -> dict[str, Any]:
+    local = await run_in_threadpool(_status_local_reads)
+    gateway = await _resolve_gateway_status(profile_dir, gateway_health_url)
+    gateway_running, gateway_state = gateway["gateway_running"], gateway["gateway_state"]
+
+    topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
+    if not requested_profile:
+        gateway["gateway_platforms"] = _merge_profile_gateway_platforms(
+            gateway["gateway_platforms"], topology.get("profile_platforms") or {})
+
+    db_path = (profile_dir if profile_dir else hermes_home) / "state.db"
+    if _is_legacy_db_probe_monkeypatched():
+        active_sessions = await _status_active_sessions()
+        storage_component = None
+        fts_rebuild = None
+        fts_precomputed = False
+    else:
+        db_res = await run_in_threadpool(probe_state_db_status, db_path)
+        active_sessions = db_res["active_sessions"]
+        storage_component = db_res["storage_component"]
+        fts_rebuild = db_res["fts_rebuild"]
+        fts_precomputed = True
+
+    active_agents = parse_active_agents((gateway["runtime"] or {}).get("active_agents", 0))
+    restart_drain_timeout = await run_in_threadpool(_resolve_restart_drain_timeout_cached)
+
+    status: dict[str, Any] = {
+        "version": local["version"],
+        "release_date": __release_date__,
+        "config_version": local["config_version"],
+        "latest_config_version": local["latest_config_version"],
+        "can_update_hermes": local["can_update_hermes"],
+        "gateway_running": gateway_running,
+        "gateway_state": gateway_state,
+        "gateway_platforms": gateway["gateway_platforms"],
+        "gateway_exit_reason": gateway["gateway_exit_reason"],
+        "gateway_updated_at": gateway["gateway_updated_at"],
+        "gateway_heartbeat_stale_s": gateway["gateway_heartbeat_stale_s"],
+        "gateway_shared_with": gateway["gateway_shared_with"],
+        "active_agents": active_agents,
+        "gateway_busy": derive_gateway_busy(
+            gateway_running=gateway_running,
+            gateway_state=gateway_state,
+            active_agents=active_agents,
+        ),
+        "gateway_drainable": derive_gateway_drainable(
+            gateway_running=gateway_running,
+            gateway_state=gateway_state,
+        ),
+        "restart_drain_timeout": restart_drain_timeout,
+        "active_sessions": active_sessions,
+        "nous_session_valid": local["nous_session_valid"],
+    }
+
+    install_id = await run_in_threadpool(get_install_id)
+    if install_id:
+        status["install_id"] = install_id
+
+    from hermes_cli.shared_profile_warning import shared_profile_warning
+    status["shared_profile_warning"] = bool(await run_in_threadpool(shared_profile_warning))
+
+    components = await _component_health(gateway, storage_component=storage_component)
+    status["components"] = components
+    status["overall"] = "ok" if all(item.get("status") == "ok" for item in components.values()) else "degraded"
+    await _advisory_pressure(
+        status,
+        profile_dir if profile_dir else hermes_home,
+        fts_rebuild=fts_rebuild,
+        fts_precomputed=fts_precomputed,
+    )
+
+    status["profiles"] = topology["profiles"]
+    status["parked_profiles"] = topology.get("parked_profiles", [])
+    status["gateway_mode"] = topology["gateway_mode"]
+    status["multiplex_standalone_reason"] = topology.get("multiplex_standalone_reason")
+
+    status["_gateway_pid"] = gateway["gateway_pid"]
+    status["_gateway_health_url"] = gateway_health_url
+    status["_gateways"] = topology["gateways"]
+    return status
+
+
+def _shape_status_response(canonical: dict[str, Any], signed_out: bool) -> dict[str, Any]:
+    payload = copy.deepcopy(canonical)
+    auth = _auth_gate_status()
+    payload.update(auth)
+
+    if not auth["auth_required"]:
+        payload.update({
+            "hermes_home": str(get_hermes_home()),
+            "config_path": str(get_config_path()),
+            "env_path": str(get_env_path()),
+            "gateway_pid": payload.get("_gateway_pid"),
+            "gateway_health_url": payload.get("_gateway_health_url"),
+            "gateways": payload.get("_gateways") or [],
+        })
+    payload.pop("_gateway_pid", None)
+    payload.pop("_gateway_health_url", None)
+    payload.pop("_gateways", None)
+
+    if signed_out:
+        return {key: value for key, value in payload.items() if key in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
+    return payload
+
+
+class _StatusCacheEntry:
+    def __init__(self, key: tuple[str, str]):
+        self.key = key
+        self.lock = threading.Lock()
+        self.state: Literal["EMPTY", "COMPUTING_COLD", "FRESH", "STALE_REFRESHING"] = "EMPTY"
+        self.gen: int = 0
+        self.ts: float = 0.0
+        self.value: Optional[dict[str, Any]] = None
+        self.fut: Optional[concurrent.futures.Future] = None
+        self.last_error: Optional[Exception] = None
+
+
+class StatusSnapshotProvider:
+    def __init__(
+        self,
+        ttl_s: float = 3.0,
+        cold_timeout_s: float = 10.0,
+        swr_soft_deadline_s: float = 1.5,
+        max_stale_s: float = 30.0,
+    ):
+        self.ttl_s = ttl_s
+        self.cold_timeout_s = cold_timeout_s
+        self.swr_soft_deadline_s = swr_soft_deadline_s
+        self.max_stale_s = max_stale_s
+        self._entries: dict[tuple[str, str], _StatusCacheEntry] = {}
+        self._entries_lock = threading.Lock()
+        self._collect_fn = _collect_canonical_status_snapshot
+
+    def _get_entry(self, key: tuple[str, str]) -> _StatusCacheEntry:
+        with self._entries_lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _StatusCacheEntry(key)
+                self._entries[key] = entry
+            return entry
+
+    def age_entries_for_test(self, seconds: float) -> None:
+        with self._entries_lock:
+            entries = list(self._entries.values())
+        for entry in entries:
+            with entry.lock:
+                entry.ts -= seconds
+
+    def inspect_entry_for_test(self, hermes_home: Path, requested_profile: str) -> dict[str, Any]:
+        key = (str(hermes_home), requested_profile or "")
+        with self._entries_lock:
+            entry = self._entries.get(key)
+        if entry is None:
+            return {"state": "EMPTY", "gen": 0, "ts": 0.0, "in_flight": None}
+        with entry.lock:
+            return {
+                "state": entry.state,
+                "gen": entry.gen,
+                "ts": entry.ts,
+                "in_flight": entry.fut,
+            }
+
+    def invalidate(self, hermes_home: Optional[Path] = None) -> None:
+        with self._entries_lock:
+            if hermes_home is None:
+                entries = list(self._entries.values())
+                self._entries.clear()
+            else:
+                target_path = Path(hermes_home)
+                entries = [e for k, e in list(self._entries.items()) if Path(k[0]) == target_path]
+                for e in entries:
+                    self._entries.pop(e.key, None)
+
+        for e in entries:
+            with e.lock:
+                e.gen += 1
+                e.state = "EMPTY"
+                e.value = None
+                e.ts = 0.0
+                if e.fut and not e.fut.done():
+                    e.fut.cancel()
+                e.fut = None
+
+    async def _run_collector(
+        self,
+        entry: _StatusCacheEntry,
+        gen: int,
+        fut: concurrent.futures.Future,
+        hermes_home: Path,
+        requested_profile: str,
+        profile_dir: Optional[Path],
+        gateway_health_url: str,
+    ) -> None:
+        try:
+            val = await self._collect_fn(hermes_home, requested_profile, profile_dir, gateway_health_url)
+            with entry.lock:
+                if entry.gen == gen:
+                    entry.value = val
+                    entry.ts = time.time()
+                    entry.state = "FRESH"
+                    entry.last_error = None
+                    entry.fut = None
+                    if not fut.done():
+                        fut.set_result(val)
+                else:
+                    if not fut.done():
+                        fut.cancel()
+        except Exception as exc:
+            with entry.lock:
+                if entry.gen == gen:
+                    entry.last_error = exc
+                    if entry.state == "STALE_REFRESHING" and entry.value is not None:
+                        entry.state = "FRESH"
+                        entry.fut = None
+                        if not fut.done():
+                            fut.set_result(entry.value)
+                    else:
+                        entry.state = "EMPTY"
+                        entry.fut = None
+                        if not fut.done():
+                            fut.set_exception(exc)
+                else:
+                    if not fut.done():
+                        fut.cancel()
+
+    async def get_status_payload(
+        self,
+        hermes_home: Path,
+        *,
+        requested_profile: str,
+        profile_dir: Optional[Path],
+        gateway_health_url: str,
+        signed_out: bool,
+    ) -> dict[str, Any]:
+        if _is_status_runtime_probe_monkeypatched():
+            raw = await self._collect_fn(hermes_home, requested_profile, profile_dir, gateway_health_url)
+            return _shape_status_response(raw, signed_out)
+
+        key = (str(hermes_home), requested_profile or "")
+        entry = self._get_entry(key)
+
+        spawn = False
+        gen = 0
+        fut: Optional[concurrent.futures.Future] = None
+        stale_val: Optional[dict[str, Any]] = None
+
+        with entry.lock:
+            now = time.time()
+            age = (now - entry.ts) if entry.value is not None else float("inf")
+
+            if entry.state == "FRESH" and age <= self.ttl_s and entry.value is not None:
+                return _shape_status_response(entry.value, signed_out)
+
+            if entry.state == "COMPUTING_COLD":
+                fut = entry.fut
+                spawn = False
+            elif entry.state == "EMPTY" or age > self.max_stale_s or entry.value is None:
+                entry.state = "COMPUTING_COLD"
+                entry.gen += 1
+                gen = entry.gen
+                fut = concurrent.futures.Future()
+                entry.fut = fut
+                entry.last_error = None
+                spawn = True
+            elif entry.state == "FRESH":
+                # Stale-While-Revalidate
+                stale_val = entry.value
+                entry.state = "STALE_REFRESHING"
+                entry.gen += 1
+                gen = entry.gen
+                fut = concurrent.futures.Future()
+                entry.fut = fut
+                entry.last_error = None
+                spawn = True
+            else:  # STALE_REFRESHING
+                stale_val = entry.value
+                fut = entry.fut
+                spawn = False
+
+        if spawn and fut is not None:
+            asyncio.create_task(
+                self._run_collector(
+                    entry,
+                    gen,
+                    fut,
+                    hermes_home,
+                    requested_profile,
+                    profile_dir,
+                    gateway_health_url,
+                )
+            )
+
+        with entry.lock:
+            curr_state = entry.state
+
+        if curr_state in ("EMPTY", "COMPUTING_COLD"):
+            if fut is None:
+                raise HTTPException(status_code=503, detail="Status probe unavailable")
+            try:
+                val = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=self.cold_timeout_s)
+                return _shape_status_response(val, signed_out)
+            except TimeoutError:
+                with entry.lock:
+                    if entry.state == "COMPUTING_COLD":
+                        entry.gen += 1
+                        entry.state = "EMPTY"
+                        if entry.fut and not entry.fut.done():
+                            entry.fut.cancel()
+                        entry.fut = None
+                raise HTTPException(status_code=503, detail="Status probe timed out")
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                raise HTTPException(status_code=503, detail="Status probe cancelled")
+        else:
+            # SWR
+            if stale_val is None:
+                raise HTTPException(status_code=503, detail="Status probe unavailable")
+            if fut is None:
+                return _shape_status_response(stale_val, signed_out)
+            try:
+                val = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=self.swr_soft_deadline_s)
+                return _shape_status_response(val, signed_out)
+            except TimeoutError:
+                return _shape_status_response(stale_val, signed_out)
+            except Exception:
+                return _shape_status_response(stale_val, signed_out)
+
+
+STATUS_SNAPSHOT_PROVIDER = StatusSnapshotProvider()
+
+
+def _reset_status_snapshot_cache() -> None:
+    STATUS_SNAPSHOT_PROVIDER.invalidate()
+    _reset_config_derived_cache()
+    try:
+        from hermes_cli.web_server_gateway import _reset_configured_platforms_cache
+        _reset_configured_platforms_cache()
+    except Exception:
+        pass
+
+
 @router.get("/api/status")
 async def get_status(profile: Optional[str] = None,
                      request: Request = None):  # type: ignore[assignment]  # None when awaited in-process
@@ -563,87 +1166,14 @@ async def get_status(profile: Optional[str] = None,
         status_scope.__enter__()
 
     try:
-        local = await run_in_threadpool(_status_local_reads)
-        gateway = await _resolve_gateway_status(profile_dir, _GATEWAY_HEALTH_URL)
-        gateway_running, gateway_state = gateway["gateway_running"], gateway["gateway_state"]
-
-        # Topology (cached, TTL 10s) is fetched before the platform rollup so per-profile
-        # gateway failures fold into the machine-level view (see
-        # _merge_profile_gateway_platforms); a ``?profile=`` request is left unmerged.
-        topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
-        if not requested_profile:
-            gateway["gateway_platforms"] = _merge_profile_gateway_platforms(
-                gateway["gateway_platforms"], topology.get("profile_platforms") or {})
-
-        active_sessions = await _status_active_sessions()
-
-        # Busy/drainable (NAS lifecycle-safety gate) derive from the persisted in-flight turn
-        # count + liveness via gateway.status. Liveness keys off gateway_running, NEVER
-        # gateway_updated_at — a stale heartbeat is reported separately, not treated as death.
-        active_agents = parse_active_agents((gateway["runtime"] or {}).get("active_agents", 0))
-        # Off-loop: on a cold Windows install the first import of hermes_cli.gateway blocks
-        # 15-30s (.pyc compilation + Defender), exceeding the desktop handshake's 15s timeout.
-        restart_drain_timeout = await run_in_threadpool(_resolve_restart_drain_timeout)
-        auth = _auth_gate_status()
-
-        status = {
-            "version": local["version"], "release_date": __release_date__,
-            "config_version": local["config_version"], "latest_config_version": local["latest_config_version"],
-            "can_update_hermes": local["can_update_hermes"],
-            "gateway_running": gateway_running, "gateway_state": gateway_state,
-            "gateway_platforms": gateway["gateway_platforms"],
-            "gateway_exit_reason": gateway["gateway_exit_reason"],
-            "gateway_updated_at": gateway["gateway_updated_at"],
-            # Seconds since housekeeping last stamped the heartbeat, only when the PID is alive but the
-            # stamp is past the freshness TTL (loop/housekeeping wedged, #113372); else null.
-            "gateway_heartbeat_stale_s": gateway["gateway_heartbeat_stale_s"],
-            # Non-null only for a profile served by the shared multiplexer: every profile that process carries.
-            "gateway_shared_with": gateway["gateway_shared_with"],
-            "active_agents": active_agents,
-            "gateway_busy": derive_gateway_busy(
-                gateway_running=gateway_running, gateway_state=gateway_state,
-                active_agents=active_agents),
-            "gateway_drainable": derive_gateway_drainable(
-                gateway_running=gateway_running, gateway_state=gateway_state),
-            "restart_drain_timeout": restart_drain_timeout, "active_sessions": active_sessions,
-            **auth, "nous_session_valid": local["nous_session_valid"]}
-
-        # Stable per-install identity (first call may touch disk). Omitted (not null) when
-        # unpersistable so older-client behavior and the no-identity fallback stay identical.
-        install_id = await run_in_threadpool(get_install_id)
-        if install_id:
-            status["install_id"] = install_id
-
-        # Advisory only. Expose no paths or process identities on this public probe.
-        from hermes_cli.shared_profile_warning import shared_profile_warning
-        status["shared_profile_warning"] = bool(await run_in_threadpool(shared_profile_warning))
-
-        components = await _component_health(gateway)
-        status["components"] = components
-        status["overall"] = ("ok" if all(item.get("status") == "ok" for item in components.values())
-                             else "degraded")
-        await _advisory_pressure(status, profile_dir if profile_dir else get_hermes_home())
-
-        # Profile NAMES and ``gateway_mode`` are low-sensitivity product surface (Hermes Cloud
-        # renders the profile list over a gated bind) so they survive the auth gate; the
-        # per-gateway ``gateways[]`` carries host ports and stays gated below.
-        status["profiles"] = topology["profiles"]
-        status["parked_profiles"] = topology.get("parked_profiles", [])
-        status["gateway_mode"] = topology["gateway_mode"]
-        status["multiplex_standalone_reason"] = topology.get("multiplex_standalone_reason")
-
-        # Host paths, gateway PID, internal health URL and per-gateway ports are deployment
-        # recon a liveness probe never needs, and on a gated bind *any* unauthenticated caller
-        # reaches this endpoint — surface them only on a loopback / ``--insecure`` bind.
-        if not auth["auth_required"]:
-            status.update({
-                "hermes_home": str(get_hermes_home()), "config_path": str(get_config_path()),
-                "env_path": str(get_env_path()), "gateway_pid": gateway["gateway_pid"],
-                "gateway_health_url": _GATEWAY_HEALTH_URL, "gateways": topology["gateways"]})
-
-        if signed_out:
-            return {key: value for key, value in status.items() if key in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
-        return status
+        home = get_hermes_home()
+        return await STATUS_SNAPSHOT_PROVIDER.get_status_payload(
+            home,
+            requested_profile=requested_profile,
+            profile_dir=profile_dir,
+            gateway_health_url=_GATEWAY_HEALTH_URL,
+            signed_out=signed_out,
+        )
     finally:
         if status_scope is not None:
             status_scope.__exit__(*sys.exc_info())

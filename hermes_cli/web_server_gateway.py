@@ -258,12 +258,55 @@ def _collect_profile_gateway_topology_cached() -> dict[str, Any]:
         return data
 
 
+_CONFIGURED_PLATFORMS_CACHE: dict[str, Any] = {"sig": None, "data": None}
+_CONFIGURED_PLATFORMS_LOCK = threading.Lock()
+
+
+def _stat_file_sig(path: Path) -> tuple[int, int]:
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return (-1, -1)
+
+
+def _reset_configured_platforms_cache() -> None:
+    with _CONFIGURED_PLATFORMS_LOCK:
+        _CONFIGURED_PLATFORMS_CACHE["sig"] = None
+        _CONFIGURED_PLATFORMS_CACHE["data"] = None
+
+
 def _load_configured_gateway_platforms() -> set[str]:
     """Connected platform names; synchronous by design — the first ``load_gateway_config()`` does
     platform discovery and can outlast Desktop's WS connect timeout on Windows, so ``get_status``
-    runs this in Starlette's worker pool."""
+    runs this in Starlette's worker pool. Cached by config.yaml + .env (mtime_ns, size)."""
     from gateway.config import load_gateway_config
-    return {platform.value for platform in load_gateway_config().get_connected_platforms()}
+    from hermes_cli.config import get_config_path, get_env_path
+
+    try:
+        cfg_path = Path(get_config_path())
+        env_path = Path(get_env_path())
+        sig = (
+            str(cfg_path),
+            *_stat_file_sig(cfg_path),
+            str(env_path),
+            *_stat_file_sig(env_path),
+            id(load_gateway_config),
+        )
+    except Exception:
+        sig = None
+
+    if sig is not None:
+        with _CONFIGURED_PLATFORMS_LOCK:
+            if _CONFIGURED_PLATFORMS_CACHE["sig"] == sig and _CONFIGURED_PLATFORMS_CACHE["data"] is not None:
+                return set(_CONFIGURED_PLATFORMS_CACHE["data"])
+
+    result = {platform.value for platform in load_gateway_config().get_connected_platforms()}
+    if sig is not None:
+        with _CONFIGURED_PLATFORMS_LOCK:
+            _CONFIGURED_PLATFORMS_CACHE["sig"] = sig
+            _CONFIGURED_PLATFORMS_CACHE["data"] = set(result)
+    return result
 
 
 _WINDOWS_11_MIN_BUILD = 22000
