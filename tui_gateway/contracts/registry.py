@@ -151,6 +151,13 @@ def validate_params(contract: MethodContract | ServerRequestContract, params: di
     return params, None
 
 
+_SHARED_SESSION_METHODS = frozenset({
+    'session.create', 'session.resume', 'session.list', 'session.interrupt',
+    'session.steer', 'session.redirect', 'session.events.since', 'prompt.submit',
+    'approval.respond',
+})
+
+
 def canonical_param_problems(contract: MethodContract, params: dict) -> list[str]:
     """Key paths the canonical dispatcher refuses (``4001 invalid_params``): unknown and missing
     keys — the closed set its handlers enforced by hand. Value/type checks stay in the handlers,
@@ -161,7 +168,7 @@ def canonical_param_problems(contract: MethodContract, params: dict) -> list[str
         # Shared methods preserve handler-owned missing-field/permission refusals,
         # while refusing malformed values before the handler indexes them.
         return [".".join(str(p) for p in err.get("loc", ())) or "params" for err in exc.errors()
-                if (err.get("type") != "missing" if contract.name in METHODS
+                if (err.get("type") != "missing" if contract.name in _SHARED_SESSION_METHODS
                     else err.get("type") in ("extra_forbidden", "missing"))]
     return []
 

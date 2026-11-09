@@ -218,7 +218,7 @@ class _Relay:
                 self.emit("message.complete", self.sid, {"text": ""})
 
 
-def forward_rpc(home: Path, endpoint, method: str, params: dict) -> Any:
+def forward_rpc(home: Path, endpoint, method: str, params: dict, *, resume_session_id: str | None = None) -> Any:
     """One request/answer RPC on the owner serving ``home`` (Group Chat calls, WA-19), on the
     host-scoped grant native Desktop itself holds, so a room may seat the served sibling profiles."""
     from gateway.hosted_room_attachments import MAX_ATTACHMENT_BYTES
@@ -228,6 +228,8 @@ def forward_rpc(home: Path, endpoint, method: str, params: dict) -> Any:
 
     async def call():
         async with connect_owner(home, endpoint, scope="host", max_size=frame) as client:
+            if resume_session_id:
+                await client.rpc("session.resume", session_id=resume_session_id)
             return await client.rpc(method, **params)
     return asyncio.run(call())
 

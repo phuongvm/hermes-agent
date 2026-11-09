@@ -2,7 +2,7 @@
  "counts": {
   "http": {
    "keep-host-wide": 1,
-   "undecided": 343
+   "undecided": 344
   },
   "rpc": {
    "authority": 108,
@@ -330,6 +330,7 @@
   {"current_path": "hermes_cli.web_routers.ops:create_webhook", "decision": "undecided", "handler": "POST /api/webhooks", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.ops:enable_webhooks", "decision": "undecided", "handler": "POST /api/webhooks/enable", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_logout", "decision": "undecided", "handler": "POST /auth/logout", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.dashboard_auth.routes:auth_native_logout", "decision": "undecided", "handler": "POST /auth/native/logout", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_native_refresh", "decision": "undecided", "handler": "POST /auth/native/refresh", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_native_token", "decision": "undecided", "handler": "POST /auth/native/token", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_password_login", "decision": "undecided", "handler": "POST /auth/password-login", "kind": "http", "ref": ""},
@@ -555,11 +556,11 @@
   {"current_path": "legacy fallback; standalone: legacy server.dispatch", "decision": "undecided", "handler": "projects.update", "kind": "rpc", "ref": "D3"},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.background", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.btw", "kind": "rpc", "ref": ""},
-  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.cancel", "kind": "rpc", "ref": ""},
-  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.receipt", "kind": "rpc", "ref": ""},
-  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.replace_queued", "kind": "rpc", "ref": ""},
-  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.resolve_unknown", "kind": "rpc", "ref": ""},
-  {"current_path": "authority; standalone: unknown method", "decision": "authority", "handler": "prompt.steer_queued", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.cancel", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.receipt", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.replace_queued", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.resolve_unknown", "kind": "rpc", "ref": ""},
+  {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.steer_queued", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "prompt.submit", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "reload.env", "kind": "rpc", "ref": ""},
   {"current_path": "authority; standalone: legacy server.dispatch", "decision": "authority", "handler": "reload.mcp", "kind": "rpc", "ref": ""},

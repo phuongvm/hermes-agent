@@ -4681,6 +4681,46 @@ export interface PluginCatalogLookupEntry {
   subdir: string
   tier?: string
 }
+export interface PromptReceiptParams {
+  session_id: string
+  admission_id: string
+  include_result?: boolean | null
+}
+/** ``result`` / ``usage``: the structured turn result committed at settlement, only with ``include_result`` on a terminal admission that saved one. */
+export interface PromptReceiptResult {
+  admission_id: string
+  ref: CanonicalSessionRef
+  sequence: number
+  status: 'queued' | 'started' | 'unknown' | 'terminal'
+  outcome: string | null
+  authority_epoch: number
+  execution_generation: number | null
+  result?: unknown | null
+  usage?: Record<string, unknown> | null
+}
+export interface CanonicalSessionRef {
+  profile_id: string
+  session_id: string
+}
+export interface PromptCancelParams {
+  session_id: string
+  admission_id: string
+}
+/** ``gateway/session_contract.py::AdmissionReceipt`` as ``dataclasses.asdict`` sends it. */
+export interface AdmissionStatus {
+  admission_id: string
+  ref: CanonicalSessionRef
+  sequence: number
+  status: 'queued' | 'started' | 'unknown' | 'terminal'
+  outcome: string | null
+  authority_epoch: number
+  execution_generation: number | null
+}
+export interface PromptResolveUnknownParams {
+  session_id: string
+  admission_id: string
+  execution_generation: number
+}
 export interface GroupsAttachmentUploadParams {
   profile?: string | null
   room_id: string
@@ -4734,50 +4774,30 @@ export interface GroupsDiscardResult {
   discarded?: boolean
   task: RoomTaskReceipt
 }
+export interface CanonicalSteerQueuedParams {
+  profile?: string | null
+  session_id: string
+  admission_id: string
+}
+/** The edited prompt: admitted as a NEW admission (``submission_id``) at the FIFO tail. */
+export interface CanonicalReplaceQueuedParams {
+  profile?: string | null
+  session_id: string
+  admission_id: string
+  submission_id: string
+  text: string
+  attachments?: CanonicalAttachment[] | null
+  display_kind?: 'hidden' | null
+  title_preview?: string | null
+}
+export interface CanonicalAttachment {
+  path: string
+  mime: string
+}
 export interface CanonicalShellExecParams {
   session_id: string
   command: string
   profile?: string | null
-}
-export interface PromptReceiptParams {
-  session_id: string
-  admission_id: string
-  include_result?: boolean | null
-}
-/** ``result`` / ``usage``: the structured turn result committed at settlement, only with ``include_result`` on a terminal admission that saved one. */
-export interface PromptReceiptResult {
-  admission_id: string
-  ref: CanonicalSessionRef
-  sequence: number
-  status: 'queued' | 'started' | 'unknown' | 'terminal'
-  outcome: string | null
-  authority_epoch: number
-  execution_generation: number | null
-  result?: unknown | null
-  usage?: Record<string, unknown> | null
-}
-export interface CanonicalSessionRef {
-  profile_id: string
-  session_id: string
-}
-export interface PromptCancelParams {
-  session_id: string
-  admission_id: string
-}
-/** ``gateway/session_contract.py::AdmissionReceipt`` as ``dataclasses.asdict`` sends it. */
-export interface AdmissionStatus {
-  admission_id: string
-  ref: CanonicalSessionRef
-  sequence: number
-  status: 'queued' | 'started' | 'unknown' | 'terminal'
-  outcome: string | null
-  authority_epoch: number
-  execution_generation: number | null
-}
-export interface PromptResolveUnknownParams {
-  session_id: string
-  admission_id: string
-  execution_generation: number
 }
 /** ``operation`` + ``payload`` are validated by ``hermes_state_mutations.validate_action``; ``expected_generation`` is required for delete/rewind/reset/branch/model/compress/reasoning/workspace. ``reasoning`` (``{effort}``) and ``workspace`` (``{cwd}``, refused ``session_busy`` mid-turn) rewrite the session's frozen policy: session-scope ``/reasoning`` and Desktop's Move to project. ``edit_policy`` (``{policy}``: ask / workspace_session / session) is an ACP session's edit approval (main's ACP modes). */
 export interface SessionMutateParams {
@@ -5358,10 +5378,6 @@ export interface CanonicalSubmitParams {
   model_override?: CanonicalModelOverride | null
   clarify_batch?: boolean
 }
-export interface CanonicalAttachment {
-  path: string
-  mime: string
-}
 export interface CanonicalTurnAuthor {
   id?: string | null
   name?: string | null
@@ -5381,22 +5397,6 @@ export interface CanonicalApprovalParams {
   execution_generation: number
   prompt_id: string
   choice: string
-}
-export interface CanonicalSteerQueuedParams {
-  profile?: string | null
-  session_id: string
-  admission_id: string
-}
-/** The edited prompt: admitted as a NEW admission (``submission_id``) at the FIFO tail. */
-export interface CanonicalReplaceQueuedParams {
-  profile?: string | null
-  session_id: string
-  admission_id: string
-  submission_id: string
-  text: string
-  attachments?: CanonicalAttachment[] | null
-  display_kind?: 'hidden' | null
-  title_preview?: string | null
 }
 export interface CanonicalConfigGetResult {
   value?: string | null
@@ -6607,6 +6607,16 @@ export interface RpcMethods {
   'prompt.background': { params: SideAgentParams; result: TaskIdResult }
   /** Side question over a snapshot of the live conversation; the answer arrives as btw.complete. */
   'prompt.btw': { params: SideAgentParams; result: TaskIdResult }
+  /** Retire a queued admission; a started one is interrupted in the same call. */
+  'prompt.cancel': { params: PromptCancelParams; result: AdmissionStatus }
+  /** Current receipt of one admission the caller submitted (or controls). */
+  'prompt.receipt': { params: PromptReceiptParams; result: PromptReceiptResult }
+  /** Cancel a still-queued admission and admit the edited prompt as a new admission at the back of the FIFO, in one write bound to the replaced admission. Refusals: admission_started, admission_conflict (the submission_id replaced another admission), queue_full, unsupported_control, not_found. */
+  'prompt.replace_queued': { params: CanonicalReplaceQueuedParams; result: AdmissionStatus }
+  /** Acknowledge a turn lost across an owner restart; the FIFO behind it resumes. Never requeues the lost input. */
+  'prompt.resolve_unknown': { params: PromptResolveUnknownParams; result: AdmissionStatus }
+  /** Hand a still-queued admission's text to the running turn's agent as a steer. The admission reads 'started' with that turn (pending snapshots mark it 'steering') and never runs on its own; it settles terminal 'steered' when the turn completes with its text, else 'interrupted' (its completion frame says 'cancelled', as an interrupted turn's does); a text the turn never consumed goes back to its queue place. Refusals: admission_started, session_idle, steer_unavailable (no agent to take it: the admission stays queued), unsupported_control, not_found. */
+  'prompt.steer_queued': { params: CanonicalSteerQueuedParams; result: AdmissionStatus }
   /** Send a user turn to a live session; busy sessions queue / steer / redirect instead of refusing. */
   'prompt.submit': { params: PromptSubmitParams; result: PromptSubmitResult }
   /** Re-read ~/.hermes/.env (CLI /reload parity); built agents keep their pool until /new. */
@@ -6966,6 +6976,11 @@ export const RPC_METHODS = [
   'projects.update',
   'prompt.background',
   'prompt.btw',
+  'prompt.cancel',
+  'prompt.receipt',
+  'prompt.replace_queued',
+  'prompt.resolve_unknown',
+  'prompt.steer_queued',
   'prompt.submit',
   'reload.env',
   'reload.mcp',

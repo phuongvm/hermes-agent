@@ -56,8 +56,10 @@ class PromptReceiptResult(AdmissionStatus):
     usage: dict[str, JsonValue] | None = None
 
 
-canonical_method("prompt.receipt", params=PromptReceiptParams, result=PromptReceiptResult,
-                 doc="Current receipt of one admission the caller submitted (or controls).")
+_RECEIPT_DOC = "Current receipt of one admission the caller submitted (or controls)."
+canonical_method("prompt.receipt", params=PromptReceiptParams, result=PromptReceiptResult, doc=_RECEIPT_DOC)
+# Standalone route forwards prompt queue controls to the session's owning gateway.
+method("prompt.receipt", params=PromptReceiptParams, result=PromptReceiptResult, doc=_RECEIPT_DOC)
 
 
 class PromptCancelParams(Params):
@@ -65,8 +67,9 @@ class PromptCancelParams(Params):
     admission_id: str
 
 
-canonical_method("prompt.cancel", params=PromptCancelParams, result=AdmissionStatus,
-                 doc="Retire a queued admission; a started one is interrupted in the same call.")
+_CANCEL_DOC = "Retire a queued admission; a started one is interrupted in the same call."
+canonical_method("prompt.cancel", params=PromptCancelParams, result=AdmissionStatus, doc=_CANCEL_DOC)
+method("prompt.cancel", params=PromptCancelParams, result=AdmissionStatus, doc=_CANCEL_DOC)
 
 
 class PromptResolveUnknownParams(Params):
@@ -75,9 +78,12 @@ class PromptResolveUnknownParams(Params):
     execution_generation: int
 
 
-canonical_method("prompt.resolve_unknown", params=PromptResolveUnknownParams, result=AdmissionStatus,
-                 doc="Acknowledge a turn lost across an owner restart; the FIFO behind it resumes. "
-                     "Never requeues the lost input.")
+_RESOLVE_UNKNOWN_DOC = (
+    "Acknowledge a turn lost across an owner restart; the FIFO behind it resumes. "
+    "Never requeues the lost input."
+)
+canonical_method("prompt.resolve_unknown", params=PromptResolveUnknownParams, result=AdmissionStatus, doc=_RESOLVE_UNKNOWN_DOC)
+method("prompt.resolve_unknown", params=PromptResolveUnknownParams, result=AdmissionStatus, doc=_RESOLVE_UNKNOWN_DOC)
 
 
 # ── session ───────────────────────────────────────────────────────────────────────────────────

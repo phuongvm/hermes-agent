@@ -12,7 +12,7 @@ from .connectors_operation import ConnectionRequestPayload
 from .sessions import OpenRequestEntry, TodoState
 from .canonical import (AdmissionStatus, CanonicalClientLabel, CanonicalSessionRef, PromptResponseResult,
                         SessionInventoryFields)
-from .registry import canonical_method
+from .registry import canonical_method, method
 
 
 class CanonicalSessionParams(ProfileParams):
@@ -367,17 +367,28 @@ for _name, _params, _result in (
 ):
     canonical_method(_name, params=_params, result=_result)
 
+_STEER_QUEUED_DOC = (
+    "Hand a still-queued admission's text to the running turn's agent as a steer. "
+    "The admission reads 'started' with that turn (pending snapshots mark it "
+    "'steering') and never runs on its own; it settles terminal 'steered' when the "
+    "turn completes with its text, else 'interrupted' (its completion frame says "
+    "'cancelled', as an interrupted turn's does); a text the turn never consumed "
+    "goes back to its queue place. "
+    "Refusals: admission_started, session_idle, steer_unavailable (no agent to take "
+    "it: the admission stays queued), unsupported_control, not_found."
+)
 canonical_method('prompt.steer_queued', params=CanonicalSteerQueuedParams, result=AdmissionStatus,
-                 doc="Hand a still-queued admission's text to the running turn's agent as a steer. "
-                     "The admission reads 'started' with that turn (pending snapshots mark it "
-                     "'steering') and never runs on its own; it settles terminal 'steered' when the "
-                     "turn completes with its text, else 'interrupted' (its completion frame says "
-                     "'cancelled', as an interrupted turn's does); a text the turn never consumed "
-                     "goes back to its queue place. "
-                     "Refusals: admission_started, session_idle, steer_unavailable (no agent to take "
-                     "it: the admission stays queued), unsupported_control, not_found.")
+                 doc=_STEER_QUEUED_DOC)
+method('prompt.steer_queued', params=CanonicalSteerQueuedParams, result=AdmissionStatus,
+       doc=_STEER_QUEUED_DOC)
+
+_REPLACE_QUEUED_DOC = (
+    "Cancel a still-queued admission and admit the edited prompt as a new admission "
+    "at the back of the FIFO, in one write bound to the replaced admission. "
+    "Refusals: admission_started, admission_conflict (the submission_id replaced "
+    "another admission), queue_full, unsupported_control, not_found."
+)
 canonical_method('prompt.replace_queued', params=CanonicalReplaceQueuedParams, result=AdmissionStatus,
-                 doc="Cancel a still-queued admission and admit the edited prompt as a new admission "
-                     "at the back of the FIFO, in one write bound to the replaced admission. "
-                     "Refusals: admission_started, admission_conflict (the submission_id replaced "
-                     "another admission), queue_full, unsupported_control, not_found.")
+                 doc=_REPLACE_QUEUED_DOC)
+method('prompt.replace_queued', params=CanonicalReplaceQueuedParams, result=AdmissionStatus,
+       doc=_REPLACE_QUEUED_DOC)

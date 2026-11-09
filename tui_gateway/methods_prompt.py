@@ -1545,6 +1545,79 @@ def _approval_respond_session_fallback(params: dict):
     return None
 
 
+# ── prompt queue controls forward ───────────────────────────────────────────
+
+def _forward_prompt_control(rid, method_name: str, params: dict) -> dict:
+    """Forward a prompt queue control (cancel, resolve_unknown, steer_queued, replace_queued, receipt)
+    from this standalone backend to the owner gateway that manages the session's queue FIFO."""
+    from pathlib import Path
+    from hermes_cli.gateway_client import GatewayRPCError
+    from tui_gateway import owner_forward
+    from tui_gateway.owner_forward import OwnerNotRunning
+
+    sid = str(params.get("session_id") or "")
+    if not sid:
+        return _err(rid, 4000, "session_id is required")
+
+    forward_params = dict(params)
+    target_key = sid
+    home = None
+
+    if session := _sessions.get(sid):
+        if session_key := session.get("session_key"):
+            target_key = str(session_key)
+            forward_params["session_id"] = target_key
+        if profile_home := session.get("profile_home"):
+            home = Path(profile_home).resolve()
+
+    if home is None:
+        home = Path(_profile_home(params.get("profile")) or _hermes_home).resolve()
+
+    try:
+        endpoint = owner_forward.discover_owner(home)
+    except OwnerNotRunning:
+        return _err(rid, 4090, "The Hermes gateway that owns this session queue is not running.",
+                    {"reason": "SESSION_NOT_OWNED"})
+    except Exception as exc:
+        return _err(rid, 5124, f"The Hermes gateway is not ready: {exc}")
+
+    try:
+        result = owner_forward.forward_rpc(home, endpoint, method_name, forward_params, resume_session_id=target_key)
+    except GatewayRPCError as exc:
+        return _err(rid, exc.code if isinstance(exc.code, int) else 5000, str(exc), exc.data or None)
+    except Exception as exc:
+        logger.warning("Prompt control %s for %s failed to forward to gateway: %s", method_name, target_key, exc)
+        return _err(rid, 5124, "The Hermes gateway did not answer. Try again.")
+
+    result = result if isinstance(result, dict) else {}
+    return _ok(rid, result)
+
+
+@method("prompt.cancel")
+def _(rid, params: dict) -> dict:
+    return _forward_prompt_control(rid, "prompt.cancel", params)
+
+
+@method("prompt.resolve_unknown")
+def _(rid, params: dict) -> dict:
+    return _forward_prompt_control(rid, "prompt.resolve_unknown", params)
+
+
+@method("prompt.steer_queued")
+def _(rid, params: dict) -> dict:
+    return _forward_prompt_control(rid, "prompt.steer_queued", params)
+
+
+@method("prompt.replace_queued")
+def _(rid, params: dict) -> dict:
+    return _forward_prompt_control(rid, "prompt.replace_queued", params)
+
+
+@method("prompt.receipt")
+def _(rid, params: dict) -> dict:
+    return _forward_prompt_control(rid, "prompt.receipt", params)
+
+
 def register(server) -> None:
     """Publish this module's helpers + handlers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))
