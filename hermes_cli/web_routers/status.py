@@ -78,12 +78,9 @@ class StateDbStatusResult(TypedDict):
     storage_component: dict[str, str]
 
 
-def _probe_sqlite_master_and_quickcheck(conn: sqlite3.Connection) -> dict[str, str]:
+def _probe_sqlite_master(conn: sqlite3.Connection) -> dict[str, str]:
     try:
         conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
-        row = conn.execute("PRAGMA quick_check(1)").fetchone()
-        if row and str(row[0]).lower() != "ok":
-            return {"status": "degraded", "reason": "corrupt"}
         return {"status": "ok"}
     except sqlite3.DatabaseError:
         return {"status": "degraded", "reason": "corrupt"}
@@ -100,11 +97,11 @@ def probe_state_db_status(
     """Single-pass read-only inspection of state.db for /api/status.
 
     Opens at most one SQLite connection (mode=ro, query_only=1) and extracts:
-    1. storage readiness (sqlite_master + quick_check),
+    1. storage readiness (sqlite_master probe matching gateway.readiness._probe_state_db),
     2. active session count via idx_sessions_effective_activity without scanning messages,
     3. deferred FTS rebuild progress from state_meta.
 
-    Never creates state.db or sidecars if missing.
+    Never creates state.db or sidecars if missing. Never runs expensive PRAGMA quick_check.
     """
     path = Path(db_path)
     if not path.is_file():
@@ -130,8 +127,8 @@ def probe_state_db_status(
         with closing(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1.5)) as conn:
             conn.execute("PRAGMA query_only = ON")
 
-            # 1. Storage readiness
-            storage_comp = _probe_sqlite_master_and_quickcheck(conn)
+            # 1. Storage readiness (matches gateway.readiness._probe_state_db: schema read only)
+            storage_comp = _probe_sqlite_master(conn)
             if storage_comp.get("reason") == "corrupt":
                 note_storage_error(path, sqlite3.DatabaseError("corrupt state.db"))
                 return {

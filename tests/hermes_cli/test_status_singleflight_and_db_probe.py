@@ -231,17 +231,25 @@ async def test_get_status_opens_sqlite_at_most_once_across_active_sessions_fts_a
         fts_progress=100,
     )
 
+    status_router._reset_status_snapshot_cache()
     real_connect = sqlite3.connect
     connect_calls: list[str] = []
+    executed_queries: list[str] = []
 
     def _spy_connect(database, *args, **kwargs):
         connect_calls.append(str(database))
-        return real_connect(database, *args, **kwargs)
+        conn = real_connect(database, *args, **kwargs)
+        conn.set_trace_callback(lambda q: executed_queries.append(str(q)))
+        return conn
 
     monkeypatch.setattr(sqlite3, "connect", _spy_connect)
 
     body = await status_router.get_status()
     assert len(connect_calls) == 1, f"Expected exactly 1 sqlite3.connect call, got {connect_calls}"
+    assert not any("quick_check" in q.lower() for q in executed_queries), (
+        f"PRAGMA quick_check must NEVER run on the status path; executed: {executed_queries}"
+    )
+    assert any("sqlite_master" in q.lower() for q in executed_queries)
     assert body["active_sessions"] == 6
     assert body["components"]["storage"] == {"status": "ok"}
     assert body["fts_rebuild"] == {"pending": True, "total": 400, "indexed": 100, "percent": 25}
