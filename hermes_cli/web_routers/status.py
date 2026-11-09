@@ -764,8 +764,9 @@ async def _advisory_pressure(
             _rebuild = await run_in_threadpool(_fts_rebuild_status)
             if _rebuild is not None:
                 status["fts_rebuild"] = _rebuild
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger("hermes.web.status").debug("legacy _fts_rebuild_status error: %s", exc)
 
 
 #: What the gateway's Webapp answers a caller who has not signed in: liveness, version and the
@@ -906,6 +907,9 @@ def _shape_status_response(canonical: dict[str, Any], signed_out: bool) -> dict[
     return payload
 
 
+_STATUS_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
 class _StatusCacheEntry:
     def __init__(self, key: tuple[str, str]):
         self.key = key
@@ -915,6 +919,8 @@ class _StatusCacheEntry:
         self.ts: float = 0.0
         self.value: Optional[dict[str, Any]] = None
         self.fut: Optional[concurrent.futures.Future] = None
+        self.task: Optional[asyncio.Task] = None
+        self.cancel_event: threading.Event = threading.Event()
         self.last_error: Optional[Exception] = None
 
 
@@ -967,12 +973,9 @@ class StatusSnapshotProvider:
         with self._entries_lock:
             if hermes_home is None:
                 entries = list(self._entries.values())
-                self._entries.clear()
             else:
                 target_path = Path(hermes_home)
-                entries = [e for k, e in list(self._entries.items()) if Path(k[0]) == target_path]
-                for e in entries:
-                    self._entries.pop(e.key, None)
+                entries = [e for k, e in self._entries.items() if Path(k[0]) == target_path]
 
         for e in entries:
             with e.lock:
@@ -980,9 +983,11 @@ class StatusSnapshotProvider:
                 e.state = "EMPTY"
                 e.value = None
                 e.ts = 0.0
+                e.cancel_event.set()
+                if e.task and not e.task.done():
+                    e.task.cancel()
                 if e.fut and not e.fut.done():
                     e.fut.cancel()
-                e.fut = None
 
     async def _run_collector(
         self,
@@ -997,34 +1002,48 @@ class StatusSnapshotProvider:
         try:
             val = await self._collect_fn(hermes_home, requested_profile, profile_dir, gateway_health_url)
             with entry.lock:
-                if entry.gen == gen:
+                if entry.gen == gen and not entry.cancel_event.is_set():
                     entry.value = val
                     entry.ts = time.time()
                     entry.state = "FRESH"
                     entry.last_error = None
-                    entry.fut = None
                     if not fut.done():
                         fut.set_result(val)
                 else:
+                    if entry.state == "COMPUTING_COLD" and entry.gen == gen:
+                        entry.state = "EMPTY"
                     if not fut.done():
                         fut.cancel()
-        except Exception as exc:
+        except asyncio.CancelledError:
             with entry.lock:
                 if entry.gen == gen:
+                    if entry.state == "COMPUTING_COLD":
+                        entry.state = "EMPTY"
+                    elif entry.state == "STALE_REFRESHING":
+                        entry.state = "FRESH"
+                if not fut.done():
+                    fut.cancel()
+        except Exception as exc:
+            with entry.lock:
+                if entry.gen == gen and not entry.cancel_event.is_set():
                     entry.last_error = exc
                     if entry.state == "STALE_REFRESHING" and entry.value is not None:
                         entry.state = "FRESH"
-                        entry.fut = None
                         if not fut.done():
                             fut.set_result(entry.value)
                     else:
                         entry.state = "EMPTY"
-                        entry.fut = None
                         if not fut.done():
                             fut.set_exception(exc)
                 else:
                     if not fut.done():
                         fut.cancel()
+        finally:
+            with entry.lock:
+                if entry.fut is fut:
+                    entry.fut = None
+                if entry.task is not None and entry.task.done():
+                    entry.task = None
 
     async def get_status_payload(
         self,
@@ -1054,15 +1073,18 @@ class StatusSnapshotProvider:
             if entry.state == "FRESH" and age <= self.ttl_s and entry.value is not None:
                 return _shape_status_response(entry.value, signed_out)
 
-            if entry.state == "COMPUTING_COLD":
+            # Preserve slot if worker is running: singleflight max_concurrent_workers_per_key == 1
+            if entry.fut is not None and not entry.fut.done():
                 fut = entry.fut
                 spawn = False
+                stale_val = entry.value if entry.state == "STALE_REFRESHING" else None
             elif entry.state == "EMPTY" or age > self.max_stale_s or entry.value is None:
                 entry.state = "COMPUTING_COLD"
                 entry.gen += 1
                 gen = entry.gen
                 fut = concurrent.futures.Future()
                 entry.fut = fut
+                entry.cancel_event = threading.Event()
                 entry.last_error = None
                 spawn = True
             elif entry.state == "FRESH":
@@ -1073,15 +1095,21 @@ class StatusSnapshotProvider:
                 gen = entry.gen
                 fut = concurrent.futures.Future()
                 entry.fut = fut
+                entry.cancel_event = threading.Event()
                 entry.last_error = None
                 spawn = True
-            else:  # STALE_REFRESHING
+            else:  # STALE_REFRESHING with prior fut completed
                 stale_val = entry.value
-                fut = entry.fut
-                spawn = False
+                entry.gen += 1
+                gen = entry.gen
+                fut = concurrent.futures.Future()
+                entry.fut = fut
+                entry.cancel_event = threading.Event()
+                entry.last_error = None
+                spawn = True
 
         if spawn and fut is not None:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._run_collector(
                     entry,
                     gen,
@@ -1092,6 +1120,10 @@ class StatusSnapshotProvider:
                     gateway_health_url,
                 )
             )
+            _STATUS_BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_STATUS_BACKGROUND_TASKS.discard)
+            with entry.lock:
+                entry.task = task
 
         with entry.lock:
             curr_state = entry.state
@@ -1104,14 +1136,32 @@ class StatusSnapshotProvider:
                 return _shape_status_response(val, signed_out)
             except TimeoutError:
                 with entry.lock:
-                    if entry.state == "COMPUTING_COLD":
+                    if entry.state == "COMPUTING_COLD" and entry.fut is fut:
                         entry.gen += 1
                         entry.state = "EMPTY"
-                        if entry.fut and not entry.fut.done():
-                            entry.fut.cancel()
-                        entry.fut = None
+                        if entry.task and not entry.task.done():
+                            entry.task.cancel()
+                        if not fut.done():
+                            fut.cancel()
                 raise HTTPException(status_code=503, detail="Status probe timed out")
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                t_end = time.time() + self.cold_timeout_s
+                while time.time() < t_end:
+                    await asyncio.sleep(0.02)
+                    with entry.lock:
+                        if entry.state == "FRESH" and entry.value is not None:
+                            return _shape_status_response(entry.value, signed_out)
+                        next_fut = entry.fut if (entry.fut is not None and not entry.fut.done() and entry.fut is not fut) else None
+                    if next_fut is not None:
+                        try:
+                            val = await asyncio.wait_for(asyncio.wrap_future(next_fut), timeout=max(0.1, t_end - time.time()))
+                            return _shape_status_response(val, signed_out)
+                        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                            continue
+                        except TimeoutError:
+                            break
+                        except Exception:
+                            break
                 raise HTTPException(status_code=503, detail="Status probe cancelled")
         else:
             # SWR
@@ -1122,7 +1172,7 @@ class StatusSnapshotProvider:
             try:
                 val = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=self.swr_soft_deadline_s)
                 return _shape_status_response(val, signed_out)
-            except TimeoutError:
+            except (TimeoutError, asyncio.CancelledError, concurrent.futures.CancelledError):
                 return _shape_status_response(stale_val, signed_out)
             except Exception:
                 return _shape_status_response(stale_val, signed_out)
@@ -1137,8 +1187,9 @@ def _reset_status_snapshot_cache() -> None:
     try:
         from hermes_cli.web_server_gateway import _reset_configured_platforms_cache
         _reset_configured_platforms_cache()
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger("hermes.web.status").debug("platforms cache reset error: %s", exc)
 
 
 @router.get("/api/status")

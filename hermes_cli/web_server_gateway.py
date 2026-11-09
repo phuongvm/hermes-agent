@@ -293,7 +293,9 @@ def _load_configured_gateway_platforms() -> set[str]:
             *_stat_file_sig(env_path),
             id(load_gateway_config),
         )
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger("hermes.web.gateway").debug("gateway platform cache signature stat error: %s", exc)
         sig = None
 
     if sig is not None:
