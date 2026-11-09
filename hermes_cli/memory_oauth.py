@@ -25,9 +25,9 @@ def _resolve_flow(provider: str):
 @contextmanager
 def _scope_to_profile(profile: Optional[str]):
     """Scope config AND secret resolution to ``profile`` so the flow's eager path resolve targets that
-    profile's honcho.json and its ``get_secret`` reads (``HERMES_HONCHO_HOST``) resolve from that
-    profile. None/""/"current" bind the dashboard's own (effective) profile's secret scope: under
-    multiplex an unscoped read raises ``UnscopedSecretError`` and the route answered HTTP 500."""
+    profile's provider config (such as honcho.json) and its ``get_secret`` reads (``HERMES_HONCHO_HOST``)
+    resolve from that profile. None/""/"current" bind the dashboard's own (effective) profile's secret scope:
+    under multiplex an unscoped read raises ``UnscopedSecretError`` and the route answered HTTP 500."""
     from hermes_cli.web_server_profiles import _config_profile_scope
 
     with _config_profile_scope(profile):

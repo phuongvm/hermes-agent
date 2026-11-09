@@ -24,8 +24,7 @@ from hermes_cli.web_server_memory import (
 from hermes_cli.web_models import MemoryProviderConfigUpdate, MemoryProviderSetupRequest
 from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK, scoped_to_thread
 from plugins.memory.config_schema import (
-    STORAGE_FLAT_JSON, STORAGE_HONCHO_HOST_BLOCK, STORAGE_PROVIDER, ProviderConfigSchema, ProviderField,
-    get_provider_config_schema,
+    STORAGE_FLAT_JSON, STORAGE_HONCHO_HOST_BLOCK, STORAGE_PROVIDER, ProviderConfigSchema, ProviderField, get_provider_config_schema,
 )
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -38,7 +37,7 @@ load_config = late("load_config", "hermes_cli.config")
 save_config = late("save_config", "hermes_cli.config")
 save_env_value = late("save_env_value", "hermes_cli.config")
 load_env = late("load_env", "hermes_cli.config")
-# Sentinel: remove this key so it falls back to the host or built-in default.
+# Sentinel: remove this key so it falls back to the built-in default.
 _UNSET: Any = object()
 
 _MEMORY_PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -156,24 +155,21 @@ def _save_submitted_secrets(provider: ProviderConfigSchema, values: dict[str, st
     return saved
 
 
-def _apply_field_values(provider: ProviderConfigSchema, values: dict[str, str], target_for) -> None:
-    """Apply submitted non-secret fields to their backend dict, in place.
-
-    Only keys present in ``values`` are touched, so a partial save never
-    clobbers fields owned by another surface. ``_UNSET`` clears the key (and
-    its aliases) so it falls back to the host/default mapping.
-    """
+def _apply_field_values(provider: ProviderConfigSchema, values: dict[str, str], target: Any) -> None:
+    """Apply :func:`_submitted_natives` to ``target`` in place; ``_UNSET`` clears the key and its aliases.
+    ``target`` can be a dict or a callable ``target_for(field) -> dict``."""
     natives = _submitted_natives(provider, values)
+    target_fn: Any = target if callable(target) else (lambda field: target)
     for field in provider.fields:
         if field.key not in natives:
             continue
-        target = target_for(field)
+        dest: Any = target_fn(field)
         coerced = natives[field.key]
         if coerced is _UNSET:
             for key in (field.key, *field.aliases):
-                target.pop(key, None)
+                dest.pop(key, None)
         else:
-            target[field.key] = coerced
+            dest[field.key] = coerced
 
 
 def _write_json_0600(path: Path, data: dict[str, Any]) -> None:
@@ -181,6 +177,40 @@ def _write_json_0600(path: Path, data: dict[str, Any]) -> None:
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(path.parent)
     atomic_json_write(path, data, mode=0o600)
+
+
+def _write_provider_flat(provider: ProviderConfigSchema, values: dict[str, str]) -> None:
+    existing = _read_flat_json(provider)
+    _save_submitted_secrets(provider, values)
+    _apply_field_values(provider, values, existing)
+    _write_json_0600(_flat_json_path(provider), existing)
+
+
+def _write_provider_honcho(provider: ProviderConfigSchema, values: dict[str, str]) -> None:
+    """Persist submitted fields to Honcho's real config for the active host (partial
+    saves touch only submitted keys; blank text clears a key — see ``_apply_field_values``)."""
+    from plugins.memory import import_provider_module
+
+    oauth = import_provider_module(provider.name, "oauth")
+    resolve_active_host, resolve_config_path, host_block_of = _honcho_resolvers(provider.name)
+    host = resolve_active_host()
+    path = resolve_config_path()
+
+    with oauth._refresh_lock, oauth._config_refresh_lock(path):
+        cfg = oauth._read_config_strict(path)
+        hosts = cfg.get("hosts")
+        cfg["hosts"] = hosts = hosts if isinstance(hosts, dict) else {}
+        existing = host_block_of(cfg, host)
+        host_key = next((k for k, v in hosts.items() if v is existing), host) if existing else host
+        host_block = hosts.setdefault(host_key, existing)
+
+        for field, submitted in _save_submitted_secrets(provider, values):
+            stored = host_block.get(field.key)
+            if not (isinstance(stored, str) and stored.startswith(oauth.ACCESS_TOKEN_PREFIX)):
+                host_block[field.key] = submitted
+
+        _apply_field_values(provider, values, lambda field: host_block if field.scope == "host" else cfg)
+        _write_json_0600(path, cfg)
 
 
 def _submitted_natives(provider: ProviderConfigSchema, values: dict[str, str]) -> dict[str, Any]:
@@ -200,45 +230,6 @@ def _write_provider_own(provider: ProviderConfigSchema, values: dict[str, str]) 
     except NotImplementedError as exc:  # declares storage=provider without the writer: a plugin bug
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     _save_submitted_secrets(provider, values)
-
-
-def _write_provider_flat(provider: ProviderConfigSchema, values: dict[str, str]) -> None:
-    existing = _read_flat_json(provider)
-    _save_submitted_secrets(provider, values)
-    _apply_field_values(provider, values, lambda field: existing)
-    _write_json_0600(_flat_json_path(provider), existing)
-
-
-def _write_provider_honcho(provider: ProviderConfigSchema, values: dict[str, str]) -> None:
-    """Persist submitted fields to Honcho's real config for the active host (partial
-    saves touch only submitted keys; blank text clears a key — see ``_apply_field_values``)."""
-    from plugins.memory import import_provider_module
-
-    oauth = import_provider_module(provider.name, "oauth")
-    resolve_active_host, resolve_config_path, host_block_of = _honcho_resolvers(provider.name)
-    host = resolve_active_host()
-    # Write the file reads resolve, or a save shadows it with a sparse copy.
-    path = resolve_config_path()
-
-    # OAuth rotation is single-use; an unlocked RMW here can revoke the grant.
-    with oauth._refresh_lock, oauth._config_refresh_lock(path):
-        # Strict: a file that exists but does not parse must not be replaced by this host's block alone.
-        cfg = oauth._read_config_strict(path)
-        hosts = cfg.get("hosts")
-        cfg["hosts"] = hosts = hosts if isinstance(hosts, dict) else {}
-        # Update the block reads resolve (legacy dot-form included), never shadow it.
-        existing = host_block_of(cfg, host)
-        host_key = next((k for k, v in hosts.items() if v is existing), host) if existing else host
-        host_block = hosts.setdefault(host_key, existing)
-
-        for field, submitted in _save_submitted_secrets(provider, values):
-            # Persist where the client reads first; an OAuth token owns that slot.
-            stored = host_block.get(field.key)
-            if not (isinstance(stored, str) and stored.startswith(oauth.ACCESS_TOKEN_PREFIX)):
-                host_block[field.key] = submitted
-
-        _apply_field_values(provider, values, lambda field: host_block if field.scope == "host" else cfg)
-        _write_json_0600(path, cfg)
 
 
 def _serialize_field_value(field: ProviderField, value: Any) -> str:
@@ -287,20 +278,17 @@ def _declared_provider_payload(provider: ProviderConfigSchema) -> dict[str, Any]
         return {"name": provider.name, "label": provider.label, "docs_url": provider.docs_url, "fields": []}
     env = load_env()
     is_honcho = provider.storage == STORAGE_HONCHO_HOST_BLOCK
-    # A provider-owned layout reports presence (a stored False/0 is set), like the host block.
     own = provider.storage == STORAGE_PROVIDER
     placeholders: dict[str, Any] = {}
     if own:
         stored = _provider_instance(provider).read_config_fields(str(get_hermes_home())) or {}
-        data = dict(stored.get("values") or {})
-        placeholders = dict(stored.get("placeholders") or {})
+        data, placeholders = dict(stored.get("values") or {}), dict(stored.get("placeholders") or {})
 
         def sources_for(field: ProviderField) -> tuple:
             return (data,)
     elif is_honcho:
         resolve_active_host, resolve_config_path, host_block_of = _honcho_resolvers(provider.name)
         host = resolve_active_host()
-        # Blank fields surface the resolved host Honcho will actually use.
         placeholders = {"workspace": host, "aiPeer": host}
         raw = _read_json_dict(resolve_config_path(), "Honcho config")
         host_block = host_block_of(raw, host)
@@ -308,7 +296,7 @@ def _declared_provider_payload(provider: ProviderConfigSchema) -> dict[str, Any]
         def sources_for(field: ProviderField) -> tuple:
             return (host_block, raw) if field.scope == "host" else (raw,)
     else:
-        data = _read_flat_json(provider)
+        data, placeholders = _read_flat_json(provider), {}
 
         def sources_for(field: ProviderField) -> tuple:
             return (data,)
@@ -355,8 +343,11 @@ def _memory_section(config: dict[str, Any]) -> dict[str, Any]:
     return memory_config
 
 
-_STORAGE_WRITERS = {STORAGE_FLAT_JSON: _write_provider_flat, STORAGE_PROVIDER: _write_provider_own,
-                    STORAGE_HONCHO_HOST_BLOCK: _write_provider_honcho}
+_STORAGE_WRITERS = {
+    STORAGE_FLAT_JSON: _write_provider_flat,
+    STORAGE_PROVIDER: _write_provider_own,
+    STORAGE_HONCHO_HOST_BLOCK: _write_provider_honcho,
+}
 
 
 def _update_memory_provider_config(provider: ProviderConfigSchema, values: dict[str, str]) -> None:
