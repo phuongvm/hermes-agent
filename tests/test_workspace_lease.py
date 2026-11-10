@@ -5,21 +5,25 @@ import signal
 import sqlite3
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from hermes_cli.workspace_lease import (
+    MAX_LEASE_TTL_S,
     CommitJournalRecord,
     LeaseExecutionReport,
     LeasePreemptedError,
     LeaseRecord,
     WorkspaceLeaseCoordinator,
     atomic_fenced_commit,
+    atomic_fenced_delete,
     atomic_fenced_git_ref_update,
     main as lease_cli_main,
     normalize_scope,
     recover_interrupted_commit,
+    release_workspace_lease,
     scopes_overlap,
 )
 
@@ -603,9 +607,21 @@ def test_cutover_and_watchdog_scripts_enforce_two_phase_staging_and_exit_75_defe
         text = script_path.read_text(encoding="utf-8")
         assert ".tmp." in text, f"{script_path.name} missing 2-phase .tmp.<fencing_token> staging"
         assert "Invoke-FencedCommit" in text, f"{script_path.name} missing Invoke-FencedCommit"
+        assert "Invoke-FencedDelete" in text, f"{script_path.name} missing Invoke-FencedDelete"
         assert "exit 75" in text, f"{script_path.name} missing exit 75 contention deferral"
         assert "Copy-Item" not in text, f"{script_path.name} still contains direct Copy-Item"
         assert "Move-Item" not in text, f"{script_path.name} still contains direct Move-Item"
+        assert "[System.IO.File]::Delete" not in text, (
+            f"{script_path.name} still contains unfenced [System.IO.File]::Delete"
+        )
+        assert "[System.IO.File]::Move" not in text, (
+            f"{script_path.name} still contains unfenced [System.IO.File]::Move"
+        )
+
+    nerve_text = cutover_scripts[1].read_text(encoding="utf-8")
+    assert "reset --quiet --mixed" not in nerve_text, (
+        "apply-live-nerve-cutover.ps1 still contains unfenced git reset --mixed"
+    )
 
     watchdog_scripts = [
         workspaces_root / ".agents" / "skills" / "crew-upstream-sync" / "scripts" / "daily-sync-watchdog.ps1",
@@ -617,3 +633,372 @@ def test_cutover_and_watchdog_scripts_enforce_two_phase_staging_and_exit_75_defe
         assert "Write-DeferredCronLedger" in text, f"{wd_path} missing Write-DeferredCronLedger"
         assert "-eq 75" in text and "exit 0" in text, f"{wd_path} missing exit 75 -> exit 0 translation"
 
+
+def test_shared_session_partial_release_retains_sibling_holders_s01(tmp_path: Path) -> None:
+    lease_dir = tmp_path / "leases"
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda pid: 1,
+        clock=lambda: 1000.0,
+    )
+
+    s1 = coord.acquire_workspace_lease(
+        scopes=("profile:coder",),
+        mode="shared_session",
+        holder="holder-pid-11",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    s2 = coord.acquire_workspace_lease(
+        scopes=("profile:coder",),
+        mode="shared_session",
+        holder="holder-pid-22",
+        holder_pid=22,
+        process_start_time_ns=1,
+    )
+    assert s1.status == "ACQUIRED"
+    assert s2.status == "ACQUIRED"
+
+    # Release PID 11 (works both via explicit pid=11 and via s1's receipt)
+    rel_11 = coord.release_workspace_lease(
+        scopes=("profile:coder",),
+        fencing_tokens=s1.fencing_tokens,
+        pid=11,
+    )
+    assert rel_11.exit_code == 0
+
+    ledger_mid = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
+    assert "profile:coder" in ledger_mid["active_records"]
+    active_rec = ledger_mid["active_records"]["profile:coder"]
+    assert active_rec["state"] == "ACQUIRED"
+    remaining_pids = [int(h.get("pid", h.get("holder_pid", 0))) for h in active_rec["shared_holders"]]
+    assert remaining_pids == [22]
+
+    # Exclusive contender must still be DEFERRED (exit 75) while PID 22 holds the shared lease
+    contender = coord.acquire_workspace_lease(
+        scopes=("profile:*",),
+        mode="exclusive_cutover",
+        holder="exclusive-contender",
+        holder_pid=99,
+        process_start_time_ns=1,
+    )
+    assert contender.status == "DEFERRED"
+    assert contender.exit_code == 75
+    assert contender.reason_code == "DEFERRED_LEASE_HELD"
+
+    # Now release PID 22 via receipt without explicit pid kwarg; scope must become UNLOCKED
+    rel_22 = coord.release_workspace_lease(
+        scopes=("profile:coder",),
+        fencing_tokens=s2.fencing_tokens,
+    )
+    assert rel_22.exit_code == 0
+    ledger_end = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
+    assert "profile:coder" not in ledger_end["active_records"]
+    assert ledger_end["scope_states"]["profile:coder"] == "UNLOCKED"
+
+    contender_after = coord.acquire_workspace_lease(
+        scopes=("profile:*",),
+        mode="exclusive_cutover",
+        holder="exclusive-contender",
+        holder_pid=99,
+        process_start_time_ns=1,
+    )
+    assert contender_after.status == "ACQUIRED"
+    assert contender_after.exit_code == 0
+
+
+def test_max_lease_ttl_ceiling_clamped_on_acquire_and_heartbeat_s02(tmp_path: Path) -> None:
+    lease_dir = tmp_path / "leases"
+    now = [1000.0]
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda pid: 1,
+        clock=lambda: now[0],
+    )
+
+    assert MAX_LEASE_TTL_S == 1800.0
+
+    # Acquire with ttl_s=3600; verify clamped to 1800.0 and max_expires_at == 2800.0
+    acq = coord.acquire_workspace_lease(
+        scopes=("profile:coder",),
+        mode="exclusive_cutover",
+        holder="long-runner",
+        ttl_s=3600.0,
+        holder_pid=42,
+        process_start_time_ns=1,
+    )
+    assert acq.status == "ACQUIRED"
+    token = acq.fencing_tokens["profile:coder"]
+
+    ledger_data = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
+    rec_data = ledger_data["active_records"]["profile:coder"]
+    assert rec_data["ttl_s"] == 1800.0
+    assert rec_data["max_expires_at"] == 1000.0 + 1800.0
+
+    # Renew every 30s up to 2800.0; expiry must never exceed acquired_at + 1800.0 (2800.0)
+    last_rec = None
+    while now[0] + 30.0 <= 2800.0:
+        now[0] += 30.0
+        last_rec = coord.renew_lease_heartbeat("profile:coder", token)
+        assert last_rec.ttl_s == 1800.0
+        assert last_rec.max_expires_at == 2800.0
+        assert last_rec.expires_at_epoch <= 2800.0
+
+    assert last_rec is not None
+    assert last_rec.expires_at_epoch == 2800.0
+
+    # Attempting renewal past 1800s from initial acquisition (at t=2830.0) must fail closed
+    now[0] = 2830.0
+    with pytest.raises(LeasePreemptedError):
+        coord.renew_lease_heartbeat("profile:coder", token)
+
+    # Even if persisted JSON on disk is tampered with ttl_s=99999, loading clamps to 1800.0
+    tampered = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
+    tampered["active_records"]["profile:coder"]["ttl_s"] = 99999.0
+    tampered["active_records"]["profile:coder"]["max_expires_at"] = 999999.0
+    (lease_dir / "workspace_leases.json").write_text(json.dumps(tampered), encoding="utf-8")
+    loaded_rec = LeaseRecord.from_dict(tampered["active_records"]["profile:coder"])
+    assert loaded_rec.ttl_s == 1800.0
+    assert loaded_rec.max_expires_at == 1000.0 + 1800.0
+
+    # Invalid / negative / NaN TTL values are rejected; +inf is clamped to 1800.0
+    with pytest.raises(ValueError):
+        coord.acquire_workspace_lease(scopes=("profile:qa",), ttl_s=-10.0)
+    with pytest.raises(ValueError):
+        coord.acquire_workspace_lease(scopes=("profile:qa",), ttl_s=float("nan"))
+    inf_acq = coord.acquire_workspace_lease(
+        scopes=("profile:qa",), ttl_s=float("inf"), holder_pid=77, process_start_time_ns=1
+    )
+    assert inf_acq.status == "ACQUIRED"
+    ledger_inf = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
+    assert ledger_inf["active_records"]["profile:qa"]["ttl_s"] == 1800.0
+
+
+def test_git_crash_recovery_reconciles_worktree_bytes_before_committed_a02(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+
+    tracked = repo / "module.py"
+    tracked.write_text("old\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "old"], check=True, capture_output=True)
+    old_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    tracked.write_text("new\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "commit", "-am", "new"], check=True, capture_output=True)
+    new_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Reset back to old_sha so working tree has "old\n" while new_sha exists in object db
+    subprocess.run(["git", "-C", str(repo), "reset", "--hard", old_sha], check=True, capture_output=True)
+    assert tracked.read_text(encoding="utf-8") == "old\n"
+
+    lease_dir = tmp_path / "leases"
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda pid: 1,
+        clock=lambda: 1762732800.0,
+    )
+    acq = coord.acquire_workspace_lease(
+        scopes=("repo:oss/crew",),
+        mode="exclusive_cutover",
+        holder="crew-cutover",
+        holder_pid=5000,
+        process_start_time_ns=1,
+    )
+    token = acq.fencing_tokens["repo:oss/crew"]
+
+    real_run = subprocess.run
+
+    def crash_before_reset(cmd: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(cmd, list) and "reset" in cmd:
+            raise RuntimeError("injected crash after update-ref before reset")
+        return real_run(cmd, *args, **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(subprocess, "run", crash_before_reset)
+    with pytest.raises(RuntimeError, match="injected crash after update-ref before reset"):
+        coord.atomic_fenced_git_ref_update(
+            scope="repo:oss/crew",
+            acquired_token=token,
+            repo_root=repo,
+            ref_name="refs/heads/main",
+            new_sha=new_sha,
+            old_sha=old_sha,
+        )
+
+    # Confirm split state right after crash: ref is new_sha, but worktree file is still "old\n"
+    monkeypatch.setattr(subprocess, "run", real_run)
+    head_mid = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_mid == new_sha
+    assert tracked.read_text(encoding="utf-8") == "old\n"
+
+    # Now run recover_interrupted_commit(): it MUST reconcile the worktree to "new\n" before marking COMMITTED
+    recovered = coord.recover_interrupted_commit()
+    assert len(recovered) == 1
+    assert recovered[0].state == "COMMITTED"
+    assert tracked.read_text(encoding="utf-8") == "new\n"
+    ledger = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
+    assert ledger["active_records"]["repo:oss/crew"]["last_committed_digest"] == new_sha
+
+
+def test_atomic_fenced_delete_and_cli_preemption_and_recovery_a01(tmp_path: Path) -> None:
+    lease_dir = tmp_path / "leases"
+    now = [time.time()]
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda pid: 100,
+        clock=lambda: now[0],
+    )
+
+    h1 = coord.acquire_workspace_lease(
+        scopes=("profile:*",),
+        mode="exclusive_cutover",
+        holder="holder-1",
+        holder_pid=101,
+        process_start_time_ns=100,
+    )
+    token_1 = h1.fencing_tokens["profile:*"]
+
+    # 1. Valid fenced deletion with backup/quarantine copy and empty parent pruning
+    root_dir = tmp_path / "profile_root"
+    nested_dir = root_dir / "plugins" / "crew" / "obsolete"
+    nested_dir.mkdir(parents=True)
+    retired_file = nested_dir / "old_helper.py"
+    retired_file.write_text("# retired\n", encoding="utf-8")
+    backup_file = tmp_path / "backups" / "old_helper.py"
+
+    atomic_fenced_delete(
+        retired_file,
+        token_1,
+        backup_path=backup_file,
+        prune_empty_parents_up_to=root_dir / "plugins" / "crew",
+        lease_dir=lease_dir,
+    )
+    assert not retired_file.exists()
+    assert not nested_dir.exists()
+    assert (root_dir / "plugins" / "crew").exists()
+    assert backup_file.read_text(encoding="utf-8") == "# retired\n"
+
+    # 2. Preemption test: Holder 1 expires, Holder 2 acquires and writes successor file;
+    # Holder 1's late `hermes lease delete` must exit 78 and leave Holder 2's file intact!
+    now[0] += 95.0
+    h2 = coord.acquire_workspace_lease(
+        scopes=("profile:*",),
+        mode="exclusive_cutover",
+        holder="holder-2",
+        holder_pid=202,
+        process_start_time_ns=100,
+    )
+    assert h2.status == "ACQUIRED"
+    token_2 = h2.fencing_tokens["profile:*"]
+
+    successor_file = root_dir / "plugins" / "crew" / "active.py"
+    successor_file.write_text("successor = True\n", encoding="utf-8")
+
+    with pytest.raises(LeasePreemptedError) as exc_info:
+        coord.atomic_fenced_delete(successor_file, token_1)
+    assert exc_info.value.exit_code == 78
+    assert successor_file.read_text(encoding="utf-8") == "successor = True\n"
+
+    rc_stale = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "delete",
+            "--path",
+            str(successor_file),
+            "--fencing-token",
+            token_1,
+        ]
+    )
+    assert rc_stale == 78
+    assert successor_file.read_text(encoding="utf-8") == "successor = True\n"
+
+    # 3. Valid CLI delete with Holder 2's active token succeeds
+    rc_ok = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "delete",
+            "--path",
+            str(successor_file),
+            "--fencing-token",
+            token_2,
+        ]
+    )
+    assert rc_ok == 0
+    assert not successor_file.exists()
+
+    # 4. Preempted git-ref-update --reset-mode mixed (Nerve plugin alignment seam) exits 78 without mutating HEAD
+    plugin_repo = tmp_path / "plugin_nerve"
+    plugin_repo.mkdir()
+    subprocess.run(["git", "-C", str(plugin_repo), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(plugin_repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(plugin_repo), "config", "user.name", "Test"], check=True)
+    (plugin_repo / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(plugin_repo), "add", "__init__.py"], check=True)
+    subprocess.run(["git", "-C", str(plugin_repo), "commit", "-m", "c1"], check=True, capture_output=True)
+    sha_c1 = subprocess.run(
+        ["git", "-C", str(plugin_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (plugin_repo / "__init__.py").write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(plugin_repo), "commit", "-am", "c2"], check=True, capture_output=True)
+    sha_c2 = subprocess.run(
+        ["git", "-C", str(plugin_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    rc_git_stale = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "git-ref-update",
+            "--scope",
+            "profile:*",
+            "--token",
+            token_1,
+            "--repo-root",
+            str(plugin_repo),
+            "--ref",
+            "HEAD",
+            "--new-sha",
+            sha_c1,
+            "--old-sha",
+            sha_c2,
+            "--reset-mode",
+            "mixed",
+            "--refresh-index",
+        ]
+    )
+    assert rc_git_stale == 78
+    head_after_stale = subprocess.run(
+        ["git", "-C", str(plugin_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after_stale == sha_c2
