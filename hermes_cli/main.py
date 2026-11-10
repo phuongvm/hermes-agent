@@ -307,6 +307,7 @@ from hermes_cli.subcommands.vault import build_vault_parser
 from hermes_cli.subcommands.moa import build_moa_parser
 from hermes_cli.subcommands.fallback import build_fallback_parser
 from hermes_cli.subcommands.worktree import build_worktree_parser
+from hermes_cli.workspace_lease import build_lease_parser
 from hermes_cli.subcommands.browser import build_browser_parser
 from hermes_cli.subcommands.secrets import build_secrets_parser
 from hermes_cli.subcommands.codex_runtime import build_codex_runtime_parser
@@ -2650,7 +2651,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "clipboard", "computer-use", "connectors",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "kanban", "lease", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy", "prompt-size", "resume", "send", "sessions", "setup",
@@ -3190,6 +3191,7 @@ def _build_cli_parser():
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
     build_worktree_parser(subparsers)
+    build_lease_parser(subparsers)
     build_browser_parser(subparsers)
     build_secrets_parser(subparsers)
     # OUTBOUND egress firewall; ``hermes proxy`` (gateway group) is the INBOUND one.
