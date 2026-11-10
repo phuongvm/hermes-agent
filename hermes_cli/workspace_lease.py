@@ -129,7 +129,7 @@ def _format_holder_id(
     holder_pid: int, process_start_time_ns: int, holder: str
 ) -> str:
     """Format a durable per-holder identity string that survives JSON/CLI round-trips."""
-    return f"{int(holder_pid)}:{int(process_start_time_ns)}:{str(holder)}"
+    return f"{int(holder_pid)}:{int(process_start_time_ns)}:{holder!s}"
 
 
 def _split_token_and_holder_id(fencing_token: str) -> tuple[str, str | None]:
@@ -137,7 +137,7 @@ def _split_token_and_holder_id(fencing_token: str) -> tuple[str, str | None]:
     raw = str(fencing_token).strip()
     if "@" in raw:
         base, holder_id = raw.split("@", 1)
-        return base, (holder_id if holder_id else None)
+        return base.strip(), (holder_id.strip() if holder_id.strip() else None)
     return raw, None
 
 
@@ -1913,98 +1913,135 @@ class WorkspaceLeaseCoordinator:
             self._recover_interrupted_commit_locked(ledger)
             released_scopes: list[str] = []
             unmatched_reason: str | None = None
-            for sc in canonical_scopes:
-                rec = ledger.active_records.get(sc)
-                raw_expected = token_map.get(sc, "")
-                expected_base, token_holder_id = _split_token_and_holder_id(raw_expected)
-                if rec is None:
-                    continue
-                if expected_base and rec.fencing_token != expected_base:
-                    continue
-                if rec.mode == "shared_session" and rec.shared_holders:
-                    removed = False
-                    remaining_holders: list[dict[str, Any]] = []
-                    candidate_holder_id = token_holder_id or implicit_holder_id
+            if not canonical_scopes:
+                unmatched_reason = "INVALID_FENCING_TOKEN"
+            else:
+                for sc in canonical_scopes:
+                    raw_expected = token_map.get(sc, "")
+                    expected_base, _ = _split_token_and_holder_id(raw_expected)
+                    rec = ledger.active_records.get(sc)
+                    if not expected_base:
+                        unmatched_reason = "INVALID_FENCING_TOKEN"
+                        break
+                    if rec is not None and rec.fencing_token != expected_base:
+                        unmatched_reason = "INVALID_FENCING_TOKEN"
+                        break
 
-                    if not has_explicit_selector and not candidate_holder_id and implicit_pid is None and not implicit_holder:
-                        unmatched_reason = "SHARED_HOLDER_ID_REQUIRED"
+            if unmatched_reason is None:
+                for sc in canonical_scopes:
+                    rec = ledger.active_records.get(sc)
+                    raw_expected = token_map.get(sc, "")
+                    expected_base, token_holder_id = _split_token_and_holder_id(
+                        raw_expected
+                    )
+                    if not expected_base:
+                        unmatched_reason = "INVALID_FENCING_TOKEN"
                         continue
+                    if rec is None:
+                        if unmatched_reason is None:
+                            unmatched_reason = "LEASE_NOT_ACTIVE"
+                        continue
+                    if rec.fencing_token != expected_base:
+                        unmatched_reason = "INVALID_FENCING_TOKEN"
+                        continue
+                    if rec.mode == "shared_session" and rec.shared_holders:
+                        removed = False
+                        remaining_holders: list[dict[str, Any]] = []
+                        candidate_holder_id = token_holder_id or implicit_holder_id
 
-                    for sh in rec.shared_holders:
-                        sh_pid = int(sh.get("pid", sh.get("holder_pid", 0)))
-                        sh_start_ns = int(sh.get("process_start_time_ns", 0))
-                        sh_holder = str(sh.get("holder", ""))
-                        sh_holder_id = str(
-                            sh.get("holder_id")
-                            or _format_holder_id(sh_pid, sh_start_ns, sh_holder)
-                        )
+                        if (
+                            not has_explicit_selector
+                            and not candidate_holder_id
+                            and implicit_pid is None
+                            and not implicit_holder
+                        ):
+                            unmatched_reason = "SHARED_HOLDER_ID_REQUIRED"
+                            continue
+
+                        for sh in rec.shared_holders:
+                            sh_pid = int(sh.get("pid", sh.get("holder_pid", 0)))
+                            sh_start_ns = int(sh.get("process_start_time_ns", 0))
+                            sh_holder = str(sh.get("holder", ""))
+                            sh_holder_id = str(
+                                sh.get("holder_id")
+                                or _format_holder_id(sh_pid, sh_start_ns, sh_holder)
+                            )
+                            if not removed:
+                                if has_explicit_selector:
+                                    id_ok = (
+                                        explicit_holder_id is None
+                                        or sh_holder_id == explicit_holder_id
+                                    )
+                                    pid_ok = (
+                                        explicit_pid is None or sh_pid == explicit_pid
+                                    )
+                                    holder_ok = (
+                                        explicit_holder is None
+                                        or sh_holder == explicit_holder
+                                    )
+                                    if id_ok and pid_ok and holder_ok:
+                                        removed = True
+                                        continue
+                                elif candidate_holder_id is not None:
+                                    if sh_holder_id == candidate_holder_id:
+                                        removed = True
+                                        continue
+                                else:
+                                    pid_ok = (
+                                        implicit_pid is None
+                                        or sh_pid == int(implicit_pid)
+                                    )
+                                    holder_ok = (
+                                        implicit_holder is None
+                                        or sh_holder == implicit_holder
+                                    )
+                                    if pid_ok and holder_ok:
+                                        removed = True
+                                        continue
+                            remaining_holders.append(sh)
+
                         if not removed:
-                            if has_explicit_selector:
-                                id_ok = (
-                                    explicit_holder_id is None
-                                    or sh_holder_id == explicit_holder_id
-                                )
-                                pid_ok = (
-                                    explicit_pid is None or sh_pid == explicit_pid
-                                )
-                                holder_ok = (
-                                    explicit_holder is None
-                                    or sh_holder == explicit_holder
-                                )
-                                if id_ok and pid_ok and holder_ok:
-                                    removed = True
-                                    continue
-                            elif candidate_holder_id is not None:
-                                if sh_holder_id == candidate_holder_id:
-                                    removed = True
-                                    continue
-                            else:
-                                pid_ok = (
-                                    implicit_pid is None or sh_pid == int(implicit_pid)
-                                )
-                                holder_ok = (
-                                    implicit_holder is None
-                                    or sh_holder == implicit_holder
-                                )
-                                if pid_ok and holder_ok:
-                                    removed = True
-                                    continue
-                        remaining_holders.append(sh)
+                            unmatched_reason = "HOLDER_NOT_FOUND"
+                            continue
 
-                    if not removed:
-                        unmatched_reason = "HOLDER_NOT_FOUND"
-                        continue
+                        rec.shared_holders = remaining_holders
+                        if len(rec.shared_holders) > 0:
+                            primary = rec.shared_holders[0]
+                            rec.holder = str(primary.get("holder", rec.holder))
+                            rec.holder_pid = int(
+                                primary.get(
+                                    "pid", primary.get("holder_pid", rec.holder_pid)
+                                )
+                            )
+                            rec.process_start_time_ns = int(
+                                primary.get(
+                                    "process_start_time_ns",
+                                    rec.process_start_time_ns,
+                                )
+                            )
+                            rec.state = "ACQUIRED"
+                            ledger.scope_states[sc] = "ACQUIRED"
+                            released_scopes.append(sc)
+                            continue
 
-                    rec.shared_holders = remaining_holders
-                    if len(rec.shared_holders) > 0:
-                        primary = rec.shared_holders[0]
-                        rec.holder = str(primary.get("holder", rec.holder))
-                        rec.holder_pid = int(
-                            primary.get("pid", primary.get("holder_pid", rec.holder_pid))
-                        )
-                        rec.process_start_time_ns = int(
-                            primary.get("process_start_time_ns", rec.process_start_time_ns)
-                        )
-                        rec.state = "ACQUIRED"
-                        ledger.scope_states[sc] = "ACQUIRED"
-                        released_scopes.append(sc)
-                        continue
+                    rec.state = "RELEASING"
+                    ledger.scope_states[sc] = "RELEASING"
+                    ledger.active_records.pop(sc, None)
+                    ledger.history.append(replace(rec, state="UNLOCKED").to_dict())
+                    ledger.scope_states[sc] = "UNLOCKED"
+                    released_scopes.append(sc)
+                self._write_ledger_locked(ledger)
 
-                rec.state = "RELEASING"
-                ledger.scope_states[sc] = "RELEASING"
-                ledger.active_records.pop(sc, None)
-                ledger.history.append(replace(rec, state="UNLOCKED").to_dict())
-                ledger.scope_states[sc] = "UNLOCKED"
-                released_scopes.append(sc)
-            self._write_ledger_locked(ledger)
-
+        is_released = (
+            bool(released_scopes) and unmatched_reason != "INVALID_FENCING_TOKEN"
+        )
         reason = (
             "LEASE_RELEASED"
-            if released_scopes or unmatched_reason is None
-            else unmatched_reason
+            if is_released
+            else (unmatched_reason or "LEASE_NOT_ACTIVE")
         )
         return LeaseExecutionReport(
-            status=final_status if released_scopes or unmatched_reason is None else "NOOP",
+            status=final_status if is_released else "NOOP",
             reason_code=reason,
             exit_code=EXIT_OK,
             scopes=tuple(released_scopes),

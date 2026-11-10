@@ -1282,3 +1282,104 @@ def test_atomic_fenced_delete_and_cli_preemption_and_recovery_a01(tmp_path: Path
         text=True,
     ).stdout.strip()
     assert head_after_stale == sha_c2
+
+
+def test_release_without_valid_fencing_token_fails_closed_s05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lease_dir = tmp_path / "leases"
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+
+    acq = coord.acquire_workspace_lease(
+        ("profile:coder",),
+        "exclusive_cutover",
+        "A",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    assert acq.status == "ACQUIRED"
+    valid_token = acq.fencing_tokens["profile:coder"]
+
+    # 1. Calling release_workspace_lease with no token / default argument MUST fail closed
+    rel_no_arg = coord.release_workspace_lease(("profile:coder",))
+    assert rel_no_arg.status == "NOOP"
+    assert rel_no_arg.reason_code == "INVALID_FENCING_TOKEN"
+    assert rel_no_arg.scopes == ()
+    assert "profile:coder" in coord.get_status()["ledger"]["active_records"]
+
+    # 2. Calling release_workspace_lease with empty string or empty dict MUST fail closed
+    rel_empty_str = release_workspace_lease(
+        ("profile:coder",), fencing_tokens="", lease_dir=lease_dir
+    )
+    assert rel_empty_str.status == "NOOP"
+    assert rel_empty_str.reason_code == "INVALID_FENCING_TOKEN"
+    assert "profile:coder" in coord.get_status()["ledger"]["active_records"]
+
+    rel_empty_map = coord.release_workspace_lease(("profile:coder",), fencing_tokens={})
+    assert rel_empty_map.status == "NOOP"
+    assert rel_empty_map.reason_code == "INVALID_FENCING_TOKEN"
+    assert "profile:coder" in coord.get_status()["ledger"]["active_records"]
+
+    # 3. Calling release_workspace_lease with wrong fencing token MUST fail closed
+    rel_wrong = coord.release_workspace_lease(
+        ("profile:coder",), fencing_tokens="profile:coder:1000:999"
+    )
+    assert rel_wrong.status == "NOOP"
+    assert rel_wrong.reason_code == "INVALID_FENCING_TOKEN"
+    assert rel_wrong.scopes == ()
+    assert "profile:coder" in coord.get_status()["ledger"]["active_records"]
+
+    # 4. CLI release without --token / --tokens-json or with wrong token MUST fail closed
+    capsys.readouterr()
+    rc_cli_missing = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "release",
+            "--scope",
+            "profile:coder",
+        ]
+    )
+    out_missing = json.loads(capsys.readouterr().out.strip())
+    assert out_missing["status"] == "NOOP"
+    assert out_missing["reason_code"] == "INVALID_FENCING_TOKEN"
+    assert rc_cli_missing != 0 or out_missing["status"] == "NOOP"
+    assert "profile:coder" in coord.get_status()["ledger"]["active_records"]
+
+    # 5. Multi-scope partial token map MUST fail closed and preserve active records
+    acq_multi = coord.acquire_workspace_lease(
+        ("repo:oss/crew",),
+        "exclusive_cutover",
+        "A",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    assert acq_multi.status == "ACQUIRED"
+    crew_token = acq_multi.fencing_tokens["repo:oss/crew"]
+
+    rel_partial = coord.release_workspace_lease(
+        ("repo:oss/crew", "profile:coder"),
+        fencing_tokens={"repo:oss/crew": crew_token},
+    )
+    assert rel_partial.status == "NOOP"
+    assert rel_partial.reason_code == "INVALID_FENCING_TOKEN"
+    assert "profile:coder" in coord.get_status()["ledger"]["active_records"]
+    assert "repo:oss/crew" in coord.get_status()["ledger"]["active_records"]
+
+    # 6. Calling release_workspace_lease with matching non-empty tokens releases the leases
+    rel_ok = coord.release_workspace_lease(
+        ("repo:oss/crew", "profile:coder"),
+        fencing_tokens={
+            "repo:oss/crew": crew_token,
+            "profile:coder": valid_token,
+        },
+    )
+    assert rel_ok.status == "APPLIED"
+    assert rel_ok.reason_code == "LEASE_RELEASED"
+    assert rel_ok.scopes == ("repo:oss/crew", "profile:coder")
+    assert "profile:coder" not in coord.get_status()["ledger"]["active_records"]
+    assert "repo:oss/crew" not in coord.get_status()["ledger"]["active_records"]
