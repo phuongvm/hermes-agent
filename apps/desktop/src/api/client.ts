@@ -761,6 +761,7 @@ export function hermesApi<T>(request: HermesApiRequest): Promise<T> {
   if (isTerminalSignedOut()) {
     const err = new Error('Authentication required (signed-out)')
     Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
+
     return Promise.reject(err)
   }
 
