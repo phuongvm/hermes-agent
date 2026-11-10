@@ -430,9 +430,17 @@ def get_container_exec_info() -> Optional[dict]:
 
 # ---- Config paths / HERMES_HOME skeleton ----
 
+SUPPORTS_FLEET_OVERLAY: bool = True
+
+
 def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
+
+
+def get_fleet_config_path() -> Path:
+    """Get the declarative fleet configuration overlay file path."""
+    return get_hermes_home() / "config.fleet.yaml"
 
 
 def require_parseable_user_config(*, ignore_user_config: bool = False) -> None:
@@ -2121,9 +2129,42 @@ def _load_config_cache_sig(config_path: Path) -> tuple[Optional[tuple[Any, ...]]
         managed_sig = file_cache_version(managed_dir / "config.yaml") if managed_dir else (0, 0, 0, 0, "")  # config-reader: ok — managed overlay
     except OSError:
         managed_sig = (0, 0, 0, 0, "")
-    if user_sig is None and managed_sig == (0, 0, 0, 0, ""):
+
+    fleet_path = get_fleet_config_path()
+    try:
+        fleet_sig = file_cache_version(fleet_path) if fleet_path.is_file() else (0, 0, 0, 0, "")
+    except OSError:
+        fleet_sig = (0, 0, 0, 0, "")
+
+    home = get_hermes_home()
+    active_mask_path = home / "state" / "fleet" / "mcp_availability.json"
+    try:
+        mask_sig = file_cache_version(active_mask_path) if active_mask_path.is_file() else (0, 0, 0, 0, "")
+    except OSError:
+        mask_sig = (0, 0, 0, 0, "")
+
+    current_sealed_path = home / "releases" / "current" / "SEALED"
+    try:
+        sealed_sig = file_cache_version(current_sealed_path) if current_sealed_path.is_file() else (0, 0, 0, 0, "")
+    except OSError:
+        sealed_sig = (0, 0, 0, 0, "")
+
+    base_mask_path = home / "releases" / "current" / "mcp_availability.json"
+    try:
+        base_mask_sig = file_cache_version(base_mask_path) if base_mask_path.is_file() else (0, 0, 0, 0, "")
+    except OSError:
+        base_mask_sig = (0, 0, 0, 0, "")
+
+    if (
+        user_sig is None
+        and managed_sig == (0, 0, 0, 0, "")
+        and fleet_sig == (0, 0, 0, 0, "")
+        and mask_sig == (0, 0, 0, 0, "")
+        and sealed_sig == (0, 0, 0, 0, "")
+        and base_mask_sig == (0, 0, 0, 0, "")
+    ):
         return None, None
-    return user_sig, (*(user_sig or (0, 0, 0, 0, "")), *managed_sig)
+    return user_sig, (*(user_sig or (0, 0, 0, 0, "")), *managed_sig, *fleet_sig, *mask_sig, *sealed_sig, *base_mask_sig)
 
 
 def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[dict[str, Any]]:
@@ -2148,6 +2189,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         if raw_good is not None:
             merged_good = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good)
             apply_user_moa_presets(merged_good, raw_good)
+            merged_good = _merge_fleet_overlay(merged_good, raw_good)
             normalized = _canonicalize_config(merged_good)
             expanded_good: dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
             lkg, _ = _merge_managed_overlay(expanded_good)
@@ -2165,6 +2207,178 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         # normally, and a read error is re-probed on every hit (_load_config_cache_hit).
         _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
     return lkg_copy
+
+
+def _get_mcp_disabled_server_ids() -> set[str]:
+    """Retrieve the set of disabled MCP server IDs from state/fleet/mcp_availability.json
+    (falling back to releases/current/mcp_availability.json on release skew or corruption).
+    Normalizes both string-form and object-form entries without crashing."""
+    home = get_hermes_home()
+    active_mask_path = home / "state" / "fleet" / "mcp_availability.json"
+    current_sealed_path = home / "releases" / "current" / "SEALED"
+    base_mask_path = home / "releases" / "current" / "mcp_availability.json"
+
+    disabled_raw: list[Any] = []
+    applied = False
+
+    current_sha = None
+    if current_sealed_path.is_file():
+        try:
+            sealed_info = json.loads(current_sealed_path.read_text(encoding="utf-8"))
+            current_sha = sealed_info.get("release_sha")
+        except Exception:
+            pass
+
+    if active_mask_path.is_file():
+        try:
+            mask_data = json.loads(active_mask_path.read_text(encoding="utf-8"))
+            mask_sha = mask_data.get("release_sha")
+            # Loader checks active generation
+            if current_sha is None or mask_sha == current_sha:
+                disabled_raw = mask_data.get("disabled_servers") or []
+                applied = True
+            else:
+                logger.warning(
+                    f"Active MCP availability mask release_sha '{mask_sha}' skewed from "
+                    f"current '{current_sha}', falling back to base mask."
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to read active MCP availability mask: {exc}, falling back to base mask.")
+
+    if not applied and base_mask_path.is_file():
+        try:
+            base_data = json.loads(base_mask_path.read_text(encoding="utf-8"))
+            disabled_raw = base_data.get("disabled_servers") or []
+        except Exception as exc:
+            logger.warning(f"Failed to read base MCP availability mask: {exc}")
+
+    disabled_ids: set[str] = set()
+    for entry in disabled_raw:
+        if isinstance(entry, str):
+            disabled_ids.add(entry)
+        elif isinstance(entry, dict) and "server_id" in entry and isinstance(entry["server_id"], str):
+            disabled_ids.add(entry["server_id"])
+    return disabled_ids
+
+
+def _evaluate_all_mcp_servers(config: dict[str, Any], user_raw: dict[str, Any]) -> None:
+    """Evaluate effective enablement for all MCP servers following Truth Table Rules E-1..E-5.
+
+    Inputs:
+    - F_def: Fleet default enablement (default_enabled, defaults to True)
+    - Op_L3: Operator preference (mcp_overrides.<id>.enabled or mcp_servers.<id>.enabled)
+    - Mask: Dynamic node availability mask (disabled_servers in active or base mask)
+
+    Precedence:
+    - Rule E-1a / E-1b: Operator explicit false ALWAYS dominates (effective = False)
+    - Rule E-2a: Operator explicit true wins over fleet default when binary is available (effective = True)
+    - Rule E-2b: Binary missing on node overrides operator enable (effective = False)
+    - Rule E-3: Fleet default_enabled takes effect when operator has not expressed preference (effective = F_def)
+    - Rule E-4a / E-4b: Missing binary disables server when operator is unset (effective = False)
+    - Rule E-5: Same-server conflict: mcp_overrides.<id>.enabled dominates mcp_servers.<id>.enabled
+    """
+    if "mcp_servers" not in config or not isinstance(config["mcp_servers"], dict):
+        return
+
+    user_mcp = user_raw.get("mcp_servers") or {} if isinstance(user_raw, dict) else {}
+    user_overrides = user_raw.get("mcp_overrides") or {} if isinstance(user_raw, dict) else {}
+    disabled_ids = _get_mcp_disabled_server_ids()
+
+    for srv_id, srv_cfg in config["mcp_servers"].items():
+        if not isinstance(srv_cfg, dict):
+            continue
+
+        f_def = srv_cfg.get("default_enabled", True)
+
+        # Operator L3 preference
+        ovr_val = None
+        if isinstance(user_overrides, dict) and srv_id in user_overrides:
+            u_ovr_item = user_overrides[srv_id]
+            if isinstance(u_ovr_item, dict) and "enabled" in u_ovr_item:
+                ovr_val = u_ovr_item["enabled"]
+
+        mcp_val = None
+        if isinstance(user_mcp, dict) and srv_id in user_mcp:
+            u_mcp_item = user_mcp[srv_id]
+            if isinstance(u_mcp_item, dict) and "enabled" in u_mcp_item:
+                mcp_val = u_mcp_item["enabled"]
+
+        # Rule E-5: Same-server conflict resolution: mcp_overrides dominates mcp_servers.<id>.enabled
+        if ovr_val is not None:
+            op_l3 = ovr_val
+        elif mcp_val is not None:
+            op_l3 = mcp_val
+        else:
+            op_l3 = None
+
+        is_masked = srv_id in disabled_ids
+
+        # Evaluate complete truth table (Rules E-1..E-5)
+        if op_l3 is False:
+            # Rule E-1a / E-1b: Operator explicit false ALWAYS dominates
+            effective_enabled = False
+        elif op_l3 is True:
+            if is_masked:
+                # Rule E-2b: Binary missing on node overrides operator enable
+                effective_enabled = False
+            else:
+                # Rule E-2a: Operator explicit true wins over fleet default
+                effective_enabled = True
+        else:
+            # op_l3 is None (operator has not expressed preference)
+            if is_masked:
+                # Rule E-4a / E-4b: Missing binary disables server
+                effective_enabled = False
+            else:
+                # Rule E-3: Fleet default_enabled takes effect
+                effective_enabled = bool(f_def)
+
+        srv_cfg["enabled"] = effective_enabled
+
+
+def _merge_fleet_overlay(config: dict[str, Any], user_raw: dict[str, Any]) -> dict[str, Any]:
+    """Merge declarative fleet configuration overlay (config.fleet.yaml) if present.
+    Enforces Layer 3 operator protection:
+    - Strips any forbidden fleet-owned enabled / mcp_overrides keys from fleet overlay.
+    - Evaluates complete Truth Table (Rules E-1..E-5) for MCP server enablement.
+    - Applies dynamic MCP availability mask from state/fleet/mcp_availability.json
+      (falling back to releases/current/mcp_availability.json on release skew or corruption).
+    """
+    fleet_path = get_fleet_config_path()
+    if not fleet_path.is_file():
+        _evaluate_all_mcp_servers(config, user_raw)
+        return config
+
+    try:
+        fleet_data = read_config_doc(fleet_path) or {}
+    except Exception as exc:
+        logger.warning(f"Failed to read fleet config overlay from {fleet_path}: {exc}")
+        _evaluate_all_mcp_servers(config, user_raw)
+        return config
+
+    if not isinstance(fleet_data, dict):
+        _evaluate_all_mcp_servers(config, user_raw)
+        return config
+
+    fleet_copy = copy.deepcopy(fleet_data)
+
+    # Strip forbidden fleet-owned keys to protect Layer 3 ownership boundary (Warning A-04)
+    fleet_copy.pop("mcp_overrides", None)
+    if "mcp_servers" in fleet_copy and isinstance(fleet_copy["mcp_servers"], dict):
+        for srv_id, srv_cfg in fleet_copy["mcp_servers"].items():
+            if isinstance(srv_cfg, dict) and "enabled" in srv_cfg:
+                if "default_enabled" not in srv_cfg:
+                    srv_cfg["default_enabled"] = srv_cfg.pop("enabled")
+                else:
+                    srv_cfg.pop("enabled", None)
+
+    # Deep merge fleet config into effective config
+    merged = _deep_merge(config, fleet_copy)
+
+    # Evaluate complete Truth Table (Rules E-1..E-5) across all servers
+    _evaluate_all_mcp_servers(merged, user_raw)
+
+    return merged
 
 
 def _merge_managed_overlay(expanded: dict[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -2246,6 +2460,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_config: dict[str, Any] = {}
 
         if user_sig is not None:
             try:
@@ -2279,6 +2494,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                     _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
                 return copy.deepcopy(fallback) if want_deepcopy else fallback
 
+        config = _merge_fleet_overlay(config, user_config if user_sig is not None else {})
         normalized = _canonicalize_config(config)
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
