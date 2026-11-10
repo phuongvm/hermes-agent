@@ -114,6 +114,7 @@ def _token_to_slug(fencing_token: str) -> str:
     return (
         str(fencing_token)
         .strip()
+        .replace("@", "_")
         .replace(":", "_")
         .replace("*", "star")
         .replace("/", "_")
@@ -122,6 +123,22 @@ def _token_to_slug(fencing_token: str) -> str:
 
 
 token_to_slug = _token_to_slug
+
+
+def _format_holder_id(
+    holder_pid: int, process_start_time_ns: int, holder: str
+) -> str:
+    """Format a durable per-holder identity string that survives JSON/CLI round-trips."""
+    return f"{int(holder_pid)}:{int(process_start_time_ns)}:{str(holder)}"
+
+
+def _split_token_and_holder_id(fencing_token: str) -> tuple[str, str | None]:
+    """Split `<base_token>[@<holder_id>]` into `(base_token, holder_id | None)`."""
+    raw = str(fencing_token).strip()
+    if "@" in raw:
+        base, holder_id = raw.split("@", 1)
+        return base, (holder_id if holder_id else None)
+    return raw, None
 
 
 def _clamp_ttl_s(ttl_s: float | None) -> float:
@@ -138,7 +155,7 @@ def _clamp_ttl_s(ttl_s: float | None) -> float:
 
 def _extract_scope_from_token(fencing_token: str) -> str:
     """Extract and normalize the `<namespace>:<target>` scope prefix from a fencing token."""
-    raw = str(fencing_token).strip()
+    raw, _ = _split_token_and_holder_id(fencing_token)
     parts = raw.rsplit(":", 2)
     if len(parts) < 3:
         raise ValueError(f"Cannot infer scope from fencing token {fencing_token!r}")
@@ -148,6 +165,7 @@ def _extract_scope_from_token(fencing_token: str) -> str:
 class _LeaseTokenStr(str):
     """String fencing token carrying optional holder identity for shared-session release."""
 
+    _holder_id: str | None = None
     _holder_pid: int | None = None
     _holder: str | None = None
 
@@ -155,14 +173,20 @@ class _LeaseTokenStr(str):
 class _LeaseTokenMap(dict[str, str]):
     """Fencing token mapping carrying optional holder identity for shared-session release."""
 
+    _holder_id: str | None = None
     _holder_pid: int | None = None
     _holder: str | None = None
 
 
 def _make_token_str(
-    token: str, *, holder_pid: int | None = None, holder: str | None = None
+    token: str,
+    *,
+    holder_id: str | None = None,
+    holder_pid: int | None = None,
+    holder: str | None = None,
 ) -> _LeaseTokenStr:
     wrapped = _LeaseTokenStr(token)
+    wrapped._holder_id = holder_id
     wrapped._holder_pid = holder_pid
     wrapped._holder = holder
     return wrapped
@@ -171,15 +195,19 @@ def _make_token_str(
 def _make_token_map(
     tokens: Mapping[str, str],
     *,
+    holder_id: str | None = None,
     holder_pid: int | None = None,
     holder: str | None = None,
 ) -> _LeaseTokenMap:
     wrapped = _LeaseTokenMap(
         {
-            k: _make_token_str(v, holder_pid=holder_pid, holder=holder)
+            k: _make_token_str(
+                v, holder_id=holder_id, holder_pid=holder_pid, holder=holder
+            )
             for k, v in tokens.items()
         }
     )
+    wrapped._holder_id = holder_id
     wrapped._holder_pid = holder_pid
     wrapped._holder = holder
     return wrapped
@@ -286,6 +314,8 @@ class CommitJournalRecord:
     refresh_index: bool = False
     caller_backup_path: str = ""
     prune_empty_parents_up_to: str = ""
+    stash_sha: str = ""
+    stash_message: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -308,6 +338,8 @@ class CommitJournalRecord:
             refresh_index=bool(data.get("refresh_index", False)),
             caller_backup_path=str(data.get("caller_backup_path", "")),
             prune_empty_parents_up_to=str(data.get("prune_empty_parents_up_to", "")),
+            stash_sha=str(data.get("stash_sha", "")),
+            stash_message=str(data.get("stash_message", "")),
         )
 
 
@@ -321,6 +353,9 @@ class LeaseExecutionReport:
     scopes: tuple[str, ...] = ()
     mode: str = "exclusive_cutover"
     holder: str = "cli"
+    holder_id: str = ""
+    holder_pid: int = 0
+    process_start_time_ns: int = 0
     fencing_tokens: dict[str, str] = field(default_factory=dict)
     fencing_token: str = ""
     timestamp_utc: str = ""
@@ -334,6 +369,9 @@ class LeaseExecutionReport:
             "scopes": list(self.scopes),
             "mode": self.mode,
             "holder": self.holder,
+            "holder_id": self.holder_id,
+            "holder_pid": self.holder_pid,
+            "process_start_time_ns": self.process_start_time_ns,
             "fencing_tokens": dict(self.fencing_tokens),
             "fencing_token": self.fencing_token,
             "timestamp_utc": self.timestamp_utc
@@ -702,6 +740,9 @@ class WorkspaceLeaseCoordinator:
             if current_sha == active_tx.staged_digest:
                 reset_mode = getattr(active_tx, "reset_mode", "hard") or "hard"
                 if reset_mode == "mixed":
+                    # Mixed alignment contract (S-04): aligns HEAD/ref and Git index to
+                    # `staged_digest` while intentionally preserving working-tree overlay
+                    # bytes on disk (used by deployed plugin overlay checkouts).
                     subprocess.run(
                         [
                             "git",
@@ -717,6 +758,8 @@ class WorkspaceLeaseCoordinator:
                         text=True,
                     )
                 else:
+                    # Hard publication contract (A-02): reconciles HEAD/ref, Git index,
+                    # and tracked working-tree bytes to `staged_digest`.
                     subprocess.run(
                         [
                             "git",
@@ -730,6 +773,46 @@ class WorkspaceLeaseCoordinator:
                         capture_output=True,
                         text=True,
                     )
+                    stash_sha = getattr(active_tx, "stash_sha", "") or ""
+                    if stash_sha:
+                        stash_msg = (
+                            getattr(active_tx, "stash_message", "")
+                            or f"recovered-stash-{active_tx.tx_id}"
+                        )
+                        apply_res = subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repo_root),
+                                "stash",
+                                "apply",
+                                "--quiet",
+                                stash_sha,
+                            ],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if apply_res.returncode != 0:
+                            subprocess.run(
+                                [
+                                    "git",
+                                    "-C",
+                                    str(repo_root),
+                                    "stash",
+                                    "store",
+                                    "-m",
+                                    stash_msg,
+                                    stash_sha,
+                                ],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                            raise RuntimeError(
+                                f"git stash apply failed during recovery of {active_tx.tx_id} "
+                                f"(saved in git stash list as {stash_msg!r}): {apply_res.stderr.strip()}"
+                            )
                 if getattr(active_tx, "refresh_index", False):
                     diff_out = subprocess.check_output(
                         ["git", "-C", str(repo_root), "diff", "--name-only", "HEAD", "--", "."],
@@ -1061,6 +1144,7 @@ class WorkspaceLeaseCoordinator:
                     )
 
             fencing_tokens: dict[str, str] = {}
+            holder_id = _format_holder_id(holder_pid, process_start_time_ns, holder)
             max_expires_at = min(now + clamped_ttl, now + MAX_LEASE_TTL_S)
             expires_at = min(now + DEFAULT_HEARTBEAT_WINDOW_S, max_expires_at)
             for sc in canonical_scopes:
@@ -1080,26 +1164,35 @@ class WorkspaceLeaseCoordinator:
                         max(existing.expires_at_epoch, expires_at),
                         existing_ceiling,
                     )
+                    holder_token = f"{existing.fencing_token}@{holder_id}"
                     existing.shared_holders = [
                         sh
                         for sh in existing.shared_holders
                         if not (
-                            int(sh.get("pid", sh.get("holder_pid", 0))) == holder_pid
-                            and int(sh.get("process_start_time_ns", 0)) == process_start_time_ns
-                            and str(sh.get("holder", "")) == holder
+                            str(sh.get("holder_id", "")) == holder_id
+                            or (
+                                int(sh.get("pid", sh.get("holder_pid", 0))) == holder_pid
+                                and int(sh.get("process_start_time_ns", 0)) == process_start_time_ns
+                                and str(sh.get("holder", "")) == holder
+                            )
                         )
                     ]
                     existing.shared_holders.append(
                         {
+                            "holder_id": holder_id,
                             "holder": holder,
                             "pid": holder_pid,
                             "holder_pid": holder_pid,
                             "process_start_time_ns": process_start_time_ns,
+                            "fencing_token": holder_token,
                             "acquired_at_epoch": now,
                         }
                     )
                     fencing_tokens[sc] = _make_token_str(
-                        existing.fencing_token, holder_pid=holder_pid, holder=holder
+                        holder_token,
+                        holder_id=holder_id,
+                        holder_pid=holder_pid,
+                        holder=holder,
                     )
                     ledger.scope_states[sc] = "ACQUIRED"
                     continue
@@ -1107,6 +1200,9 @@ class WorkspaceLeaseCoordinator:
                 gen = int(ledger.scope_generations.get(sc, 0)) + 1
                 ledger.scope_generations[sc] = gen
                 token = f"{sc}:{ledger.epoch}:{gen}"
+                issued_token = (
+                    f"{token}@{holder_id}" if mode == "shared_session" else token
+                )
                 rec = LeaseRecord(
                     scope=sc,
                     state="ACQUIRED",
@@ -1125,10 +1221,12 @@ class WorkspaceLeaseCoordinator:
                     shared_holders=(
                         [
                             {
+                                "holder_id": holder_id,
                                 "holder": holder,
                                 "pid": holder_pid,
                                 "holder_pid": holder_pid,
                                 "process_start_time_ns": process_start_time_ns,
+                                "fencing_token": issued_token,
                                 "acquired_at_epoch": now,
                             }
                         ]
@@ -1139,17 +1237,25 @@ class WorkspaceLeaseCoordinator:
                 ledger.active_records[sc] = rec
                 ledger.scope_states[sc] = "ACQUIRED"
                 fencing_tokens[sc] = _make_token_str(
-                    token, holder_pid=holder_pid, holder=holder
+                    issued_token,
+                    holder_id=holder_id,
+                    holder_pid=holder_pid,
+                    holder=holder,
                 )
 
             self._write_ledger_locked(ledger)
             wrapped_tokens = _make_token_map(
-                fencing_tokens, holder_pid=holder_pid, holder=holder
+                fencing_tokens,
+                holder_id=holder_id,
+                holder_pid=holder_pid,
+                holder=holder,
             )
             primary_token = (
                 wrapped_tokens[canonical_scopes[0]]
                 if canonical_scopes
-                else _make_token_str("", holder_pid=holder_pid, holder=holder)
+                else _make_token_str(
+                    "", holder_id=holder_id, holder_pid=holder_pid, holder=holder
+                )
             )
             return LeaseExecutionReport(
                 status="ACQUIRED",
@@ -1158,6 +1264,9 @@ class WorkspaceLeaseCoordinator:
                 scopes=canonical_scopes,
                 mode=mode,
                 holder=holder,
+                holder_id=holder_id,
+                holder_pid=holder_pid,
+                process_start_time_ns=process_start_time_ns,
                 fencing_tokens=wrapped_tokens,
                 fencing_token=primary_token,
             )
@@ -1264,6 +1373,7 @@ class WorkspaceLeaseCoordinator:
         now_epoch: float | None = None,
     ) -> LeaseRecord:
         """Renew the 30s heartbeat rolling window (90s window capped at `max_expires_at`)."""
+        base_token, _ = _split_token_and_holder_id(acquired_token)
         with self._acquire_kernel_mutex(timeout_s=5.0):
             ledger = self._read_ledger_locked()
             canonical = normalize_scope(scope)
@@ -1283,7 +1393,7 @@ class WorkspaceLeaseCoordinator:
             if (
                 record is None
                 or record.state != "ACQUIRED"
-                or record.fencing_token != acquired_token
+                or record.fencing_token != base_token
                 or now > record.expires_at_epoch
                 or now > hard_ceiling
             ):
@@ -1513,8 +1623,21 @@ class WorkspaceLeaseCoordinator:
         fetch_from: str | None = None,
         fetch_refspec: str | None = None,
         refresh_index: bool = False,
+        stash_dirty: bool = False,
+        stash_message: str | None = None,
     ) -> str:
-        """Execute a fenced, journaled Git ref fast-forward + working-tree sync inside `workspace_lease.lock`."""
+        """Execute a fenced, journaled Git ref fast-forward + working-tree sync inside `workspace_lease.lock`.
+
+        Reset contracts:
+        - `reset_mode="hard"` (default publication contract, A-01R/A-02): updates `ref_name` to `new_sha`,
+          reconciles both the Git index and tracked working-tree bytes via `git reset --hard <new_sha>`,
+          and when `stash_dirty=True` captures dirty tracked modifications before ref mutation into a
+          journaled stash commit (`stash_sha`) and restores them onto `<new_sha>` inside the same
+          coordinator-owned recoverable transaction.
+        - `reset_mode="mixed"` (overlay-preserving plugin alignment contract, S-04): updates `ref_name`
+          and aligns `HEAD`/index to `new_sha` via `git reset --quiet --mixed <new_sha>` while intentionally
+          leaving deployed working-tree overlay bytes untouched on disk.
+        """
         repo = Path(repo_root)
         if reset_mode not in ("hard", "mixed"):
             raise ValueError(f"Unsupported git reset_mode {reset_mode!r}: expected 'hard' or 'mixed'")
@@ -1567,6 +1690,31 @@ class WorkspaceLeaseCoordinator:
                 ).strip()
             )
             token_slug = _token_to_slug(acquired_token)
+            stash_sha = ""
+            effective_stash_msg = ""
+            if stash_dirty:
+                dirty_status = subprocess.check_output(
+                    ["git", "-C", str(repo), "status", "--porcelain", "-uno"],
+                    text=True,
+                ).strip()
+                if dirty_status:
+                    effective_stash_msg = (
+                        str(stash_message).strip()
+                        if stash_message
+                        else f"fenced-git-ref-update-{int(now * 1000)}-{token_slug}"
+                    )
+                    stash_sha = subprocess.check_output(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "stash",
+                            "create",
+                            effective_stash_msg,
+                        ],
+                        text=True,
+                    ).strip()
+
             journal_entry = CommitJournalRecord(
                 tx_id=f"tx_{int(now * 1000)}_{token_slug}",
                 state="PUBLISH_INTENT",
@@ -1581,11 +1729,13 @@ class WorkspaceLeaseCoordinator:
                 ref_name=ref_name,
                 reset_mode=reset_mode,
                 refresh_index=bool(refresh_index),
+                stash_sha=stash_sha,
+                stash_message=effective_stash_msg,
             )
             self._write_journal_locked(journal_entry)
 
-            if resolved_old != resolved_new:
-                if ref_name and ref_name != "HEAD":
+            if resolved_old != resolved_new or stash_sha:
+                if resolved_old != resolved_new and ref_name and ref_name != "HEAD":
                     cmd = ["git", "-C", str(repo), "update-ref", ref_name, resolved_new, resolved_old]
                     subprocess.run(cmd, check=True, capture_output=True, text=True)
                 if reset_mode == "mixed":
@@ -1602,6 +1752,33 @@ class WorkspaceLeaseCoordinator:
                         capture_output=True,
                         text=True,
                     )
+                if stash_sha:
+                    apply_res = subprocess.run(
+                        ["git", "-C", str(repo), "stash", "apply", "--quiet", stash_sha],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if apply_res.returncode != 0:
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repo),
+                                "stash",
+                                "store",
+                                "-m",
+                                effective_stash_msg,
+                                stash_sha,
+                            ],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        raise RuntimeError(
+                            f"git stash apply failed after fast-forward to {resolved_new} "
+                            f"(saved in git stash list as {effective_stash_msg!r}): {apply_res.stderr.strip()}"
+                        )
 
             if refresh_index:
                 diff_out = subprocess.check_output(
@@ -1634,96 +1811,169 @@ class WorkspaceLeaseCoordinator:
     def release_workspace_lease(
         self,
         scopes: Sequence[str] | str,
-        fencing_tokens: Mapping[str, str] | str | LeaseExecutionReport,
+        fencing_tokens: Mapping[str, Any] | str | LeaseExecutionReport = "",
         final_status: str = "APPLIED",
         *,
+        holder_id: str | None = None,
         pid: int | None = None,
         holder_pid: int | None = None,
         holder: str | None = None,
     ) -> LeaseExecutionReport:
-        """Transition `ACQUIRED -> RELEASING -> UNLOCKED` for matching fencing tokens."""
+        """Transition `ACQUIRED -> RELEASING -> UNLOCKED` for matching fencing tokens.
+
+        For `shared_session` leases, each holder is identified by a durable `holder_id`
+        (`"<pid>:<start_ns>:<holder>"`) embedded in the holder's fencing token
+        (`<base_token>@<holder_id>`) and/or supplied explicitly via `holder_id`, `pid`,
+        or `holder`. Release NEVER guesses `os.getpid()` and NEVER removes an arbitrary
+        sibling (`pop(0)`); if the requested identity is absent or unknown, all existing
+        shared holders remain intact.
+        """
         if isinstance(scopes, str):
             raw_list = [s for s in scopes.split(",") if s.strip()]
         else:
             raw_list = list(scopes)
         canonical_scopes = tuple(dict.fromkeys(normalize_scope(s) for s in raw_list))
 
-        target_pid: int | None = (
+        explicit_holder_id: str | None = str(holder_id) if holder_id else None
+        explicit_pid: int | None = (
             int(pid)
             if pid is not None
             else (int(holder_pid) if holder_pid is not None else None)
         )
-        target_holder: str | None = str(holder) if holder else None
+        explicit_holder: str | None = str(holder) if holder else None
+        has_explicit_selector = (
+            explicit_holder_id is not None
+            or explicit_pid is not None
+            or explicit_holder is not None
+        )
+
+        implicit_holder_id: str | None = None
+        implicit_pid: int | None = None
+        implicit_holder: str | None = None
 
         if isinstance(fencing_tokens, LeaseExecutionReport):
-            if target_pid is None:
-                target_pid = getattr(fencing_tokens.fencing_tokens, "_holder_pid", None)
-            if target_holder is None:
-                target_holder = (
-                    getattr(fencing_tokens.fencing_tokens, "_holder", None)
-                    or fencing_tokens.holder
-                )
+            implicit_holder_id = (
+                fencing_tokens.holder_id
+                or getattr(fencing_tokens.fencing_tokens, "_holder_id", None)
+            )
+            implicit_pid = (
+                fencing_tokens.holder_pid
+                or getattr(fencing_tokens.fencing_tokens, "_holder_pid", None)
+            )
+            implicit_holder = (
+                getattr(fencing_tokens.fencing_tokens, "_holder", None)
+                or fencing_tokens.holder
+            )
             token_map = {
                 normalize_scope(k): str(v)
                 for k, v in fencing_tokens.fencing_tokens.items()
             }
         elif isinstance(fencing_tokens, str):
-            if target_pid is None:
-                target_pid = getattr(fencing_tokens, "_holder_pid", None)
-            if target_holder is None:
-                target_holder = getattr(fencing_tokens, "_holder", None)
-            token_map = {sc: str(fencing_tokens) for sc in canonical_scopes}
+            implicit_holder_id = getattr(fencing_tokens, "_holder_id", None)
+            implicit_pid = getattr(fencing_tokens, "_holder_pid", None)
+            implicit_holder = getattr(fencing_tokens, "_holder", None)
+            token_map = (
+                {sc: str(fencing_tokens) for sc in canonical_scopes}
+                if fencing_tokens
+                else {}
+            )
+        elif isinstance(fencing_tokens, Mapping):
+            implicit_holder_id = getattr(fencing_tokens, "_holder_id", None)
+            implicit_pid = getattr(fencing_tokens, "_holder_pid", None)
+            implicit_holder = getattr(fencing_tokens, "_holder", None)
+            if "fencing_tokens" in fencing_tokens and isinstance(
+                fencing_tokens.get("fencing_tokens"), Mapping
+            ):
+                if not implicit_holder_id and fencing_tokens.get("holder_id"):
+                    implicit_holder_id = str(fencing_tokens["holder_id"])
+                if implicit_pid is None and fencing_tokens.get("holder_pid"):
+                    implicit_pid = int(fencing_tokens["holder_pid"])
+                if not implicit_holder and fencing_tokens.get("holder"):
+                    implicit_holder = str(fencing_tokens["holder"])
+                inner_tokens = fencing_tokens["fencing_tokens"]
+                token_map = {
+                    normalize_scope(str(k)): str(v) for k, v in inner_tokens.items()
+                }
+            else:
+                for v in fencing_tokens.values():
+                    if implicit_holder_id is None and getattr(v, "_holder_id", None) is not None:
+                        implicit_holder_id = getattr(v, "_holder_id", None)
+                    if implicit_pid is None and getattr(v, "_holder_pid", None) is not None:
+                        implicit_pid = getattr(v, "_holder_pid", None)
+                    if implicit_holder is None and getattr(v, "_holder", None) is not None:
+                        implicit_holder = getattr(v, "_holder", None)
+                token_map = {
+                    normalize_scope(str(k)): str(v) for k, v in fencing_tokens.items()
+                }
         else:
-            if target_pid is None:
-                target_pid = getattr(fencing_tokens, "_holder_pid", None)
-            if target_holder is None:
-                target_holder = getattr(fencing_tokens, "_holder", None)
-            for v in fencing_tokens.values():
-                if target_pid is None and getattr(v, "_holder_pid", None) is not None:
-                    target_pid = getattr(v, "_holder_pid", None)
-                if target_holder is None and getattr(v, "_holder", None) is not None:
-                    target_holder = getattr(v, "_holder", None)
-            token_map = {normalize_scope(k): str(v) for k, v in fencing_tokens.items()}
+            token_map = {}
 
         with self._acquire_kernel_mutex(timeout_s=5.0):
             ledger = self._read_ledger_locked()
             self._recover_interrupted_commit_locked(ledger)
             released_scopes: list[str] = []
+            unmatched_reason: str | None = None
             for sc in canonical_scopes:
                 rec = ledger.active_records.get(sc)
-                expected_token = token_map.get(sc)
+                raw_expected = token_map.get(sc, "")
+                expected_base, token_holder_id = _split_token_and_holder_id(raw_expected)
                 if rec is None:
                     continue
-                if expected_token and rec.fencing_token != expected_token:
+                if expected_base and rec.fencing_token != expected_base:
                     continue
                 if rec.mode == "shared_session" and rec.shared_holders:
                     removed = False
                     remaining_holders: list[dict[str, Any]] = []
+                    candidate_holder_id = token_holder_id or implicit_holder_id
+
+                    if not has_explicit_selector and not candidate_holder_id and implicit_pid is None and not implicit_holder:
+                        unmatched_reason = "SHARED_HOLDER_ID_REQUIRED"
+                        continue
+
                     for sh in rec.shared_holders:
                         sh_pid = int(sh.get("pid", sh.get("holder_pid", 0)))
+                        sh_start_ns = int(sh.get("process_start_time_ns", 0))
                         sh_holder = str(sh.get("holder", ""))
+                        sh_holder_id = str(
+                            sh.get("holder_id")
+                            or _format_holder_id(sh_pid, sh_start_ns, sh_holder)
+                        )
                         if not removed:
-                            if target_pid is not None and sh_pid == int(target_pid):
-                                removed = True
-                                continue
-                            if (
-                                target_pid is None
-                                and target_holder is not None
-                                and sh_holder == target_holder
-                            ):
-                                removed = True
-                                continue
+                            if has_explicit_selector:
+                                id_ok = (
+                                    explicit_holder_id is None
+                                    or sh_holder_id == explicit_holder_id
+                                )
+                                pid_ok = (
+                                    explicit_pid is None or sh_pid == explicit_pid
+                                )
+                                holder_ok = (
+                                    explicit_holder is None
+                                    or sh_holder == explicit_holder
+                                )
+                                if id_ok and pid_ok and holder_ok:
+                                    removed = True
+                                    continue
+                            elif candidate_holder_id is not None:
+                                if sh_holder_id == candidate_holder_id:
+                                    removed = True
+                                    continue
+                            else:
+                                pid_ok = (
+                                    implicit_pid is None or sh_pid == int(implicit_pid)
+                                )
+                                holder_ok = (
+                                    implicit_holder is None
+                                    or sh_holder == implicit_holder
+                                )
+                                if pid_ok and holder_ok:
+                                    removed = True
+                                    continue
                         remaining_holders.append(sh)
 
-                    if not removed and remaining_holders:
-                        caller_pid = os.getpid()
-                        for idx, sh in enumerate(remaining_holders):
-                            if int(sh.get("pid", sh.get("holder_pid", 0))) == caller_pid:
-                                remaining_holders.pop(idx)
-                                removed = True
-                                break
-                        if not removed:
-                            remaining_holders.pop(0)
+                    if not removed:
+                        unmatched_reason = "HOLDER_NOT_FOUND"
+                        continue
 
                     rec.shared_holders = remaining_holders
                     if len(rec.shared_holders) > 0:
@@ -1748,9 +1998,14 @@ class WorkspaceLeaseCoordinator:
                 released_scopes.append(sc)
             self._write_ledger_locked(ledger)
 
+        reason = (
+            "LEASE_RELEASED"
+            if released_scopes or unmatched_reason is None
+            else unmatched_reason
+        )
         return LeaseExecutionReport(
-            status=final_status,
-            reason_code="LEASE_RELEASED",
+            status=final_status if released_scopes or unmatched_reason is None else "NOOP",
+            reason_code=reason,
             exit_code=EXIT_OK,
             scopes=tuple(released_scopes),
             fencing_tokens=token_map,
@@ -1847,6 +2102,8 @@ def atomic_fenced_git_ref_update(
     fetch_from: str | None = None,
     fetch_refspec: str | None = None,
     refresh_index: bool = False,
+    stash_dirty: bool = False,
+    stash_message: str | None = None,
     lease_dir: Path | str | None = None,
 ) -> str:
     coord = WorkspaceLeaseCoordinator(lease_dir=lease_dir)
@@ -1861,6 +2118,8 @@ def atomic_fenced_git_ref_update(
         fetch_from=fetch_from,
         fetch_refspec=fetch_refspec,
         refresh_index=refresh_index,
+        stash_dirty=stash_dirty,
+        stash_message=stash_message,
     )
 
 
@@ -1888,9 +2147,10 @@ def renew_lease_heartbeat(
 
 def release_workspace_lease(
     scopes: Sequence[str] | str,
-    fencing_tokens: Mapping[str, str] | str | LeaseExecutionReport,
+    fencing_tokens: Mapping[str, Any] | str | LeaseExecutionReport = "",
     final_status: str = "APPLIED",
     *,
+    holder_id: str | None = None,
     pid: int | None = None,
     holder_pid: int | None = None,
     holder: str | None = None,
@@ -1901,6 +2161,7 @@ def release_workspace_lease(
         scopes=scopes,
         fencing_tokens=fencing_tokens,
         final_status=final_status,
+        holder_id=holder_id,
         pid=pid,
         holder_pid=holder_pid,
         holder=holder,
@@ -2000,7 +2261,7 @@ def configure_lease_subcommands(lease_parser: argparse.ArgumentParser) -> None:
     p_git = sub.add_parser("git-ref-update", help="Journaled lock-held git update-ref + reset")
     _add_common_lease_Flags(p_git, is_subparser=True)
     p_git.add_argument("--scope", required=True)
-    p_git.add_argument("--token", required=True)
+    p_git.add_argument("--token", "--fencing-token", dest="token", required=True)
     p_git.add_argument("--repo-root", required=True)
     p_git.add_argument("--ref", default="refs/heads/main")
     p_git.add_argument("--new-sha", required=True)
@@ -2009,11 +2270,13 @@ def configure_lease_subcommands(lease_parser: argparse.ArgumentParser) -> None:
     p_git.add_argument("--fetch-from", default=None)
     p_git.add_argument("--fetch-refspec", default=None)
     p_git.add_argument("--refresh-index", action="store_true", default=False)
+    p_git.add_argument("--stash-dirty", action="store_true", default=False)
+    p_git.add_argument("--stash-message", default=None)
 
     p_hb = sub.add_parser("heartbeat", help="Renew 30s lease heartbeat")
     _add_common_lease_Flags(p_hb, is_subparser=True)
     p_hb.add_argument("--scope", required=True)
-    p_hb.add_argument("--token", required=True)
+    p_hb.add_argument("--token", "--fencing-token", dest="token", required=True)
 
     p_rel = sub.add_parser("release", help="Release held workspace lease(s)")
     _add_common_lease_Flags(p_rel, is_subparser=True)
@@ -2024,9 +2287,10 @@ def configure_lease_subcommands(lease_parser: argparse.ArgumentParser) -> None:
         action="append",
         required=True,
     )
-    p_rel.add_argument("--token", default="")
+    p_rel.add_argument("--token", "--fencing-token", dest="token", default="")
     p_rel.add_argument("--tokens-json", default="")
     p_rel.add_argument("--status", default="APPLIED")
+    p_rel.add_argument("--holder-id", dest="holder_id", default=None)
     p_rel.add_argument("--pid", type=int, default=None)
     p_rel.add_argument("--holder", default=None)
 
@@ -2133,6 +2397,8 @@ def cmd_lease(args: argparse.Namespace) -> int:
                 fetch_from=getattr(args, "fetch_from", None),
                 fetch_refspec=getattr(args, "fetch_refspec", None),
                 refresh_index=bool(getattr(args, "refresh_index", False)),
+                stash_dirty=bool(getattr(args, "stash_dirty", False)),
+                stash_message=getattr(args, "stash_message", None),
             )
             print(
                 json.dumps(
@@ -2159,7 +2425,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
             raw_scopes = []
             for item in getattr(args, "scopes", []) or []:
                 raw_scopes.extend(part.strip() for part in str(item).split(",") if part.strip())
-            tokens_arg: Mapping[str, str] | str
+            tokens_arg: Mapping[str, Any] | str
             if getattr(args, "tokens_json", ""):
                 tokens_arg = json.loads(args.tokens_json)
             else:
@@ -2168,6 +2434,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
                 scopes=raw_scopes,
                 fencing_tokens=tokens_arg,
                 final_status=str(getattr(args, "status", "APPLIED")),
+                holder_id=getattr(args, "holder_id", None),
                 pid=getattr(args, "pid", None),
                 holder=getattr(args, "holder", None),
             )

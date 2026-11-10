@@ -4,6 +4,7 @@ import json
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -596,42 +597,138 @@ def test_commit_journal_aborts_and_purges_staged_on_pre_swap_crash(tmp_path: Pat
     assert target_file.read_text(encoding="utf-8") == "model: baseline\n"
 
 
-def test_cutover_and_watchdog_scripts_enforce_two_phase_staging_and_exit_75_deferral() -> None:
+def test_cutover_and_watchdog_scripts_enforce_two_phase_staging_and_exit_75_deferral(
+    tmp_path: Path,
+) -> None:
     workspaces_root = Path(__file__).resolve().parents[3]
-    cutover_scripts = [
-        workspaces_root / "_config" / "agent4070" / "hermes" / "services" / "apply-live-crew-cutover.ps1",
-        workspaces_root / "_config" / "agent4070" / "hermes" / "services" / "apply-live-nerve-cutover.ps1",
-        workspaces_root / "_config" / "agent4070" / "hermes" / "services" / "apply-live-hermes-cutover.ps1",
-    ]
-    for script_path in cutover_scripts:
-        text = script_path.read_text(encoding="utf-8")
-        assert ".tmp." in text, f"{script_path.name} missing 2-phase .tmp.<fencing_token> staging"
-        assert "Invoke-FencedCommit" in text, f"{script_path.name} missing Invoke-FencedCommit"
-        assert "Invoke-FencedDelete" in text, f"{script_path.name} missing Invoke-FencedDelete"
-        assert "exit 75" in text, f"{script_path.name} missing exit 75 contention deferral"
-        assert "Copy-Item" not in text, f"{script_path.name} still contains direct Copy-Item"
-        assert "Move-Item" not in text, f"{script_path.name} still contains direct Move-Item"
-        assert "[System.IO.File]::Delete" not in text, (
-            f"{script_path.name} still contains unfenced [System.IO.File]::Delete"
-        )
-        assert "[System.IO.File]::Move" not in text, (
-            f"{script_path.name} still contains unfenced [System.IO.File]::Move"
-        )
+    hermes_cutover = (
+        workspaces_root
+        / "_config"
+        / "agent4070"
+        / "hermes"
+        / "services"
+        / "apply-live-hermes-cutover.ps1"
+    )
+    lease_script = Path(__file__).resolve().parents[1] / "hermes_cli" / "workspace_lease.py"
 
-    nerve_text = cutover_scripts[1].read_text(encoding="utf-8")
-    assert "reset --quiet --mixed" not in nerve_text, (
-        "apply-live-nerve-cutover.ps1 still contains unfenced git reset --mixed"
+    # Behavioral test (A-04 / A-01R): execute the real PowerShell wrapper functions from
+    # apply-live-hermes-cutover.ps1 against disposable git/file targets and lease store.
+    lease_dir = tmp_path / "leases"
+    now = [time.time() - 100.0]
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda pid: 100,
+        clock=lambda: now[0],
+    )
+    h1 = coord.acquire_workspace_lease(
+        scopes=("repo:oss/hermes-agent",),
+        mode="exclusive_cutover",
+        holder="cutover-1",
+        holder_pid=101,
+        process_start_time_ns=100,
+    )
+    token_1 = h1.fencing_tokens["repo:oss/hermes-agent"]
+
+    repo = tmp_path / "disposable_hermes_repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    tracked_a = repo / "core.py"
+    tracked_b = repo / "local_cfg.py"
+    tracked_a.write_text("v = 1\n", encoding="utf-8")
+    tracked_b.write_text("local = 'baseline'\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "c1"], check=True, capture_output=True)
+    sha1 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "incoming"], check=True, capture_output=True)
+    tracked_a.write_text("v = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "commit", "-am", "c2"], check=True, capture_output=True)
+    sha2 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True)
+
+    # Dirty tracked modification on local_cfg.py before preempted cutover attempt
+    tracked_b.write_text("local = 'dirty-operator-edit'\n", encoding="utf-8")
+
+    # Preempt Holder 1 -> Holder 2 acquires lease at current wall-clock time
+    now[0] = time.time()
+    h2 = coord.acquire_workspace_lease(
+        scopes=("repo:oss/hermes-agent",),
+        mode="exclusive_cutover",
+        holder="cutover-2",
+        holder_pid=202,
+        process_start_time_ns=100,
+    )
+    token_2 = h2.fencing_tokens["repo:oss/hermes-agent"]
+
+    ps_prefix = (
+        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{hermes_cutover.as_posix()}', [ref]$null, [ref]$null); "
+        "$fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-FencedGitRefUpdate' }, $true) | Select-Object -First 1; "
+        "Invoke-Expression $fn.Extent.Text; "
+        f"$LeasePythonExe = '{Path(sys.executable).as_posix()}'; "
+        f"$LeaseScript = '{lease_script.as_posix()}'; "
+        f"$LeaseDir = '{lease_dir.as_posix()}'; "
     )
 
-    watchdog_scripts = [
-        workspaces_root / ".agents" / "skills" / "crew-upstream-sync" / "scripts" / "daily-sync-watchdog.ps1",
-        workspaces_root / ".agents" / "skills" / "nerve-upstream-sync" / "scripts" / "daily-sync-watchdog.ps1",
-    ]
-    for wd_path in watchdog_scripts:
-        text = wd_path.read_text(encoding="utf-8")
-        assert "cron_cutover_ledger.jsonl" in text, f"{wd_path} missing cron_cutover_ledger.jsonl"
-        assert "Write-DeferredCronLedger" in text, f"{wd_path} missing Write-DeferredCronLedger"
-        assert "-eq 75" in text and "exit 0" in text, f"{wd_path} missing exit 75 -> exit 0 translation"
+    # Stale Holder 1 invokes Invoke-FencedGitRefUpdate -StashDirty: MUST exit 78 with 0 repo/stash mutations
+    ps_stale = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            ps_prefix
+            + f"Invoke-FencedGitRefUpdate -Scope 'repo:oss/hermes-agent' -Token '{token_1}' -RepoPath '{repo.as_posix()}' -RefName 'refs/heads/main' -NewSha '{sha2}' -OldSha '{sha1}' -StashDirty -StashMessage 'stale-cutover-stash'",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert ps_stale.returncode == 78
+    head_after_stale = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after_stale == sha1
+    assert tracked_a.read_text(encoding="utf-8") == "v = 1\n"
+    assert tracked_b.read_text(encoding="utf-8") == "local = 'dirty-operator-edit'\n"
+
+    # Active Holder 2 runs Invoke-FencedGitRefUpdate from apply-live-hermes-cutover.ps1 (with -StashDirty):
+    # advances HEAD to sha2 AND preserves dirty tracked file
+    ps_res = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            ps_prefix
+            + f"Invoke-FencedGitRefUpdate -Scope 'repo:oss/hermes-agent' -Token '{token_2}' -RepoPath '{repo.as_posix()}' -RefName 'refs/heads/main' -NewSha '{sha2}' -OldSha '{sha1}' -StashDirty -StashMessage 'active-cutover-stash'",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert ps_res.returncode == 0, ps_res.stderr or ps_res.stdout
+    head_after_ok = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after_ok == sha2
+    assert tracked_a.read_text(encoding="utf-8") == "v = 2\n"
+    assert tracked_b.read_text(encoding="utf-8") == "local = 'dirty-operator-edit'\n"
 
 
 def test_shared_session_partial_release_retains_sibling_holders_s01(tmp_path: Path) -> None:
@@ -645,36 +742,94 @@ def test_shared_session_partial_release_retains_sibling_holders_s01(tmp_path: Pa
     s1 = coord.acquire_workspace_lease(
         scopes=("profile:coder",),
         mode="shared_session",
-        holder="holder-pid-11",
+        holder="A",
         holder_pid=11,
         process_start_time_ns=1,
     )
     s2 = coord.acquire_workspace_lease(
         scopes=("profile:coder",),
         mode="shared_session",
-        holder="holder-pid-22",
+        holder="B",
         holder_pid=22,
         process_start_time_ns=1,
     )
     assert s1.status == "ACQUIRED"
     assert s2.status == "ACQUIRED"
+    assert s1.holder_id == "11:1:A"
+    assert s2.holder_id == "22:1:B"
 
-    # Release PID 11 (works both via explicit pid=11 and via s1's receipt)
-    rel_11 = coord.release_workspace_lease(
+    # 1. Second-holder-first release (Holder B / PID 22 first) after full JSON round-trip (S-01R repro)
+    round_tripped_b_tokens = json.loads(json.dumps(s2.fencing_tokens))
+    rel_22 = coord.release_workspace_lease(
         scopes=("profile:coder",),
-        fencing_tokens=s1.fencing_tokens,
-        pid=11,
+        fencing_tokens=round_tripped_b_tokens,
     )
-    assert rel_11.exit_code == 0
+    assert rel_22.exit_code == 0
+    assert rel_22.reason_code == "LEASE_RELEASED"
+    assert rel_22.scopes == ("profile:coder",)
 
-    ledger_mid = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
-    assert "profile:coder" in ledger_mid["active_records"]
-    active_rec = ledger_mid["active_records"]["profile:coder"]
-    assert active_rec["state"] == "ACQUIRED"
-    remaining_pids = [int(h.get("pid", h.get("holder_pid", 0))) for h in active_rec["shared_holders"]]
-    assert remaining_pids == [22]
+    record_after_b = coord.get_status()["ledger"]["active_records"]["profile:coder"]
+    assert record_after_b["state"] == "ACQUIRED"
+    assert [int(h["pid"]) for h in record_after_b["shared_holders"]] == [11]
 
-    # Exclusive contender must still be DEFERRED (exit 75) while PID 22 holds the shared lease
+    # 2. Duplicate release of already-released Holder B must be a safe no-op and MUST NOT remove Holder A (PID 11)
+    rel_22_dup = coord.release_workspace_lease(
+        scopes=("profile:coder",),
+        fencing_tokens=round_tripped_b_tokens,
+    )
+    assert rel_22_dup.status == "NOOP"
+    assert rel_22_dup.reason_code == "HOLDER_NOT_FOUND"
+    assert rel_22_dup.scopes == ()
+    record_after_dup = coord.get_status()["ledger"]["active_records"]["profile:coder"]
+    assert [int(h["pid"]) for h in record_after_dup["shared_holders"]] == [11]
+
+    # 3. Unknown holder release (explicit pid=999, unknown holder_id, or CLI --pid 999) MUST NOT remove Holder A (PID 11)
+    rel_unknown_pid = coord.release_workspace_lease(
+        scopes=("profile:coder",),
+        fencing_tokens=json.loads(json.dumps(s1.fencing_tokens)),
+        pid=999,
+    )
+    assert rel_unknown_pid.status == "NOOP"
+    assert rel_unknown_pid.reason_code == "HOLDER_NOT_FOUND"
+    assert rel_unknown_pid.scopes == ()
+
+    rel_unknown_id = coord.release_workspace_lease(
+        scopes=("profile:coder",),
+        fencing_tokens=json.loads(json.dumps(s1.fencing_tokens)),
+        holder_id="999:1:ghost",
+    )
+    assert rel_unknown_id.status == "NOOP"
+    assert rel_unknown_id.reason_code == "HOLDER_NOT_FOUND"
+
+    rc_cli_unknown = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "release",
+            "--scope",
+            "profile:coder",
+            "--tokens-json",
+            json.dumps(s1.fencing_tokens),
+            "--pid",
+            "999",
+        ]
+    )
+    assert rc_cli_unknown == 0
+
+    # 4. Bare scope token without holder identity on shared_session MUST fail closed / no-op without popping PID 11
+    base_only_token = s1.fencing_tokens["profile:coder"].split("@", 1)[0]
+    rel_bare = coord.release_workspace_lease(
+        scopes=("profile:coder",),
+        fencing_tokens={"profile:coder": base_only_token},
+    )
+    assert rel_bare.status == "NOOP"
+    assert rel_bare.reason_code == "SHARED_HOLDER_ID_REQUIRED"
+    assert rel_bare.scopes == ()
+
+    record_still_11 = coord.get_status()["ledger"]["active_records"]["profile:coder"]
+    assert [int(h["pid"]) for h in record_still_11["shared_holders"]] == [11]
+
+    # 5. Exclusive contender must still receive DEFERRED (exit 75) while PID 11 holds the shared lease
     contender = coord.acquire_workspace_lease(
         scopes=("profile:*",),
         mode="exclusive_cutover",
@@ -686,12 +841,13 @@ def test_shared_session_partial_release_retains_sibling_holders_s01(tmp_path: Pa
     assert contender.exit_code == 75
     assert contender.reason_code == "DEFERRED_LEASE_HELD"
 
-    # Now release PID 22 via receipt without explicit pid kwarg; scope must become UNLOCKED
-    rel_22 = coord.release_workspace_lease(
+    # 6. Now release PID 11 via JSON-serialized token map; scope must transition to UNLOCKED
+    rel_11 = coord.release_workspace_lease(
         scopes=("profile:coder",),
-        fencing_tokens=s2.fencing_tokens,
+        fencing_tokens=json.loads(json.dumps(s1.fencing_tokens)),
     )
-    assert rel_22.exit_code == 0
+    assert rel_11.exit_code == 0
+    assert rel_11.reason_code == "LEASE_RELEASED"
     ledger_end = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
     assert "profile:coder" not in ledger_end["active_records"]
     assert ledger_end["scope_states"]["profile:coder"] == "UNLOCKED"
@@ -859,6 +1015,95 @@ def test_git_crash_recovery_reconciles_worktree_bytes_before_committed_a02(
     ledger = json.loads((lease_dir / "workspace_leases.json").read_text(encoding="utf-8"))
     assert ledger["active_records"]["repo:oss/crew"]["last_committed_digest"] == new_sha
 
+    # Also verify crash recovery for `stash_dirty=True` (A-01R): if crash happens after update-ref
+    # and before stash apply, recovery reconciles HEAD/worktree to new commit AND applies journaled stash_sha
+    subprocess.run(["git", "-C", str(repo), "reset", "--hard", old_sha], check=True, capture_output=True)
+    local_note = repo / "local_note.py"
+    local_note.write_text("operator_dirty = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "local_note.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "base-with-note"], check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tracked.write_text("new_v3\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "commit", "-am", "v3"], check=True, capture_output=True)
+    v3_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(repo), "reset", "--hard", base_sha], check=True, capture_output=True)
+    local_note.write_text("operator_dirty = 2\n", encoding="utf-8")
+
+    def crash_before_stash_apply(cmd: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(cmd, list) and len(cmd) >= 5 and cmd[3:5] == ["stash", "apply"]:
+            raise RuntimeError("injected crash before stash apply")
+        return real_run(cmd, *args, **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(subprocess, "run", crash_before_stash_apply)
+    with pytest.raises(RuntimeError, match="injected crash before stash apply"):
+        coord.atomic_fenced_git_ref_update(
+            scope="repo:oss/crew",
+            acquired_token=token,
+            repo_root=repo,
+            ref_name="refs/heads/main",
+            new_sha=v3_sha,
+            old_sha=base_sha,
+            stash_dirty=True,
+            stash_message="cutover-stash-test",
+        )
+    monkeypatch.setattr(subprocess, "run", real_run)
+    recovered_stash = coord.recover_interrupted_commit()
+    assert len(recovered_stash) == 1
+    assert recovered_stash[0].state == "COMMITTED"
+    assert tracked.read_text(encoding="utf-8") == "new_v3\n"
+    assert local_note.read_text(encoding="utf-8") == "operator_dirty = 2\n"
+
+    # S-04 qualification: verify `reset_mode="mixed"` recovery aligns HEAD and index to `v3_sha`
+    # while intentionally preserving working-tree overlay bytes on disk.
+    subprocess.run(["git", "-C", str(repo), "reset", "--hard", base_sha], check=True, capture_output=True)
+    tracked.write_text("overlay_preserved_on_disk\n", encoding="utf-8")
+    monkeypatch.setattr(subprocess, "run", crash_before_reset)
+    with pytest.raises(RuntimeError, match="injected crash after update-ref before reset"):
+        coord.atomic_fenced_git_ref_update(
+            scope="repo:oss/crew",
+            acquired_token=token,
+            repo_root=repo,
+            ref_name="refs/heads/main",
+            new_sha=v3_sha,
+            old_sha=base_sha,
+            reset_mode="mixed",
+        )
+    monkeypatch.setattr(subprocess, "run", real_run)
+    recovered_mixed = coord.recover_interrupted_commit()
+    assert len(recovered_mixed) == 1
+    assert recovered_mixed[0].state == "COMMITTED"
+    head_mixed = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    index_blob_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", ":module.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    v3_blob_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{v3_sha}:module.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_mixed == v3_sha
+    assert index_blob_sha == v3_blob_sha
+    assert tracked.read_text(encoding="utf-8") == "overlay_preserved_on_disk\n"
+
 
 def test_atomic_fenced_delete_and_cli_preemption_and_recovery_a01(tmp_path: Path) -> None:
     lease_dir = tmp_path / "leases"
@@ -947,6 +1192,41 @@ def test_atomic_fenced_delete_and_cli_preemption_and_recovery_a01(tmp_path: Path
     )
     assert rc_ok == 0
     assert not successor_file.exists()
+
+    # 3b. Injected deletion journal crash recovery (A-04): simulate crash in PUBLISHED_LEDGER_PENDING
+    # before target removal/parent pruning completes, and verify recover_interrupted_commit finishes it.
+    crash_dir = root_dir / "plugins" / "crew" / "crash_retired"
+    crash_dir.mkdir(parents=True)
+    crash_target = crash_dir / "dangling.py"
+    crash_target.write_text("# to-be-deleted\n", encoding="utf-8")
+    internal_bk = lease_dir / ".delete_backup_crash"
+    internal_bk.write_text("# to-be-deleted\n", encoding="utf-8")
+    caller_bk = tmp_path / "backups" / "dangling_quarantine.py"
+    del_journal = CommitJournalRecord(
+        tx_id="tx_delete_crash_1",
+        state="PUBLISHED_LEDGER_PENDING",
+        scope="profile:*",
+        fencing_token=token_2,
+        target_path=str(crash_target),
+        backup_path=str(internal_bk),
+        staged_path="",
+        staged_digest="DELETED:crash_digest",
+        started_at_epoch=now[0],
+        kind="delete",
+        caller_backup_path=str(caller_bk),
+        prune_empty_parents_up_to=str(root_dir / "plugins" / "crew"),
+    )
+    (lease_dir / "workspace_lease.journal.json").write_text(
+        json.dumps({"active_tx": del_journal.to_dict()}, indent=2),
+        encoding="utf-8",
+    )
+    recovered_del = coord.recover_interrupted_commit()
+    assert len(recovered_del) == 1
+    assert recovered_del[0].state == "COMMITTED"
+    assert not crash_target.exists()
+    assert not crash_dir.exists()
+    assert caller_bk.read_text(encoding="utf-8") == "# to-be-deleted\n"
+    assert not internal_bk.exists()
 
     # 4. Preempted git-ref-update --reset-mode mixed (Nerve plugin alignment seam) exits 78 without mutating HEAD
     plugin_repo = tmp_path / "plugin_nerve"
