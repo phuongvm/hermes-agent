@@ -22,6 +22,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.goal_release import (
+    AFFIRMATIVE_RELEASE_COMMAND_RE,
+    CONTINUATION_PROMPT_RELEASE_READY_TEMPLATE,
+    NON_RELEASE_MODIFICATION_VERBS,
+    RELEASE_INTERROGATIVE_HYPOTHETICAL_TOKENS,
+    RELEASE_NEGATION_TOKENS,
+    VERIFICATION_RECEIPT_TTL_S,
+    VerificationReceipt,
+    compute_multi_repo_digest,
+    on_new_user_prompt_authorize_release,
+    release_action_message,
+    serialize_verification_receipt,
+    verify_receipt_parity,
+)
 from hermes_time import safe_strftime
 
 logger = logging.getLogger(__name__)
@@ -451,6 +465,11 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: list[GoalGate] = field(default_factory=list)
+    # Slice 3 cryptographic receipt-bound release state machine (ACTIVE -> VERIFIED -> RELEASE_READY).
+    phase: str = "ACTIVE"
+    active_verification_receipt: Optional[VerificationReceipt] = None
+    last_verified_receipt: Optional[VerificationReceipt] = None
+    last_transition_history: tuple[str, ...] = ("ACTIVE",)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -477,6 +496,10 @@ class GoalState:
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            phase=str(data.get("phase") or "ACTIVE"),
+            active_verification_receipt=VerificationReceipt.from_dict(data.get("active_verification_receipt")),
+            last_verified_receipt=VerificationReceipt.from_dict(data.get("last_verified_receipt")),
+            last_transition_history=tuple(str(x) for x in (data.get("last_transition_history") or ("ACTIVE",))),
             **ints, **floats,
         )
 
@@ -494,6 +517,51 @@ class GoalState:
         self.waiting_on_delegations = 0
         self.waiting_reason = None
         self.waiting_since = 0.0
+
+    def record_verification_receipt(self, receipt: VerificationReceipt) -> None:
+        """Bind a freshly serialized VerificationReceipt onto this GoalState."""
+        self.active_verification_receipt = receipt
+        self.last_verified_receipt = receipt
+
+    def invalidate_verification_receipt(self) -> None:
+        """Reset phase to ACTIVE and unlink both active and last verification receipts."""
+        self.phase = "ACTIVE"
+        self.active_verification_receipt = None
+        self.last_verified_receipt = None
+        self.last_transition_history = ("ACTIVE",)
+
+    def promote_with_receipt(
+        self,
+        receipt: Optional[VerificationReceipt] = None,
+        *,
+        gates_passed: bool = True,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Promote ACTIVE -> VERIFIED -> RELEASE_READY if receipt parity holds and gates passed."""
+        candidate = receipt or self.active_verification_receipt or self.last_verified_receipt
+        if candidate is None or not verify_receipt_parity(candidate, now=now):
+            self.invalidate_verification_receipt()
+            return False
+        self.phase = "VERIFIED"
+        self.active_verification_receipt = candidate
+        self.last_verified_receipt = candidate
+        if gates_passed:
+            self.phase = "RELEASE_READY"
+            self.last_transition_history = ("ACTIVE", "VERIFIED", "RELEASE_READY")
+            return True
+        self.last_transition_history = ("ACTIVE", "VERIFIED")
+        return False
+
+    def render_release_ready_prompt(self) -> str:
+        """Render CONTINUATION_PROMPT_RELEASE_READY_TEMPLATE for a receipt-verified goal."""
+        receipt = self.active_verification_receipt or self.last_verified_receipt
+        digest = (receipt.tree_sha or receipt.porcelain_baseline_digest) if receipt else ""
+        return CONTINUATION_PROMPT_RELEASE_READY_TEMPLATE.format(
+            goal=self.goal,
+            receipt_digest_short=digest[:12],
+            tree_sha=receipt.tree_sha if receipt else "",
+            porcelain_baseline_digest=receipt.porcelain_baseline_digest if receipt else "",
+        )
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -1504,9 +1572,14 @@ class GoalManager:
         # so the judge is skipped and the gate's output drives the next turn (same turn budget).
         gate_decision = self._check_gates()
         if gate_decision is not None:
+            state.invalidate_verification_receipt()
+            self._save()
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
+
+        if state.active_verification_receipt is not None or state.last_verified_receipt is not None:
+            state.promote_with_receipt(gates_passed=True)
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
@@ -1567,10 +1640,23 @@ class GoalManager:
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
 
+    def authorize_new_user_prompt(self, user_message: str, *, now: Optional[float] = None) -> str:
+        """Step 1 unconditional reset + Step 2 5-gate release authorization for a new user prompt."""
+        if self._state is None:
+            return "ACTIVE"
+        phase = on_new_user_prompt_authorize_release(self._state, user_message, now=now)
+        self._save()
+        return phase
+
     def next_continuation_prompt(self) -> Optional[str]:
         s = self._state
         if not s or s.status != "active":
             return None
+        if s.phase == "RELEASE_READY" and s.active_verification_receipt is not None:
+            if verify_receipt_parity(s.active_verification_receipt):
+                return s.render_release_ready_prompt()
+            s.invalidate_verification_receipt()
+            self._save()
         # Contract first (it carries the verification surface); subgoals fold in as extra criteria.
         if s.has_contract():
             contract_block = s.contract.render_block()
@@ -1754,6 +1840,8 @@ def run_kanban_goal_loop(
 
 
 __all__ = [
+    "AFFIRMATIVE_RELEASE_COMMAND_RE",
+    "CONTINUATION_PROMPT_RELEASE_READY_TEMPLATE",
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
@@ -1764,17 +1852,27 @@ __all__ = [
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "NON_RELEASE_MODIFICATION_VERBS",
+    "RELEASE_INTERROGATIVE_HYPOTHETICAL_TOKENS",
+    "RELEASE_NEGATION_TOKENS",
+    "VERIFICATION_RECEIPT_TTL_S",
     "GoalContract",
     "GoalGate",
     "GoalManager",
     "GoalState",
+    "VerificationReceipt",
     "clear_goal",
+    "compute_multi_repo_digest",
     "draft_contract",
     "judge_goal",
     "load_goal",
     "migrate_goal_to_session",
+    "on_new_user_prompt_authorize_release",
     "parse_contract",
+    "release_action_message",
     "run_gate",
     "run_kanban_goal_loop",
     "save_goal",
+    "serialize_verification_receipt",
+    "verify_receipt_parity",
 ]
