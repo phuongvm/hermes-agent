@@ -235,6 +235,36 @@ def handle_api_error(
     return _verdict(_ue.action, _ue.result)
 
 
+def tier_floor_wait_override(agent: Any, api_error: Any, *, status_code: Any) -> Optional[int]:
+    """Slice 4 / Module D4: when a tier-pinned profile (``cb-agent-*``) hits a ``TierFloorViolationError`` or a
+    503 from its combo, the wait follows ``(15, 30, 60, 120)`` then ``WAIT(120s)`` — a deterministic schedule
+    the generic jittered backoff must not shorten, and never a cheap-tier downgrade. ``None`` = not applicable."""
+    from agent.tier_floor_policy import (
+        TierFloorViolationError, is_tier_pinned_model, tier1_backoff_for_attempt,
+    )
+    pinned = getattr(agent, "_tier_pinned_primary", None)
+    if not is_tier_pinned_model(pinned):
+        pinned = getattr(agent, "model", None)
+    if not is_tier_pinned_model(pinned):
+        return None
+    if not (isinstance(api_error, TierFloorViolationError) or status_code == 503):
+        return None
+    attempt = int(getattr(agent, "_tier1_violation_attempts", 0) or 0)
+    agent._tier1_violation_attempts = attempt + 1
+    retry_after = None
+    response = getattr(api_error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            retry_after = None
+    wait = tier1_backoff_for_attempt(attempt, retry_after_s=retry_after)
+    logger.warning("TIER_1 floor (%s): %s — waiting %ss (attempt %d) instead of downgrading", pinned,
+                   type(api_error).__name__, wait, attempt + 1)
+    return wait
+
+
 def _is_local_validation_error(api_error: Any) -> bool:
     """ValueError/TypeError are local bugs, except: UnicodeEncodeError (surrogate recovery
     path), json.JSONDecodeError / provider stream-parse ValueErrors (transient provider/network failure, must retry),
@@ -422,6 +452,9 @@ def settle_unrecovered_error(
         is_rate_limited=is_rate_limited, is_zai_coding_overload=_is_zai_coding_overload,
         base_url=_base, model=_model,
     )
+    _tier_wait = tier_floor_wait_override(agent, api_error, status_code=status_code)
+    if _tier_wait is not None:
+        wait_time = max(float(wait_time or 0), float(_tier_wait))
     # Same preserve-redirect rule as the invalid-response wait: a steering correction
     # must survive backoff, not die as "Operation interrupted".
     _interrupted = interruptible_backoff_sleep(

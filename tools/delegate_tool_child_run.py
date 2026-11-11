@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from agent.compression_marker import elide
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
+from pathlib import Path
 from tools import file_state
 from tools.delegate_tool_progress import _quiet, _safe_progress
 from tools.delegate_tool_registry import (
@@ -1077,6 +1078,37 @@ class _ChildRun:
                 entry["summary"] = entry["summary"] + reminder
             else:
                 entry["stale_paths"] = mod_paths
+
+    def checkpoint_slice_manifest(self, result: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+        """Module D3 disk checkpoint: a child carrying ``_delegate_slice_id`` (``slice1``..``slice4``) writes and
+        ``os.fsync``s ``<_delegate_manifest_dir>/slice{N}_manifest.json`` BEFORE its result entry returns, so a
+        parent that dies mid-collection (or a 1800s slice bound that fires) still finds the slice's proof on disk.
+        No-op for ordinary children. Records the path on the entry as ``slice_manifest``; never raises."""
+        slice_id = getattr(self.child, "_delegate_slice_id", None)
+        if not isinstance(slice_id, str) or not slice_id:
+            return entry
+        from tools.sliced_delegation import SliceManifest, write_slice_manifest
+        with _quiet("slice manifest checkpoint failed: %s"):
+            manifest_dir = getattr(self.child, "_delegate_manifest_dir", None)
+            directory = Path(manifest_dir) if manifest_dir else Path.cwd() / "slice_manifests"
+            info = self.worktree_info or {}
+            repo_root = str(getattr(self.child, "_delegate_repo_root", None) or info.get("path") or Path.cwd())
+            head_sha = str(getattr(self.child, "_delegate_head_sha", "") or info.get("head", "") or "")
+            written: dict[str, str] = {}
+            with _quiet(None):
+                import hashlib
+                for paths in file_state.writes_since(self.child_task_id, self.wall_start, []).values():
+                    for p in paths:
+                        try:
+                            written[str(p)] = hashlib.sha256(Path(p).read_bytes()).hexdigest()
+                        except OSError:
+                            written[str(p)] = "<unreadable>"
+            proofs = tuple(str(c) for c in (getattr(self.child, "_delegate_proof_commands", None) or ()))
+            manifest = SliceManifest(slice_id=slice_id, repo_root=repo_root, head_sha=head_sha,
+                                     modified_files_sha256=written, proof_commands=proofs,
+                                     proof_exit_code=0 if entry.get("status") == "completed" else 1)
+            entry["slice_manifest"] = str(write_slice_manifest(directory, manifest))
+        return entry
 
     def account_background_processes(self, entry: dict[str, Any]) -> None:
         """Name the child's background processes on the result BEFORE ``cleanup`` kills them: handed-off ones now

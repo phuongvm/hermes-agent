@@ -417,10 +417,19 @@ AMBIGUOUS_SKILL_PREFIX = "Ambiguous skill name "
 _SHADOW_CHECKED: set[tuple[str, ...]] = set()
 
 
-def get_skill_search_roots(local: Optional[Path] = None, *, include_project: bool = True) -> list[tuple[int, Path]]:
+def get_skill_search_roots(local: Optional[Path] = None, *, include_project: bool = True,
+                           trusted_project: Optional[bool] = None) -> list[tuple[int, Path]]:
     """``(tier, dir)`` for every skill root in precedence order — the ONE ordering the skills list,
     prompt index, slash commands, skill_view, preload and cron share. *local* overrides the profile
-    skills dir (skills_tool passes its live root); that entry is kept even when missing."""
+    skills dir (skills_tool passes its live root); that entry is kept even when missing.
+
+    *trusted_project* pins the Tier 0 decision independently of the process cwd: ``True`` keeps the
+    trusted project roots, ``False`` is the Gateway/cron ordering (cwd ``$HOME`` resolves no project,
+    so ``skills.create_dir`` is the only route to ``.agents/skills``). ``None`` (default) derives it
+    from the cwd exactly as before. ``DualRootCatalogResolver`` evaluates both values and requires an
+    identical catalog resolution so skill behaviour never depends on where a session was launched."""
+    if trusted_project is False:
+        include_project = False
     roots = [(TIER_PROJECT, d) for d in get_project_skills_dirs()] if include_project else []
     roots.append((TIER_LOCAL, Path(local) if local is not None else get_skills_dir()))
     create_dir = get_skill_create_dir()
@@ -435,6 +444,35 @@ def get_all_skills_dirs() -> list[Path]:
     """Skill dirs: local ``~/.hermes/skills/`` first, then create_dir, then external.
     Trusted project dirs are NOT included (higher precedence; see get_project_skills_dirs)."""
     return [d for _tier, d in get_skill_search_roots(include_project=False)]
+
+
+def resolve_dual_root_catalog(local: Optional[Path] = None) -> dict[str, dict[str, str]]:
+    """Module D2 seam: ``{"trusted": {name: sha256}, "untrusted": {name: sha256}}`` of every uniquely
+    resolved skill under ``trusted_project=True`` and ``trusted_project=False``. Identity is the
+    SKILL.md content digest, so a byte-identical ``.agents/skills`` copy reached through Tier 0 in one
+    ordering and through ``skills.create_dir`` in the other counts as the SAME resolution; a skill that
+    exists only in the project tier, or a divergent profile-local copy, shows up as a difference."""
+    out: dict[str, dict[str, str]] = {}
+    for label, trusted in (("trusted", True), ("untrusted", False)):
+        entries: list[dict[str, Any]] = []
+        for tier, root in get_skill_search_roots(local, trusted_project=trusted):
+            if not root.is_dir():
+                continue
+            for path in iter_skill_index_files(root, "SKILL.md"):
+                try:
+                    fm, _ = parse_frontmatter(path.read_text(encoding="utf-8-sig", errors="ignore"))
+                except Exception:
+                    fm = {}
+                entries.append({"name": str(fm.get("name") or path.parent.name), "tier": tier, "root": root, "path": path})
+        resolved: dict[str, str] = {}
+        for e in resolve_skill_catalog(entries):
+            if e["status"] == "unique":
+                try:
+                    resolved[str(e["name"])] = hashlib.sha256(Path(e["path"]).read_bytes()).hexdigest()
+                except OSError:
+                    resolved[str(e["name"])] = "<unreadable>"
+        out[label] = resolved
+    return out
 
 
 def provably_same_skill(skill_mds) -> bool:

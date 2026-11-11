@@ -104,6 +104,9 @@ def _normalize_role(r: Optional[str]) -> str:
     return r_norm
 
 DEFAULT_MAX_ITERATIONS = 250
+# Slice 4 / Module D3: one delegated slice is bounded to 30 minutes; a longer ``timeout_s`` is refused at
+# preflight (never clamped) so monolithic multi-slice delegations cannot be requested by accident.
+from tools.sliced_delegation import MAX_SLICE_TIMEOUT_S, validate_slice_timeout
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds (cycles of _HEARTBEAT_INTERVAL with no progress). Progress = iteration, current_tool OR
 # last_activity_ts advancing; an in-flight model wait refreshes last_activity_ts, so slow models are not "idle". Idle
@@ -425,6 +428,7 @@ def _run_single_child(
         entry = _build_result_entry(child, result, task_index, duration, schema)
         run.append_sibling_write_reminder(entry)
         run.account_background_processes(entry)
+        run.checkpoint_slice_manifest(result, entry)  # Module D3: durable slice{N}_manifest.json before return
         run.emit_complete(result, entry, duration)
         return run.attach_worktree(entry)
     except Exception as exc:
@@ -568,11 +572,12 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    credentials_cfg: Optional[dict[str, Any]] = None,
+    credentials_cfg: Optional[dict[str, Any]] = None, timeout_s: Optional[float] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
-    (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
+    (per-task beats top-level; capability is depth-derived). ``timeout_s`` (call-level or per task) is the slice
+    bound and must be ``<= MAX_SLICE_TIMEOUT_S``. Returns JSON with one results entry per task, or a
     dispatch handle when running in the background."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
@@ -585,6 +590,18 @@ def delegate_task(
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+
+    # Slice bound preflight (Module D3): refused before the pause gate so the refusal is deterministic.
+    slice_err = validate_slice_timeout(timeout_s)
+    if slice_err is None and isinstance(tasks, list):
+        for i, task in enumerate(tasks):
+            if isinstance(task, dict) and task.get("timeout_s") is not None:
+                slice_err = validate_slice_timeout(task.get("timeout_s"))
+                if slice_err is not None:
+                    slice_err = f"Task {i}: {slice_err}"
+                    break
+    if slice_err is not None:
+        return tool_error(slice_err)
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():

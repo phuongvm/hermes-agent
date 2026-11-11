@@ -1922,6 +1922,24 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
+def _tier_floor_blocks_fallback(agent, fb_provider: str, fb_model: str) -> bool:
+    """Slice 4 / Module D4: a specialist primary (``cb-agent-*``) never falls back to a TIER_3 tail. The
+    pinned profile's primary model is remembered on first sight so the check survives a mid-turn swap."""
+    from agent.tier_floor_policy import is_tier1_model_id, is_tier_pinned_model
+    pinned = getattr(agent, "_tier_pinned_primary", None)
+    if not is_tier_pinned_model(pinned):  # unset, stale, or a MagicMock attribute
+        pinned = None
+        if is_tier_pinned_model(getattr(agent, "model", None)):
+            pinned = agent._tier_pinned_primary = agent.model
+    if not pinned:
+        return False
+    if is_tier1_model_id(fb_model):
+        return False
+    logger.warning("Fallback skip: %s/%s is below the TIER_1 floor pinned by %s (waiting instead of downgrading)",
+                   fb_provider, fb_model, pinned)
+    return True
+
+
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
@@ -1929,6 +1947,8 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
     if not fb_provider or not fb_model:
+        return True
+    if _tier_floor_blocks_fallback(agent, fb_provider, fb_model):
         return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
@@ -2950,6 +2970,13 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
+        # Slice 4 / Module D4: a specialist profile's stream answered by a TIER_3 tail is refused on the
+        # headers alone (``x-model-id``), before any chunk is consumed; the retry loop then WAITS on the
+        # (15s, 30s, 60s, 120s) schedule instead of accepting a downgraded answer.
+        from agent.tier_floor_policy import enforce_tier1_response_guard, is_tier_pinned_model
+        _pinned = getattr(self.agent, "_tier_pinned_primary", None)
+        enforce_tier1_response_guard(response, profile_model=_pinned if is_tier_pinned_model(_pinned)
+                                     else getattr(self.agent, "model", None))
         self.agent._capture_rate_limits(response)
         self.agent._capture_credits(response)
         self.agent._capture_nous_model_switch(response)

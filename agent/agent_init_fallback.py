@@ -19,6 +19,23 @@ def _fallback_entries(fallback_model) -> list[dict[str, Any]]:
     ]
 
 
+def filter_fallback_entries_for_tier_floor(entries: list[dict[str, Any]], *, primary_model: Any) -> list[dict[str, Any]]:
+    """Slice 4 / Module D4: a specialist profile (``cb-agent-*``) is pinned to TIER_1_FRONTIER_REASONING, so
+    chain entries that resolve to a TIER_3 tail (``cb-always-on``, ``nemotron-free``, ``crouton-alpha`` …) are
+    dropped at init — the agent WAITS on the tier-1 backoff schedule instead of downgrading. Non-specialist
+    primaries keep their chain untouched."""
+    from agent.tier_floor_policy import is_tier1_model_id, is_tier_pinned_model
+    if not is_tier_pinned_model(primary_model):
+        return entries
+    kept, dropped = [], []
+    for entry in entries:
+        (kept if is_tier1_model_id(entry.get("model")) else dropped).append(entry)
+    if dropped:
+        logger.warning("TIER_1 floor for %s: dropped fallback entries %s (never downgrade)", primary_model,
+                       [f"{e.get('model')} ({e.get('provider')})" for e in dropped])
+    return kept
+
+
 def _init_fallback_chain(agent, fallback_model):
     # Stable pool-entry identity: OAuth refreshes can replace the token before a failed
     # request is recovered, so the key value alone can't attribute the failure.
@@ -26,7 +43,8 @@ def _init_fallback_chain(agent, fallback_model):
     sync_credential_pool_entry_id(agent)
 
     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
-    agent._fallback_chain = _fallback_entries(fallback_model)
+    agent._fallback_chain = filter_fallback_entries_for_tier_floor(
+        _fallback_entries(fallback_model), primary_model=getattr(agent, "model", None))
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)

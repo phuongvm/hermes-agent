@@ -23,6 +23,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_TURN_LIVENESS_TIMEOUT_S = 600.0
 DEFAULT_TURN_LIVENESS_POLL_S = 15.0
 MIN_TURN_LIVENESS_POLL_S = 0.01
+# Slice 4 / Module D3: delegated children emit ``subagent.heartbeat`` every 60s of wall time so the parent and the
+# gateway watch window see a live child while it waits on a multi-minute completion. The cadence and event name
+# are owned by ``tools.sliced_delegation``; this module exposes them next to the turn watchdog they complement.
+from tools.sliced_delegation import HEARTBEAT_EVENT as SUBAGENT_HEARTBEAT_EVENT
+from tools.sliced_delegation import HEARTBEAT_INTERVAL_S as SUBAGENT_HEARTBEAT_INTERVAL_S
+from tools.sliced_delegation import SubagentHeartbeat
+
+
+def subagent_heartbeat(emit: Callable[..., Any], *, subagent_id: Optional[str],
+                       interval_s: float = SUBAGENT_HEARTBEAT_INTERVAL_S) -> SubagentHeartbeat:
+    """Build the 60s ``subagent.heartbeat`` emitter for one delegated child (``emit(kind, **fields)``)."""
+    return SubagentHeartbeat(emit, subagent_id=subagent_id, interval_s=interval_s)
 
 _CONFIG_TIMEOUT_KEY = "agent.turn_liveness.timeout_s"
 _CONFIG_POLL_KEY = "agent.turn_liveness.poll_s"

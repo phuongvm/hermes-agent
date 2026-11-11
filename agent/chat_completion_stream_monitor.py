@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 # Kills of one dispatched attempt whose worker never unwinds before the monitor gives up on it.
 _STALE_ABANDON_KILLS = 3
+# Slice 4 / Module D3: an upstream SSE stream that delivered ZERO chunks is cut over after 180s. This is the
+# implicit ``HERMES_STREAM_STALE_TIMEOUT`` default the poll loop enforces via ``_kill_stale_stream``; the rule
+# itself (``should_cut_over_silent_stream``) lives in ``tools.sliced_delegation`` so the constant has one owner.
+from tools.sliced_delegation import SILENT_STREAM_CUTOVER_S, should_cut_over_silent_stream
 
 
 class StreamingWaitMonitor:
