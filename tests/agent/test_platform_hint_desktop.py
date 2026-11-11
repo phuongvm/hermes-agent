@@ -67,6 +67,15 @@ class TestPlatformHintResolutionInStablePrompt:
         assert "Runtime surface:" not in stable
         assert "embedded terminal pane" not in stable
 
+    def test_desktop_hint_advertises_inline_mermaid_and_compact_svg_without_raw_thresholds(self):
+        hint = PLATFORM_HINTS["desktop"]
+        assert (
+            "Fenced ```mermaid and compact ```svg blocks render inline as diagrams in the chat; "
+            "use ```mermaid proactively for architecture, flows, and sequences."
+        ) in hint
+        for forbidden in ("2000", "2,000", "SVG_MIN_CHARS", "160", "1200"):
+            assert forbidden not in hint, f"Desktop hint must not duplicate raw threshold token {forbidden!r}"
+
     def test_embedded_tui_yields_tui_hint_with_clarifier(self, monkeypatch):
         monkeypatch.setenv("HERMES_DESKTOP", "1")
         monkeypatch.setenv("HERMES_DESKTOP_TERMINAL", "1")

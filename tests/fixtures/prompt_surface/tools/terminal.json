@@ -32,6 +32,11 @@
         ],
         "description": "With background=true. true: one notification on exit; use it for anything that ends (builds, tests, deploys), or the job runs silently. ['pattern', ...]: notify when a line matches, only for one-shot readiness on processes that never exit; rate-limited. Omit for servers/daemons."
       },
+      "notify_on_complete": {
+        "default": false,
+        "description": "With background=true: notify on process exit. Alias for notify=true.",
+        "type": "boolean"
+      },
       "persist_on_release": {
         "default": false,
         "description": "With background=true: survive session end, /new, compression and other cleanup (not host exit). Only for jobs the user explicitly wants to outlive the conversation.",
