@@ -35,10 +35,10 @@ router = APIRouter()
 
 
 async def _git_op(fn, *args):
-    """Run a (blocking) git op off the event loop; map a failed mutation to 400."""
-    loop = asyncio.get_running_loop()
+    """Run a (blocking) git op off the event loop via bounded probe pool; map a failed mutation to 400."""
     try:
-        return await loop.run_in_executor(None, fn, *args)
+        from hermes_cli.web_server import offload_probe
+        return await offload_probe(fn, *args)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "git operation failed")
 

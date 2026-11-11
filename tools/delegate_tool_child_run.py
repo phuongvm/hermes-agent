@@ -348,6 +348,13 @@ class _Heartbeat:
         # Threshold (seconds of frozen activity) the stale verdict fired at; None until it does.
         # ``await_child`` reads it to name the real cause when a configured cap was still pending.
         self.stale_threshold_seconds: Optional[float] = None
+        self.child_progress_cb = getattr(child, "tool_progress_callback", None)
+        subagent_id = getattr(child, "_subagent_id", None)
+        if self.child_progress_cb:
+            from tools.sliced_delegation import subagent_heartbeat
+            self._subagent_hb = subagent_heartbeat(self.child_progress_cb, subagent_id=subagent_id)
+        else:
+            self._subagent_hb = None
 
     def start(self) -> None:
         from agent.periodic_scheduler import schedule
@@ -400,6 +407,8 @@ class _Heartbeat:
                 desc = f"delegate_task: subagent {child_summary.get('last_activity_desc', '')} (iteration {child_iter}/{child_max})"
         except Exception:
             pass
+        if self._subagent_hb is not None:
+            self._subagent_hb.tick()
         with _quiet(None):
             touch(desc)
         return None
@@ -871,43 +880,48 @@ class _ChildRun:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
         return _close_subagent_steering(self.subagent_id, self.child) if self.subagent_id else None
 
-    def wait_liveness_aware(self, settled: threading.Event, child_future: Any, child_timeout: Optional[float]) -> None:
-        """Wait for the worker or the stale verdict, where ``child_timeout`` bounds INACTIVITY, not total runtime.
-
-        A configured cap used to be a dispatch-to-death stopwatch, so it only ever killed children the runtime had
-        already judged healthy: all 75 reported deaths happened while waiting on an in-flight LLM completion, none
-        mid-tool (#116001). A provider serving multi-minute completions is progress — the child's activity clock
-        ticks during the wait and the request is bounded by the per-call stale watchdog — so the budget restarts on
-        every sign of progress, exactly the signals the heartbeat's stale verdict reads. Genuinely frozen children
-        keep two authorities: this budget (when configured) and the heartbeat's stale threshold.
-        """
-        if child_timeout is None:
+    def wait_liveness_aware(self, settled: threading.Event, child_future: Any, child_timeout: Optional[float], execution_deadline: Optional[float] = None) -> None:
+        """Wait for the worker or the stale verdict, bounded by inactivity (child_timeout) and slice deadline (execution_deadline)."""
+        if child_timeout is None and execution_deadline is None:
             settled.wait()
             return
-        deadline = time.monotonic() + child_timeout
-        warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
+        deadline = (time.monotonic() + child_timeout) if child_timeout is not None else execution_deadline
+        if execution_deadline is not None and (deadline is None or deadline > execution_deadline):
+            deadline = execution_deadline
+        warn_at = (deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)) if (deadline is not None and child_timeout is not None) else execution_deadline
         warned = False
         fingerprint = _child_activity_fingerprint(self.child)
         while True:
             now = time.monotonic()
-            remaining = deadline - now
+            if execution_deadline is not None and now >= execution_deadline:
+                return
+            remaining = (deadline - now) if deadline is not None else 1.0
             if remaining <= 0:
                 return  # no progress for the whole budget
             wait = min(_LIVENESS_POLL_SECONDS, remaining)
-            if not warned:
+            if execution_deadline is not None:
+                wait = min(wait, max(0.0, execution_deadline - now))
+            if not warned and child_timeout is not None and warn_at is not None:
                 wait = min(wait, max(warn_at - now, 0.0))
             settled.wait(timeout=wait)
             if settled.is_set():
                 return  # the worker finished, or the heartbeat declared the child stale
+            now = time.monotonic()
+            if execution_deadline is not None and now >= execution_deadline:
+                return
             current = _child_activity_fingerprint(self.child)
             if current != fingerprint:
                 fingerprint = current
-                deadline = time.monotonic() + child_timeout
-                warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
-                warned = False  # a fresh window gets its own warning
-            elif not warned and time.monotonic() >= warn_at:
+                if child_timeout is not None:
+                    deadline = now + child_timeout
+                    if execution_deadline is not None and deadline > execution_deadline:
+                        deadline = execution_deadline
+                    warn_at = (deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)) if deadline is not None else execution_deadline
+                    warned = False  # a fresh window gets its own warning
+            elif not warned and child_timeout is not None and warn_at is not None and now >= warn_at:
                 warned = True
-                _warn_child_budget(self.child, child_timeout - (deadline - time.monotonic()), child_timeout)
+                if deadline is not None:
+                    _warn_child_budget(self.child, child_timeout - (deadline - now), child_timeout)
 
     def await_child(self) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], bool]:
         """Run the child's conversation on a daemon worker: ``(result, None, False)`` or ``(None, error_entry,
@@ -928,6 +942,8 @@ class _ChildRun:
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
+        slice_timeout = getattr(child, "_delegate_timeout_s", None)
+        execution_deadline = (self.child_start + slice_timeout) if slice_timeout is not None else None
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )
@@ -957,8 +973,12 @@ class _ChildRun:
         # Set when the stale verdict — not the configured cap — ended the wait; the entry must name that cause.
         stale_after: Optional[float] = None
         try:
-            self.wait_liveness_aware(settled, future, child_timeout)
+            self.wait_liveness_aware(settled, future, child_timeout, execution_deadline=execution_deadline)
             if not future.done():
+                now = time.monotonic()
+                if execution_deadline is not None and now >= execution_deadline:
+                    stale_after = None
+                    raise FuturesTimeoutError()
                 stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
                 if stale_after is None:
                     # A configured inactivity cap elapsing keeps its teeth: the user armed a
@@ -1000,7 +1020,7 @@ class _ChildRun:
         _signal_child_stop(child)
         is_timeout = isinstance(exc, (FuturesTimeoutError, TimeoutError))
         # What actually ended the wait: the stale threshold pre-empts a longer configured cap.
-        timeout_cause = stale_after if stale_after is not None else child_timeout
+        timeout_cause = stale_after if stale_after is not None else (slice_timeout if (slice_timeout is not None and execution_deadline and time.monotonic() >= execution_deadline) else child_timeout)
         duration = self.elapsed()
         logger.warning("Subagent %d %s after %.1fs", task_index, "timed out" if is_timeout else f"raised {type(exc).__name__}",
                        duration, exc_info=exc if not is_timeout else False)  # outside ``except``: pass it
@@ -1021,6 +1041,8 @@ class _ChildRun:
                 logger.warning("Subagent %d 0-API-call timeout — diagnostic written to %s", task_index, diagnostic_path)
         if not is_timeout:
             _err = str(exc)
+        elif slice_timeout is not None and execution_deadline and time.monotonic() >= execution_deadline:
+            _err = f"Subagent timed out after {duration}s exceeding slice timeout bound ({slice_timeout:g}s)."
         elif stale_after is not None:
             _err = (
                 f"Subagent stopped making progress after {child_api_calls} API call(s) — no activity for "
@@ -1083,31 +1105,41 @@ class _ChildRun:
         """Module D3 disk checkpoint: a child carrying ``_delegate_slice_id`` (``slice1``..``slice4``) writes and
         ``os.fsync``s ``<_delegate_manifest_dir>/slice{N}_manifest.json`` BEFORE its result entry returns, so a
         parent that dies mid-collection (or a 1800s slice bound that fires) still finds the slice's proof on disk.
-        No-op for ordinary children. Records the path on the entry as ``slice_manifest``; never raises."""
+        Fails closed with RuntimeError if checkpoint cannot be persisted."""
         slice_id = getattr(self.child, "_delegate_slice_id", None)
         if not isinstance(slice_id, str) or not slice_id:
             return entry
         from tools.sliced_delegation import SliceManifest, write_slice_manifest
-        with _quiet("slice manifest checkpoint failed: %s"):
-            manifest_dir = getattr(self.child, "_delegate_manifest_dir", None)
-            directory = Path(manifest_dir) if manifest_dir else Path.cwd() / "slice_manifests"
-            info = self.worktree_info or {}
-            repo_root = str(getattr(self.child, "_delegate_repo_root", None) or info.get("path") or Path.cwd())
-            head_sha = str(getattr(self.child, "_delegate_head_sha", "") or info.get("head", "") or "")
-            written: dict[str, str] = {}
-            with _quiet(None):
-                import hashlib
-                for paths in file_state.writes_since(self.child_task_id, self.wall_start, []).values():
-                    for p in paths:
-                        try:
-                            written[str(p)] = hashlib.sha256(Path(p).read_bytes()).hexdigest()
-                        except OSError:
-                            written[str(p)] = "<unreadable>"
-            proofs = tuple(str(c) for c in (getattr(self.child, "_delegate_proof_commands", None) or ()))
-            manifest = SliceManifest(slice_id=slice_id, repo_root=repo_root, head_sha=head_sha,
-                                     modified_files_sha256=written, proof_commands=proofs,
-                                     proof_exit_code=0 if entry.get("status") == "completed" else 1)
+        manifest_dir = getattr(self.child, "_delegate_manifest_dir", None)
+        directory = Path(manifest_dir) if manifest_dir else Path.cwd() / "slice_manifests"
+        info = self.worktree_info or {}
+        repo_root = str(getattr(self.child, "_delegate_repo_root", None) or info.get("path") or Path.cwd())
+        head_sha = str(getattr(self.child, "_delegate_head_sha", "") or info.get("head", "") or "")
+        written: dict[str, str] = {}
+        import hashlib
+        try:
+            for paths in file_state.writes_since(self.child_task_id, self.wall_start, []).values():
+                for p in paths:
+                    try:
+                        written[str(p)] = hashlib.sha256(Path(p).read_bytes()).hexdigest()
+                    except OSError:
+                        written[str(p)] = "<unreadable>"
+        except Exception:
+            pass
+        proofs_val = getattr(self.child, "_delegate_proof_commands", None)
+        proofs = tuple(str(c) for c in proofs_val) if isinstance(proofs_val, (list, tuple)) else ()
+        proof_exit = getattr(self.child, "_delegate_proof_exit_code", None)
+        if proof_exit is None or not isinstance(proof_exit, (int, float)):
+            proof_exit = 0 if entry.get("status") == "completed" else 1
+        manifest = SliceManifest(slice_id=slice_id, repo_root=repo_root, head_sha=head_sha,
+                                 modified_files_sha256=written, proof_commands=proofs,
+                                 proof_exit_code=int(proof_exit))
+        try:
             entry["slice_manifest"] = str(write_slice_manifest(directory, manifest))
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = f"Mandatory slice manifest checkpoint failed: {exc}"
+            raise RuntimeError(f"Mandatory slice manifest checkpoint failed: {exc}") from exc
         return entry
 
     def account_background_processes(self, entry: dict[str, Any]) -> None:

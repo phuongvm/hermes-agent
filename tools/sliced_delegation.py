@@ -145,6 +145,12 @@ class SubagentHeartbeat:
         return True
 
 
+def subagent_heartbeat(emit: Callable[..., Any], *, subagent_id: Optional[str],
+                       interval_s: float = HEARTBEAT_INTERVAL_S) -> SubagentHeartbeat:
+    """Build the 60s ``subagent.heartbeat`` emitter for one delegated child (``emit(kind, **fields)``)."""
+    return SubagentHeartbeat(emit, subagent_id=subagent_id, interval_s=interval_s)
+
+
 # --------------------------------------------------------------------------------------------- silent stream
 def should_cut_over_silent_stream(*, last_chunk_at: float, now: float, chunks_delivered: int,
                                   cutover_s: float = SILENT_STREAM_CUTOVER_S) -> bool:

@@ -757,6 +757,9 @@ def get_install_id() -> Optional[str]:
 # ``offload_probe`` (``asyncio.to_thread`` semantics) so the dashboard event loop never blocks on them and the
 # loop-heartbeat watchdog below keeps its stall p99 < 1.0s. Routers import the seam from here.
 from tools.sliced_delegation import PROBE_POOL_MAX_WORKERS, offload_probe, probe_pool
+async def offload_eager_reconcile() -> None:
+    """Run eager state.db schema reconcile on the bounded probe pool."""
+    return await offload_probe(_eager_reconcile_own_session_db)
 # A finished ``gateway-restart`` child does not mean the gateway is back (it
 # exits once the restart is handed off), so in-flight reuse stops coalescing
 # exactly when a stale frontend re-fires every few seconds (#89034: 77 restarts,

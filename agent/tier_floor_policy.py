@@ -60,11 +60,20 @@ class TierFloorViolationError(RuntimeError):
     def __init__(self, *, model_id: Optional[str], profile_model: str, reason: str = "") -> None:
         self.model_id = model_id
         self.profile_model = profile_model
-        shown = model_id if model_id is not None else "<missing x-model-id>"
+        shown = model_id if model_id is not None else "<missing provenance>"
         super().__init__(
             f"TIER_1_FRONTIER_REASONING floor violated for {profile_model}: response answered by {shown!r}"
             + (f" ({reason})" if reason else "") + "; backing off instead of downgrading"
         )
+
+
+class TierFloorReadbackError(RuntimeError):
+    """9Router combo readback validation failed."""
+
+    def __init__(self, violations: list[dict[str, Any]], receipt: Optional[dict[str, Any]] = None) -> None:
+        self.violations = violations
+        self.receipt = receipt
+        super().__init__(f"9Router combo readback failed with {len(violations)} violation(s): {violations}")
 
 
 # ---------------------------------------------------------------------------- allowlist
@@ -82,6 +91,23 @@ def is_tier1_model_id(model_id: Any) -> bool:
 
 def is_tier_pinned_model(profile_model: Any) -> bool:
     return isinstance(profile_model, str) and profile_model.strip() in SPECIALIST_COMBO_IDS
+
+
+def tier_floor_blocks_fallback(agent: Any, fb_provider: str, fb_model: str) -> bool:
+    """Slice 4 / Module D4: a specialist primary (``cb-agent-*``) never falls back to a TIER_3 tail. The
+    pinned profile's primary model is remembered on first sight so the check survives a mid-turn swap."""
+    pinned = getattr(agent, "_tier_pinned_primary", None)
+    if not is_tier_pinned_model(pinned):  # unset, stale, or a MagicMock attribute
+        pinned = None
+        if is_tier_pinned_model(getattr(agent, "model", None)):
+            pinned = agent._tier_pinned_primary = agent.model
+    if not pinned:
+        return False
+    if is_tier1_model_id(fb_model):
+        return False
+    logger.warning("Fallback skip: %s/%s is below the TIER_1 floor pinned by %s (waiting instead of downgrading)",
+                   fb_provider, fb_model, pinned)
+    return True
 
 
 def _header_lookup(source: Any) -> Callable[[str], Optional[str]]:
@@ -105,20 +131,32 @@ def _header_lookup(source: Any) -> Callable[[str], Optional[str]]:
 
 def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Optional[str],
                                  require_header: bool = False) -> Optional[str]:
-    """Return the ``x-model-id`` that answered (or ``None``) — raising ``TierFloorViolationError`` when
-    ``profile_model`` is a specialist combo and the id is outside ``TIER_1_ALLOWLIST``. Non-specialist
-    profiles are never guarded. A missing header is tolerated unless ``require_header`` is set."""
+    """Return the model provenance that answered (or ``None``) — raising ``TierFloorViolationError`` when
+    ``profile_model`` is a specialist combo and either ``x-model-id`` or ``response.model`` is outside
+    ``TIER_1_ALLOWLIST``, or if model provenance is missing/empty on a specialist profile. Non-specialist
+    profiles are never guarded."""
     if not is_tier_pinned_model(profile_model):
         return None
     assert profile_model is not None
-    model_id = _header_lookup(response_or_headers)(MODEL_ID_HEADER)
-    if model_id is None:
-        if require_header:
-            raise TierFloorViolationError(model_id=None, profile_model=profile_model, reason="header required")
-        return None
-    if not is_tier1_model_id(model_id):
-        raise TierFloorViolationError(model_id=model_id, profile_model=profile_model)
-    return model_id
+
+    header_model_id = _header_lookup(response_or_headers)(MODEL_ID_HEADER)
+    body_model = getattr(response_or_headers, "model", None)
+    if body_model is None and isinstance(response_or_headers, dict):
+        body_model = response_or_headers.get("model")
+
+    if require_header and not header_model_id:
+        raise TierFloorViolationError(model_id=None, profile_model=profile_model, reason="header required")
+
+    if not header_model_id and not body_model:
+        raise TierFloorViolationError(model_id=None, profile_model=profile_model, reason="missing provenance")
+
+    if header_model_id and not is_tier1_model_id(header_model_id):
+        raise TierFloorViolationError(model_id=header_model_id, profile_model=profile_model, reason="header rejected")
+
+    if body_model and not is_tier1_model_id(str(body_model)):
+        raise TierFloorViolationError(model_id=str(body_model), profile_model=profile_model, reason="body model rejected")
+
+    return header_model_id or str(body_model)
 
 
 # ---------------------------------------------------------------------------- backoff
@@ -162,7 +200,11 @@ def _combo_violations(combos: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             violations.append({"combo": name, "reason_code": "MISSING_TIER_FLOOR",
                                "observed": combo.get("fallback_tier_floor")})
             continue
-        bad = [m for m in (combo.get("models") or []) if not is_tier1_model_id(m)]
+        models = combo.get("models")
+        if not models or len(models) < 1:
+            violations.append({"combo": name, "reason_code": "EMPTY_MODELS"})
+            continue
+        bad = [m for m in models if not is_tier1_model_id(m)]
         if bad:
             violations.append({"combo": name, "reason_code": "TIER_3_MEMBER", "members": bad})
     return violations
@@ -175,16 +217,21 @@ def verify_9router_combo_readback(*, base_url: str, receipt_path: Optional[Path]
     """Verify the five specialist combos carry the TIER_1 floor with TIER_1-only members. Reads
     ``NINEROUTER_READBACK_FIXTURE_PATH`` (or ``fixture_path``) for a deterministic offline run, otherwise
     ``GET {base_url}/api/combos``. Always writes ``receipt_path`` (default ``./9router_combo_readback_receipt.json``);
-    an unreachable router without a fixture fails closed (``ROUTER_UNREACHABLE``)."""
+    raises ``TierFloorReadbackError`` if violations exist (or router unreachable without fixture)."""
     started = time.monotonic()
     fixture = fixture_path or (Path(os.environ[FIXTURE_ENV]) if os.environ.get(FIXTURE_ENV) else None)
-    receipt: dict[str, Any] = {"schema": "9router_combo_readback_receipt.v1", "tier_floor": TIER_1_FRONTIER_REASONING,
-                               "specialists": list(SPECIALIST_COMBO_IDS), "base_url": base_url,
-                               "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    receipt: dict[str, Any] = {
+        "schema": "9router_combo_readback_receipt.v1",
+        "tier_floor": TIER_1_FRONTIER_REASONING,
+        "specialists": list(SPECIALIST_COMBO_IDS),
+        "base_url": base_url,
+        "mode": "offline_fixture" if fixture is not None else "live",
+        "source": "fixture" if fixture is not None else "live",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
     combos: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
     if fixture is not None:
-        receipt["source"] = "fixture"
         receipt["fixture_path"] = str(fixture)
         try:
             raw = Path(fixture).read_bytes()
@@ -193,7 +240,6 @@ def verify_9router_combo_readback(*, base_url: str, receipt_path: Optional[Path]
         except (OSError, ValueError) as exc:
             violations.append({"combo": "*", "reason_code": "FIXTURE_UNREADABLE", "error": str(exc)})
     else:
-        receipt["source"] = "live"
         headers = {"Accept": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -203,13 +249,32 @@ def verify_9router_combo_readback(*, base_url: str, receipt_path: Optional[Path]
             violations.append({"combo": "*", "reason_code": "ROUTER_UNREACHABLE", "error": str(exc)[:200]})
     if not violations:
         violations = _combo_violations(combos)
+    by_name = {str(c.get("name")): c for c in combos}
     verified = [n for n in SPECIALIST_COMBO_IDS if not any(v["combo"] in (n, "*") for v in violations)]
-    receipt.update({"combo_count": len(verified), "verified": verified, "violations": violations,
-                    "passed": not violations, "elapsed_ms": round((time.monotonic() - started) * 1000, 1)})
+    per_combo_digests = {
+        n: hashlib.sha256(json.dumps(by_name[n].get("models", []), sort_keys=True).encode()).hexdigest()
+        for n in verified if n in by_name
+    }
+    receipt.update({
+        "combo_count": len(verified),
+        "combos_verified": len(verified),
+        "verified": verified,
+        "per_combo_digests": per_combo_digests,
+        "violations": violations,
+        "passed": not violations,
+        "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+    })
     out = Path(receipt_path) if receipt_path is not None else Path.cwd() / RECEIPT_FILENAME
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_out = out.parent / f".{out.name}.tmp.{os.getpid()}"
+    with open(tmp_out, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_out, out)
     receipt["receipt_path"] = str(out)
+    if violations:
+        raise TierFloorReadbackError(violations, receipt)
     return receipt
 
 
@@ -297,6 +362,7 @@ __all__ = [
     "TIER1_WAIT_S",
     "TIER_1_ALLOWLIST",
     "TIER_1_FRONTIER_REASONING",
+    "TierFloorReadbackError",
     "TierFloorViolationError",
     "audit_specialist_cheap_model",
     "enforce_tier1_response_guard",
@@ -304,6 +370,7 @@ __all__ = [
     "is_tier_pinned_model",
     "main",
     "tier1_backoff_for_attempt",
+    "tier_floor_blocks_fallback",
     "verify_9router_combo_readback",
 ]
 
@@ -325,9 +392,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results["config_audit"] = audit_specialist_cheap_model(args.audit_config)
         rc = rc or (0 if results["config_audit"]["passed"] else 2)
     if args.readback:
-        results["readback"] = verify_9router_combo_readback(
-            base_url=args.readback, receipt_path=args.receipt, api_key=os.environ.get(args.api_key_env))
-        rc = rc or (0 if results["readback"]["passed"] else 2)
+        try:
+            results["readback"] = verify_9router_combo_readback(
+                base_url=args.readback, receipt_path=args.receipt, api_key=os.environ.get(args.api_key_env))
+            rc = rc or (0 if results["readback"]["passed"] else 2)
+        except TierFloorReadbackError as exc:
+            results["readback"] = exc.receipt or {"passed": False, "violations": exc.violations}
+            rc = 2
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
     else:

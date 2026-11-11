@@ -124,6 +124,10 @@ class TurnLivenessWatchdog:
         self._deactivate_turn = deactivate_turn
         # A sleeping host is not a stalled turn: time asleep never counts toward the bound.
         self._awake_idle = AwakeIdleMeter()
+        # Subagent 60s heartbeat emitter if progress callback is available
+        self._subagent_id = getattr(self._agent, "_subagent_id", None)
+        self._progress_cb = getattr(self._agent, "tool_progress_callback", None)
+        self._subagent_hb = subagent_heartbeat(self._progress_cb, subagent_id=self._subagent_id) if self._progress_cb else None
 
     def schedule(self):
         """Start polling via the shared periodic scheduler; returns the cancel handle.
@@ -136,6 +140,8 @@ class TurnLivenessWatchdog:
         """One poll. Returns False when the watchdog is finished."""
         if self._stop_event.is_set():
             return False
+        if self._subagent_hb is not None:
+            self._subagent_hb.tick()
         snapshot = self._sample()
         if snapshot is None:
             return False  # turn no longer active

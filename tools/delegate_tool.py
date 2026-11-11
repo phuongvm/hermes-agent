@@ -472,6 +472,7 @@ def _build_children(
 ) -> tuple[list[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe), each on its task's route;
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
+    import re
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
     children = []
@@ -497,6 +498,34 @@ def _build_children(
                 _close_child(built, "Failed to close child after a refused sibling")
             return [], str(exc)
         pin_child_service_tier(child, route.creds)
+        # SP-01: Forward slice identity, manifest dir, and timeout deadline
+        _slice_id = t.get("slice_id")
+        if not _slice_id and t.get("context"):
+            _m = re.search(r"\b(slice[1-4])\b", str(t.get("context")))
+            if _m:
+                _slice_id = _m.group(1)
+        if not _slice_id and t.get("goal"):
+            _m = re.search(r"\b(slice[1-4])\b", str(t.get("goal")))
+            if _m:
+                _slice_id = _m.group(1)
+        if _slice_id:
+            setattr(child, "_delegate_slice_id", _slice_id)
+            _m_dir = t.get("manifest_dir") or t.get("delegate_manifest_dir") or getattr(parent_agent, "_delegate_manifest_dir", None)
+            if _m_dir:
+                setattr(child, "_delegate_manifest_dir", str(_m_dir))
+            if t.get("repo_root"):
+                setattr(child, "_delegate_repo_root", str(t["repo_root"]))
+            if t.get("head_sha"):
+                setattr(child, "_delegate_head_sha", str(t["head_sha"]))
+            if t.get("proof_commands"):
+                setattr(child, "_delegate_proof_commands", list(t["proof_commands"]))
+            if "proof_exit_code" in t:
+                setattr(child, "_delegate_proof_exit_code", int(t["proof_exit_code"]))
+        _t_timeout = t.get("timeout_s")
+        if _t_timeout is not None:
+            setattr(child, "_delegate_timeout_s", float(_t_timeout))
+        elif _slice_id:
+            setattr(child, "_delegate_timeout_s", float(MAX_SLICE_TIMEOUT_S))
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -573,6 +602,7 @@ def delegate_task(
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None, timeout_s: Optional[float] = None,
+    slice_id: Optional[str] = None, manifest_dir: Optional[str] = None, **kwargs,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -635,6 +665,14 @@ def delegate_task(
         )
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    if not err and task_list:
+        for t in task_list:
+            if timeout_s is not None and "timeout_s" not in t:
+                t["timeout_s"] = timeout_s
+            if slice_id and "slice_id" not in t:
+                t["slice_id"] = slice_id
+            if manifest_dir and "manifest_dir" not in t:
+                t["manifest_dir"] = manifest_dir
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:

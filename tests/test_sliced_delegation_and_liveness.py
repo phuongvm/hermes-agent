@@ -220,3 +220,105 @@ def test_web_server_exports_probe_offload_seam():
     from hermes_cli import web_server
     assert web_server.PROBE_POOL_MAX_WORKERS == 4
     assert callable(web_server.offload_probe)
+    assert callable(web_server.offload_eager_reconcile)
+    with mock.patch("hermes_cli.web_server._eager_reconcile_own_session_db") as mock_rec:
+        asyncio.run(web_server.offload_eager_reconcile())
+        mock_rec.assert_called_once()
+
+
+def test_checkpoint_slice_manifest_fails_closed_on_error(tmp_path: Path):
+    from tools import delegate_tool_child_run as cr
+    child = mock.MagicMock()
+    child._delegate_slice_id = "slice3"
+    child._delegate_manifest_dir = str(tmp_path)
+    run = cr._ChildRun(child, mock.MagicMock(), 0, "goal", None, None)
+    entry = {"status": "completed"}
+    with mock.patch("tools.sliced_delegation.write_slice_manifest", side_effect=OSError("disk full")):
+        with pytest.raises(RuntimeError) as exc_info:
+            run.checkpoint_slice_manifest({}, entry)
+        assert "Mandatory slice manifest checkpoint failed" in str(exc_info.value)
+        assert entry["status"] == "error"
+
+
+def test_child_run_times_out_on_slice_deadline(tmp_path: Path):
+    from tools import delegate_tool_child_run as cr
+    child = mock.MagicMock()
+    child._delegate_slice_id = "slice1"
+    child._delegate_timeout_s = 0.05
+    child.run_conversation = lambda **kw: time.sleep(0.3)
+    run = cr._ChildRun(child, mock.MagicMock(), 0, "goal", "sa-test", None)
+    res, err_entry, deferred = run.await_child()
+    assert res is None
+    assert err_entry is not None
+    assert err_entry["status"] == "timeout"
+    assert "slice timeout" in err_entry["error"]
+
+
+def test_delegate_task_forwards_slice_id_and_timeout():
+    from tools import delegate_tool
+    parent = mock.MagicMock()
+    parent._delegate_depth = 0
+    creds = {"model": "m", "provider": "ai-router", "base_url": "http://x", "api_key": "k", "api_mode": "chat_completions"}
+    with mock.patch.object(delegate_tool, "is_spawn_paused", return_value=False), \
+         mock.patch("tools.delegate_tool._routes_for", return_value=([mock.MagicMock(error=None, creds=creds, routing_cfg={})], None)), \
+         mock.patch("tools.delegate_tool._build_child_preserving_parent_tools") as mock_build, \
+         mock.patch("tools.delegate_tool._run_batch", return_value="{}"):
+        built_child = mock.MagicMock()
+        mock_build.return_value = built_child
+        delegate_tool.delegate_task(
+            tasks=[{"goal": "a self-contained goal for the task", "slice_id": "slice4", "manifest_dir": "/tmp/manifests", "timeout_s": 900}],
+            parent_agent=parent,
+        )
+        assert getattr(built_child, "_delegate_slice_id", None) == "slice4"
+        assert getattr(built_child, "_delegate_manifest_dir", None) == "/tmp/manifests"
+        assert getattr(built_child, "_delegate_timeout_s", None) == 900.0
+
+
+def test_turn_liveness_watchdog_ticks_subagent_heartbeat():
+    from agent.turn_liveness import TurnLivenessWatchdog
+    agent = mock.MagicMock()
+    events = []
+    agent.tool_progress_callback = lambda kind, **kw: events.append((kind, kw))
+    agent._subagent_id = "sa-child-1"
+    agent._last_activity_ts = 100.0
+    agent._turn_liveness_activity_generation = 1
+    stop_event = mock.MagicMock()
+    stop_event.is_set.return_value = False
+    lock = mock.MagicMock()
+    watchdog = TurnLivenessWatchdog(
+        agent, session_id="s1", timeout_s=600.0, poll_s=15.0,
+        stop_event=stop_event, activity_lock=lock,
+        is_turn_active=lambda: True, commit_abort=lambda s, m: True,
+        deactivate_turn=lambda: None,
+    )
+    assert watchdog._subagent_hb is not None
+    with mock.patch("tools.sliced_delegation.time.monotonic", side_effect=[0.0, 61.0, 61.0, 122.0]):
+        watchdog._tick()
+        watchdog._tick()
+    assert any(k == "subagent.heartbeat" for k, _ in events)
+
+
+def test_stream_monitor_cuts_over_silent_stream_at_180s():
+    from agent.chat_completion_stream_monitor import StreamingWaitMonitor
+    import threading
+    mon = StreamingWaitMonitor()
+    agent = mock.MagicMock()
+    agent.base_url = ""
+    agent._interrupt_requested = False
+    setattr(mon, "agent", agent)
+    setattr(mon, "api_kwargs", {"model": "cb-agent-coder"})
+    setattr(mon, "_stream_stale_timeout", 900.0)
+    setattr(mon, "_call_done", threading.Event())
+    setattr(mon, "last_chunk_time", {"t": 0.0})
+    clients = mock.MagicMock()
+    clients.diag = {"chunks": 0}
+    setattr(mon, "clients", clients)
+    setattr(mon, "stream_attempt_lock", threading.Lock())
+    setattr(mon, "stream_attempt_state", {"current": 1, "cancelled": set()})
+    setattr(mon, "_abort_for_interrupt", mock.MagicMock())
+    killed = []
+    setattr(mon, "_kill_stale_stream", lambda elapsed: (killed.append(elapsed), getattr(mon, "_call_done").set()))
+    with mock.patch("agent.chat_completion_stream_monitor.time.time", side_effect=[0.0, 0.0, 181.0, 181.0, 181.0]):
+        mon._poll_until_done()
+    assert len(killed) == 1
+    assert killed[0] >= 180.0

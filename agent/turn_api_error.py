@@ -237,7 +237,7 @@ def handle_api_error(
 
 def tier_floor_wait_override(agent: Any, api_error: Any, *, status_code: Any) -> Optional[int]:
     """Slice 4 / Module D4: when a tier-pinned profile (``cb-agent-*``) hits a ``TierFloorViolationError`` or a
-    503 from its combo, the wait follows ``(15, 30, 60, 120)`` then ``WAIT(120s)`` — a deterministic schedule
+    503 or 429 from its combo, the wait follows ``(15, 30, 60, 120)`` then ``WAIT(120s)`` — a deterministic schedule
     the generic jittered backoff must not shorten, and never a cheap-tier downgrade. ``None`` = not applicable."""
     from agent.tier_floor_policy import (
         TierFloorViolationError, is_tier_pinned_model, tier1_backoff_for_attempt,
@@ -247,7 +247,7 @@ def tier_floor_wait_override(agent: Any, api_error: Any, *, status_code: Any) ->
         pinned = getattr(agent, "model", None)
     if not is_tier_pinned_model(pinned):
         return None
-    if not (isinstance(api_error, TierFloorViolationError) or status_code == 503):
+    if not (isinstance(api_error, TierFloorViolationError) or status_code in (503, 429)):
         return None
     attempt = int(getattr(agent, "_tier1_violation_attempts", 0) or 0)
     agent._tier1_violation_attempts = attempt + 1
@@ -260,8 +260,27 @@ def tier_floor_wait_override(agent: Any, api_error: Any, *, status_code: Any) ->
         except Exception:
             retry_after = None
     wait = tier1_backoff_for_attempt(attempt, retry_after_s=retry_after)
-    logger.warning("TIER_1 floor (%s): %s — waiting %ss (attempt %d) instead of downgrading", pinned,
-                   type(api_error).__name__, wait, attempt + 1)
+    cumulative = int(getattr(agent, "_tier1_cumulative_wait_s", 0) or 0) + wait
+    agent._tier1_cumulative_wait_s = cumulative
+    logger.warning("TIER_1 floor (%s): %s — waiting %ss (attempt %d, cumulative %ds) instead of downgrading", pinned,
+                   type(api_error).__name__, wait, attempt + 1, cumulative)
+
+    if cumulative >= 300 or wait >= 120:
+        gm = getattr(agent, "goal_manager", None)
+        if gm is not None and callable(getattr(gm, "wait_for_seconds", None)):
+            try:
+                gm.wait_for_seconds(120, reason=f"TIER_1 floor exhausted ({type(api_error).__name__} {status_code})")
+            except Exception as exc:
+                logger.debug("GoalManager wait_for_seconds failed: %s", exc)
+        elif getattr(agent, "session_id", None):
+            try:
+                from hermes_cli.goals import GoalManager
+                gm = GoalManager(agent.session_id)
+                if gm.is_active():
+                    gm.wait_for_seconds(120, reason=f"TIER_1 floor exhausted ({type(api_error).__name__} {status_code})")
+            except Exception as exc:
+                logger.debug("GoalManager transition to WAIT(120s) failed: %s", exc)
+
     return wait
 
 

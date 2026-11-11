@@ -262,8 +262,9 @@ def _safe_call(mod, fn_name: str, default):
 
 async def _status_active_sessions() -> int:
     try:
+        from hermes_cli.web_server import offload_probe
         return await asyncio.wait_for(
-            run_in_threadpool(_count_status_active_sessions),
+            offload_probe(_count_status_active_sessions),
             timeout=_STATUS_ACTIVE_SESSIONS_TIMEOUT)
     except TimeoutError:
         _log.debug("/api/status active session count exceeded %.2fs; returning 0",
@@ -823,7 +824,8 @@ async def _collect_canonical_status_snapshot(
         fts_rebuild = None
         fts_precomputed = False
     else:
-        db_res = await run_in_threadpool(probe_state_db_status, db_path)
+        from hermes_cli.web_server import offload_probe
+        db_res = await offload_probe(probe_state_db_status, db_path)
         active_sessions = db_res["active_sessions"]
         storage_component = db_res["storage_component"]
         fts_rebuild = db_res["fts_rebuild"]

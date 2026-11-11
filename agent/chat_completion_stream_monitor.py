@@ -295,7 +295,13 @@ class StreamingWaitMonitor:
                 self._mon.last_heartbeat = _hb_now
                 self._heartbeat(int(_hb_now - self.last_chunk_time["t"]))
             _stale_elapsed = time.time() - self.last_chunk_time["t"]
-            if _stale_elapsed > self._stream_stale_timeout:
+            diag = getattr(getattr(self, "clients", None), "diag", None)
+            chunks_delivered = int(diag.get("chunks", 0)) if isinstance(diag, dict) else 0
+            if should_cut_over_silent_stream(
+                last_chunk_at=self.last_chunk_time["t"],
+                now=time.time(),
+                chunks_delivered=chunks_delivered,
+            ) or _stale_elapsed > self._stream_stale_timeout:
                 self._mon.wait_notice_started_ts = None  # Reconnect status has its own owner.
                 self._mon.wait_notice.reset()
                 self._kill_stale_stream(_stale_elapsed)

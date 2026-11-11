@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -50,10 +51,23 @@ def test_guard_passes_tier1_and_is_noop_for_non_specialist():
     assert tfp.enforce_tier1_response_guard({"X-Model-Id": "cb-claude-opus"}, profile_model="cb-agent-reviewer") == "cb-claude-opus"
     # default profile (cb-always-on) is not tier pinned -> never raises
     assert tfp.enforce_tier1_response_guard({"x-model-id": "nemotron-free"}, profile_model="cb-always-on") is None
-    # missing header on a specialist: tolerated by default (legacy routers), rejected when required
-    assert tfp.enforce_tier1_response_guard({}, profile_model="cb-agent-qa") is None
+    # missing provenance on a specialist: rejected fail-closed
+    with pytest.raises(tfp.TierFloorViolationError) as ei:
+        tfp.enforce_tier1_response_guard({}, profile_model="cb-agent-qa")
+    assert "missing provenance" in str(ei.value)
     with pytest.raises(tfp.TierFloorViolationError):
         tfp.enforce_tier1_response_guard({}, profile_model="cb-agent-qa", require_header=True)
+
+
+def test_guard_rejects_response_model_body_even_with_empty_headers():
+    from types import SimpleNamespace
+    with pytest.raises(tfp.TierFloorViolationError) as ei:
+        tfp.enforce_tier1_response_guard(
+            SimpleNamespace(headers={}, model="nemotron-free"),
+            profile_model="cb-agent-coder",
+        )
+    assert ei.value.model_id == "nemotron-free"
+    assert ei.value.profile_model == "cb-agent-coder"
 
 
 def test_guard_accepts_header_objects_and_response_like():
@@ -101,11 +115,24 @@ def test_readback_passes_with_offline_fixture_and_writes_receipt(tmp_path, monke
     receipt = tfp.verify_9router_combo_readback(base_url="http://127.0.0.1:9", receipt_path=receipt_path)
     assert receipt["passed"] is True
     assert receipt["source"] == "fixture"
+    assert receipt["mode"] == "offline_fixture"
     assert sorted(receipt["verified"]) == sorted(SPECIALISTS)
+    assert receipt["combos_verified"] == 5
+    assert "per_combo_digests" in receipt
     assert receipt["violations"] == []
     on_disk = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert on_disk["passed"] is True and on_disk["combo_count"] == 5
+    assert on_disk["combos_verified"] == 5
+    assert on_disk["mode"] == "offline_fixture"
+    assert "per_combo_digests" in on_disk
     assert "fixture_sha256" in on_disk and len(on_disk["fixture_sha256"]) == 64
+
+
+def test_combo_violations_rejects_empty_models():
+    combos = [{"name": n, "fallback_tier_floor": tfp.TIER_1_FRONTIER_REASONING, "models": []} for n in tfp.SPECIALIST_COMBO_IDS]
+    violations = tfp._combo_violations(combos)
+    assert len(violations) == len(tfp.SPECIALIST_COMBO_IDS)
+    assert all(v["reason_code"] == "EMPTY_MODELS" for v in violations)
 
 
 def test_readback_rejects_missing_floor_or_tier3_member(tmp_path, monkeypatch):
@@ -115,19 +142,25 @@ def test_readback_rejects_missing_floor_or_tier3_member(tmp_path, monkeypatch):
     combos[1]["models"] = ["cb-gemini-argon", "nemotron-free"]    # reviewer: TIER_3 member
     del combos[4]                                                 # qa: combo absent
     monkeypatch.setenv("NINEROUTER_READBACK_FIXTURE_PATH", str(_fixture(tmp_path, combos)))
-    receipt = tfp.verify_9router_combo_readback(base_url="http://127.0.0.1:9", receipt_path=tmp_path / "r.json")
+    with pytest.raises(tfp.TierFloorReadbackError) as exc_info:
+        tfp.verify_9router_combo_readback(base_url="http://127.0.0.1:9", receipt_path=tmp_path / "r.json")
+    receipt = exc_info.value.receipt
+    assert receipt is not None
     assert receipt["passed"] is False
-    codes = {v["combo"]: v["reason_code"] for v in receipt["violations"]}
+    codes = {v["combo"]: v["reason_code"] for v in exc_info.value.violations}
     assert codes == {"cb-agent-coder": "MISSING_TIER_FLOOR", "cb-agent-reviewer": "TIER_3_MEMBER", "cb-agent-qa": "COMBO_ABSENT"}
 
 
 def test_readback_without_fixture_and_unreachable_router_fails_closed(tmp_path, monkeypatch):
     monkeypatch.delenv("NINEROUTER_READBACK_FIXTURE_PATH", raising=False)
-    receipt = tfp.verify_9router_combo_readback(base_url="http://127.0.0.1:9", receipt_path=tmp_path / "r.json",
-                                                fetch=lambda url, headers: (_ for _ in ()).throw(OSError("refused")))
+    with pytest.raises(tfp.TierFloorReadbackError) as exc_info:
+        tfp.verify_9router_combo_readback(base_url="http://127.0.0.1:9", receipt_path=tmp_path / "r.json",
+                                          fetch=lambda url, headers: (_ for _ in ()).throw(OSError("refused")))
+    receipt = exc_info.value.receipt
+    assert receipt is not None
     assert receipt["passed"] is False
     assert receipt["source"] == "live"
-    assert receipt["violations"][0]["reason_code"] == "ROUTER_UNREACHABLE"
+    assert exc_info.value.violations[0]["reason_code"] == "ROUTER_UNREACHABLE"
     assert (tmp_path / "r.json").exists()
 
 
@@ -180,6 +213,7 @@ class _Agent:
         self._fallback_chain = list(chain)
         self._fallback_index = 0
         self._tier1_violation_attempts = 0
+        self.goal_manager: Any = None
 
 
 def test_init_fallback_chain_drops_tier3_entries_for_specialist_profile():
@@ -194,11 +228,11 @@ def test_init_fallback_chain_drops_tier3_entries_for_specialist_profile():
 
 
 def test_should_skip_fallback_candidate_refuses_tier3_on_specialist():
-    from agent.chat_completion_helpers import _tier_floor_blocks_fallback
+    from agent.tier_floor_policy import tier_floor_blocks_fallback
     agent = _Agent("cb-agent-reviewer", [])
-    assert _tier_floor_blocks_fallback(agent, "ai-router", "cb-always-on") is True
-    assert _tier_floor_blocks_fallback(agent, "ai-router", "cb-claude-opus") is False
-    assert _tier_floor_blocks_fallback(_Agent("cb-always-on", []), "ai-router", "nemotron-free") is False
+    assert tier_floor_blocks_fallback(agent, "ai-router", "cb-always-on") is True
+    assert tier_floor_blocks_fallback(agent, "ai-router", "cb-claude-opus") is False
+    assert tier_floor_blocks_fallback(_Agent("cb-always-on", []), "ai-router", "nemotron-free") is False
 
 
 def test_turn_api_error_tier_floor_backoff_overrides_generic_wait():
@@ -211,9 +245,31 @@ def test_turn_api_error_tier_floor_backoff_overrides_generic_wait():
     class E(Exception):
         status_code = 503
     assert tier_floor_wait_override(agent, E(), status_code=503) == 120
+    # 429 also triggers the tier floor backoff
+    class E429(Exception):
+        status_code = 429
+    agent429 = _Agent("cb-agent-coder", [])
+    assert tier_floor_wait_override(agent429, E429(), status_code=429) == 15
     # unrelated errors / non-pinned profiles: no override
     assert tier_floor_wait_override(agent, ValueError("x"), status_code=400) is None
     assert tier_floor_wait_override(_Agent("cb-always-on", []), err, status_code=503) is None
+    assert tier_floor_wait_override(_Agent("cb-always-on", []), E429(), status_code=429) is None
+
+
+def test_tier_floor_wait_override_transitions_goal_to_wait_120():
+    from agent.turn_api_error import tier_floor_wait_override
+    from unittest.mock import MagicMock
+    agent = _Agent("cb-agent-coder", [])
+    gm = MagicMock()
+    gm.is_active.return_value = True
+    agent.goal_manager = gm
+    class E429(Exception):
+        status_code = 429
+        response = MagicMock(headers={"retry-after": "120"})
+    wait = tier_floor_wait_override(agent, E429(), status_code=429)
+    assert wait == 120
+    gm.wait_for_seconds.assert_called_once()
+    assert gm.wait_for_seconds.call_args[0][0] == 120
 
 
 # ---------------------------------------------------------------------------- tasks.md 4.3 proof names
