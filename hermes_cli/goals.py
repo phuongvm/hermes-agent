@@ -537,9 +537,14 @@ class GoalState:
         gates_passed: bool = True,
         now: Optional[float] = None,
     ) -> bool:
-        """Promote ACTIVE -> VERIFIED -> RELEASE_READY if receipt parity holds and gates passed."""
-        candidate = receipt or self.active_verification_receipt or self.last_verified_receipt
-        if candidate is None or not verify_receipt_parity(candidate, now=now):
+        """Promote ACTIVE -> VERIFIED -> RELEASE_READY if receipt parity holds and gates passed.
+
+        Never falls back to ``last_verified_receipt``: that cache is only re-linked by Step 2 of
+        ``on_new_user_prompt_authorize_release()`` on an affirmative imperative release command (S-01)."""
+        candidate = receipt or self.active_verification_receipt
+        if candidate is None:
+            return False
+        if not verify_receipt_parity(candidate, now=now):
             self.invalidate_verification_receipt()
             return False
         self.phase = "VERIFIED"
@@ -1578,7 +1583,9 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
-        if state.active_verification_receipt is not None or state.last_verified_receipt is not None:
+        # Only an actively linked receipt may promote here; last_verified_receipt is reserved for
+        # Step 2 of on_new_user_prompt_authorize_release() (affirmative release command) — S-01.
+        if state.active_verification_receipt is not None:
             state.promote_with_receipt(gates_passed=True)
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(

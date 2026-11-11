@@ -58,8 +58,11 @@ def _init_git_repo(base: Path, name: str = "repo_a") -> Path:
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test User")
+    # Match noninteractive_git_env() in goal_release.py (system/global config blanked -> autocrlf off)
+    # and write exact LF bytes so the index blob and the on-disk bytes agree regardless of host autocrlf.
+    _git(repo, "config", "core.autocrlf", "false")
     tracked = repo / "module.py"
-    tracked.write_text("VALUE = 1\n", encoding="utf-8")
+    tracked.write_bytes(b"VALUE = 1\n")
     _git(repo, "add", "module.py")
     _git(repo, "commit", "-m", "initial commit")
     return repo
@@ -415,7 +418,7 @@ def test_release_ready_requires_valid_verification_receipt_and_resets_on_file_ed
     assert restored.last_verified_receipt is None
 
     # 2. Tracked file modification in repo_b invalidates parity and unlinks both receipts
-    (repo_b / "module.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (repo_b / "module.py").write_bytes(b"VALUE = 2\n")
     assert compute_multi_repo_digest(receipt.repo_roots) != receipt.porcelain_baseline_digest
     assert verify_receipt_parity(receipt, now=now_ts + 20.0) is False
     phase_drift = on_new_user_prompt_authorize_release(state, "commit and push", now=now_ts + 20.0)
@@ -424,8 +427,8 @@ def test_release_ready_requires_valid_verification_receipt_and_resets_on_file_ed
     assert state.active_verification_receipt is None
     assert state.last_verified_receipt is None
 
-    # Restore tracked file; parity recovers for the raw receipt
-    (repo_b / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # Restore tracked file with exact LF bytes; parity recovers for the raw receipt
+    (repo_b / "module.py").write_bytes(b"VALUE = 1\n")
     assert verify_receipt_parity(receipt, now=now_ts + 25.0) is True
 
     # 3. Untracked file creation in repo_a invalidates parity
@@ -506,6 +509,62 @@ def test_goal_manager_evaluate_after_turn_promotes_and_emits_release_ready_promp
     assert state.active_verification_receipt is None
 
     # Affirmative release command re-promotes to RELEASE_READY via cached last_verified_receipt
+    assert mgr.authorize_new_user_prompt("commit and push") == "RELEASE_READY"
+    assert state.phase == "RELEASE_READY"
+    assert state.active_verification_receipt == receipt
+
+
+def test_negated_and_non_release_turn_post_evaluation_does_not_re_promote_s01(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S-01 regression: after Step 1 unlinks active_verification_receipt on a negated or non-release
+    prompt, the end-of-turn evaluate_after_turn() MUST NOT fall back to last_verified_receipt and
+    re-promote to RELEASE_READY. Only an affirmative imperative release command (Step 2) may re-link it."""
+    import hermes_cli.goals as goals_mod
+
+    monkeypatch.setattr(goals_mod, "load_goal", lambda _sid: None)
+    monkeypatch.setattr(goals_mod, "save_goal", lambda _sid, _state: None)
+    monkeypatch.setattr(
+        goals_mod,
+        "judge_goal",
+        lambda *_a, **_kw: ("continue", "acknowledged", False, None, False),
+    )
+
+    repo = _init_git_repo(tmp_path, "repo_s01")
+    receipt = serialize_verification_receipt(
+        repo_roots=[str(repo)],
+        proof_command_signature=("pytest -q",),
+        proof_exit_code=0,
+        proof_output_digest="all pass",
+    )
+
+    mgr = GoalManager("sess-s01")
+    state = mgr.set("Implement and release Slice 3")
+    state.record_verification_receipt(receipt)
+    mgr.evaluate_after_turn("All unit tests pass.")
+    assert state.phase == "RELEASE_READY"
+
+    for prompt in ("do not commit and push", "explain why test X was slow"):
+        assert mgr.authorize_new_user_prompt(prompt) == "ACTIVE"
+        assert state.phase == "ACTIVE"
+        assert state.active_verification_receipt is None
+        assert state.last_verified_receipt == receipt  # cached for a future affirmative command
+
+        decision = mgr.evaluate_after_turn("Understood, I will not commit or push.")
+        assert state.phase == "ACTIVE", f"post-turn evaluation re-promoted after {prompt!r}"
+        assert state.active_verification_receipt is None
+        assert state.last_verified_receipt == receipt
+        assert "PHASE: RELEASE_READY" not in (decision.get("continuation_prompt") or "")
+        assert CONTINUATION_PROMPT_RELEASE_READY_TEMPLATE.split("{")[0] not in (
+            decision.get("continuation_prompt") or ""
+        )
+
+    # promote_with_receipt() with no explicit/active receipt must not resurrect last_verified_receipt
+    assert state.promote_with_receipt(gates_passed=True) is False
+    assert state.phase == "ACTIVE"
+    assert state.active_verification_receipt is None
+
+    # Affirmative release command is the ONLY path that re-links last_verified_receipt
     assert mgr.authorize_new_user_prompt("commit and push") == "RELEASE_READY"
     assert state.phase == "RELEASE_READY"
     assert state.active_verification_receipt == receipt
