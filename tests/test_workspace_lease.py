@@ -14,6 +14,8 @@ import pytest
 from hermes_cli.workspace_lease import (
     MAX_LEASE_TTL_S,
     CommitJournalRecord,
+    CorruptJournalError,
+    CorruptPersistentStateError,
     LeaseExecutionReport,
     LeasePreemptedError,
     LeaseRecord,
@@ -1383,3 +1385,304 @@ def test_release_without_valid_fencing_token_fails_closed_s05(
     assert rel_ok.scopes == ("repo:oss/crew", "profile:coder")
     assert "profile:coder" not in coord.get_status()["ledger"]["active_records"]
     assert "repo:oss/crew" not in coord.get_status()["ledger"]["active_records"]
+
+
+def test_multi_scope_release_is_atomic_all_or_nothing_s05r(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """S-05R: a batch release MUST fail closed as a whole when ANY requested scope is invalid."""
+    lease_dir = tmp_path / "leases"
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+    acq = coord.acquire_workspace_lease(
+        ("profile:coder",),
+        "exclusive_cutover",
+        "A",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    assert acq.status == "ACQUIRED"
+    valid_token = acq.fencing_tokens["profile:coder"]
+
+    def _active() -> dict[str, object]:
+        return coord.get_status()["ledger"]["active_records"]
+
+    # 1. Valid token for an active scope + dummy token for a NON-active scope -> NOOP, nothing released
+    rel_absent = coord.release_workspace_lease(
+        ("profile:coder", "repo:oss/absent"),
+        fencing_tokens={
+            "profile:coder": valid_token,
+            "repo:oss/absent": "repo:oss/absent:1000:1",
+        },
+    )
+    assert rel_absent.status == "NOOP"
+    assert rel_absent.reason_code == "LEASE_NOT_ACTIVE"
+    assert rel_absent.scopes == ()
+    assert "profile:coder" in _active()
+    assert _active()["profile:coder"]["fencing_token"] == valid_token
+
+    # 2. Same shape via the module-level API and a single shared token string
+    rel_str = release_workspace_lease(
+        ("profile:coder", "repo:oss/absent"),
+        fencing_tokens=valid_token,
+        lease_dir=lease_dir,
+    )
+    assert rel_str.status == "NOOP"
+    assert rel_str.scopes == ()
+    assert "profile:coder" in _active()
+
+    # 3. Two ACTIVE scopes, one valid token + one mismatching token -> NOOP, BOTH remain active
+    acq_crew = coord.acquire_workspace_lease(
+        ("repo:oss/crew",),
+        "exclusive_cutover",
+        "A",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    crew_token = acq_crew.fencing_tokens["repo:oss/crew"]
+    rel_mismatch = coord.release_workspace_lease(
+        ("repo:oss/crew", "profile:coder"),
+        fencing_tokens={
+            "repo:oss/crew": crew_token,
+            "profile:coder": "profile:coder:1000:999",
+        },
+    )
+    assert rel_mismatch.status == "NOOP"
+    assert rel_mismatch.reason_code == "INVALID_FENCING_TOKEN"
+    assert rel_mismatch.scopes == ()
+    assert "profile:coder" in _active()
+    assert "repo:oss/crew" in _active()
+
+    # 4. Shared-session sibling: valid exclusive token + shared scope with unknown holder -> NOOP for all
+    shared = coord.acquire_workspace_lease(
+        ("profile:qa",),
+        "shared_session",
+        "S",
+        holder_pid=22,
+        process_start_time_ns=1,
+    )
+    shared_base = shared.fencing_tokens["profile:qa"].split("@", 1)[0]
+    rel_ghost = coord.release_workspace_lease(
+        ("repo:oss/crew", "profile:qa"),
+        fencing_tokens={
+            "repo:oss/crew": crew_token,
+            "profile:qa": f"{shared_base}@999:1:ghost",
+        },
+    )
+    assert rel_ghost.status == "NOOP"
+    assert rel_ghost.reason_code == "HOLDER_NOT_FOUND"
+    assert rel_ghost.scopes == ()
+    assert "repo:oss/crew" in _active()
+    assert [int(h["pid"]) for h in _active()["profile:qa"]["shared_holders"]] == [22]
+
+    # 5. CLI path with the mixed valid/absent token map MUST also be a NOOP that retains the record
+    capsys.readouterr()
+    rc_cli = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "release",
+            "--scope",
+            "profile:coder,repo:oss/absent",
+            "--tokens-json",
+            json.dumps(
+                {"profile:coder": valid_token, "repo:oss/absent": "repo:oss/absent:1000:1"}
+            ),
+        ]
+    )
+    out_cli = json.loads(capsys.readouterr().out.strip())
+    assert rc_cli == 0
+    assert out_cli["status"] == "NOOP"
+    assert out_cli["scopes"] == []
+    assert "profile:coder" in _active()
+
+    # 6. Fully valid batch still releases every requested scope atomically
+    rel_ok = coord.release_workspace_lease(
+        ("repo:oss/crew", "profile:coder"),
+        fencing_tokens={"repo:oss/crew": crew_token, "profile:coder": valid_token},
+    )
+    assert rel_ok.status == "APPLIED"
+    assert rel_ok.scopes == ("repo:oss/crew", "profile:coder")
+    assert "profile:coder" not in _active()
+    assert "repo:oss/crew" not in _active()
+    assert "profile:qa" in _active()
+
+
+def test_corrupt_ledger_or_journal_fails_closed_without_overwrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Malformed durable state MUST raise CorruptPersistentStateError and never be overwritten."""
+    corrupt_ledger_text = '{"schema": "hermes-workspace-leases/v1", "epoch": 1000, "active_records": {'
+    lease_dir = tmp_path / "leases_bad_ledger"
+    lease_dir.mkdir()
+    ledger_path = lease_dir / "workspace_leases.json"
+    ledger_path.write_text(corrupt_ledger_text, encoding="utf-8")
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+
+    with pytest.raises(CorruptPersistentStateError) as exc_info:
+        coord.acquire_workspace_lease(
+            ("profile:coder",),
+            "exclusive_cutover",
+            "A",
+            holder_pid=11,
+            process_start_time_ns=1,
+        )
+    assert exc_info.value.reason_code == "CORRUPT_PERSISTENT_STATE"
+    assert exc_info.value.exit_code == 79
+    assert ledger_path.read_text(encoding="utf-8") == corrupt_ledger_text
+    assert not (lease_dir / "workspace_lease.journal.json").exists()
+
+    # Structurally-invalid (parseable but wrong-shaped) ledger is also corrupt state
+    bad_shape_dir = tmp_path / "leases_bad_shape"
+    bad_shape_dir.mkdir()
+    bad_shape_text = json.dumps({"epoch": 1000, "active_records": ["not", "a", "mapping"]})
+    (bad_shape_dir / "workspace_leases.json").write_text(bad_shape_text, encoding="utf-8")
+    coord_shape = WorkspaceLeaseCoordinator(
+        lease_dir=bad_shape_dir, process_inspector=lambda _: 1, clock=lambda: 1000.0
+    )
+    with pytest.raises(CorruptPersistentStateError):
+        coord_shape.get_status()
+    assert (bad_shape_dir / "workspace_leases.json").read_text(encoding="utf-8") == bad_shape_text
+
+    # Corrupt journal with a healthy ledger -> CorruptJournalError, journal bytes untouched
+    journal_dir = tmp_path / "leases_bad_journal"
+    coord_j = WorkspaceLeaseCoordinator(
+        lease_dir=journal_dir, process_inspector=lambda _: 1, clock=lambda: 1000.0
+    )
+    ok = coord_j.acquire_workspace_lease(
+        ("profile:coder",), "exclusive_cutover", "A", holder_pid=11, process_start_time_ns=1
+    )
+    assert ok.status == "ACQUIRED"
+    ledger_before = (journal_dir / "workspace_leases.json").read_text(encoding="utf-8")
+    corrupt_journal_text = '{"active_tx": {"tx_id": "tx_1", "state": "PUBLISH_INTENT"'
+    journal_path = journal_dir / "workspace_lease.journal.json"
+    journal_path.write_text(corrupt_journal_text, encoding="utf-8")
+
+    with pytest.raises(CorruptJournalError) as j_info:
+        coord_j.acquire_workspace_lease(
+            ("repo:oss/crew",), "exclusive_cutover", "A", holder_pid=11, process_start_time_ns=1
+        )
+    assert isinstance(j_info.value, CorruptPersistentStateError)
+    assert j_info.value.exit_code == 79
+    assert journal_path.read_text(encoding="utf-8") == corrupt_journal_text
+    assert (journal_dir / "workspace_leases.json").read_text(encoding="utf-8") == ledger_before
+
+    with pytest.raises(CorruptJournalError):
+        coord_j.recover_interrupted_commit()
+    with pytest.raises(CorruptJournalError):
+        coord_j.release_workspace_lease(("profile:coder",), fencing_tokens=ok.fencing_tokens)
+    assert journal_path.read_text(encoding="utf-8") == corrupt_journal_text
+    assert "profile:coder" in json.loads(ledger_before)["active_records"]
+
+    # CLI contract: status FAILED / CORRUPT_PERSISTENT_STATE / exit 79, no overwrite
+    capsys.readouterr()
+    rc = lease_cli_main(
+        [
+            "--lease-dir",
+            str(lease_dir),
+            "acquire",
+            "--scope",
+            "profile:coder",
+            "--mode",
+            "exclusive_cutover",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out.strip())
+    assert rc == 79
+    assert out["status"] == "FAILED"
+    assert out["reason_code"] == "CORRUPT_PERSISTENT_STATE"
+    assert out["exit_code"] == 79
+    assert ledger_path.read_text(encoding="utf-8") == corrupt_ledger_text
+
+
+def test_state_db_without_sessions_schema_defers_exclusive_acquire_exit_75(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configured but unqueryable state.db MUST defer (exit 75), never grant an exclusive lease."""
+    empty_db = tmp_path / "empty_state.db"
+    conn = sqlite3.connect(empty_db)
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+
+    lease_dir = tmp_path / "leases"
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=lease_dir,
+        state_db_path=empty_db,
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+    deferred = coord.acquire_workspace_lease(
+        ("repo:oss/crew",), "exclusive_cutover", "cron-crew", holder_pid=11, process_start_time_ns=1
+    )
+    assert deferred.status == "DEFERRED"
+    assert deferred.reason_code == "STATE_DB_QUERY_FAILED"
+    assert deferred.exit_code == 75
+    assert deferred.details["state_db_path"] == str(empty_db)
+    assert "sessions" in deferred.details["error"]
+    status = coord.get_status()["ledger"]
+    assert status["active_records"] == {}
+    assert status["scope_states"]["repo:oss/crew"] == "UNLOCKED"
+
+    # Non-SQLite garbage at the configured path is equally fail-closed
+    garbage_db = tmp_path / "garbage.db"
+    garbage_db.write_bytes(b"this is not a sqlite database\n" * 20)
+    coord_garbage = WorkspaceLeaseCoordinator(
+        lease_dir=tmp_path / "leases_garbage",
+        state_db_path=garbage_db,
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+    deferred_garbage = coord_garbage.acquire_workspace_lease(
+        ("repo:oss/crew",), "exclusive_cutover", "cron-crew", holder_pid=11, process_start_time_ns=1
+    )
+    assert deferred_garbage.status == "DEFERRED"
+    assert deferred_garbage.reason_code == "STATE_DB_QUERY_FAILED"
+    assert deferred_garbage.exit_code == 75
+
+    # A configured path that does not exist on disk is also a misconfiguration -> defer
+    coord_missing = WorkspaceLeaseCoordinator(
+        lease_dir=tmp_path / "leases_missing",
+        state_db_path=tmp_path / "does_not_exist.db",
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+    deferred_missing = coord_missing.acquire_workspace_lease(
+        ("repo:oss/crew",), "exclusive_cutover", "cron-crew", holder_pid=11, process_start_time_ns=1
+    )
+    assert deferred_missing.status == "DEFERRED"
+    assert deferred_missing.reason_code == "STATE_DB_QUERY_FAILED"
+    assert deferred_missing.exit_code == 75
+
+    # shared_session acquisition never consults state.db, so it remains unaffected
+    shared = coord.acquire_workspace_lease(
+        ("profile:coder",), "shared_session", "sess", holder_pid=11, process_start_time_ns=1
+    )
+    assert shared.status == "ACQUIRED"
+
+    # CLI exit code contract for the cron wrappers
+    capsys.readouterr()
+    rc = lease_cli_main(
+        [
+            "--lease-dir",
+            str(tmp_path / "leases_cli"),
+            "--state-db",
+            str(empty_db),
+            "acquire",
+            "--scope",
+            "repo:oss/crew",
+            "--mode",
+            "exclusive_cutover",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out.strip())
+    assert rc == 75
+    assert out["status"] == "DEFERRED"
+    assert out["reason_code"] == "STATE_DB_QUERY_FAILED"
