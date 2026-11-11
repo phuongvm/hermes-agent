@@ -568,3 +568,69 @@ def test_negated_and_non_release_turn_post_evaluation_does_not_re_promote_s01(
     assert mgr.authorize_new_user_prompt("commit and push") == "RELEASE_READY"
     assert state.phase == "RELEASE_READY"
     assert state.active_verification_receipt == receipt
+
+
+def test_untracked_non_ascii_and_quoted_path_drift_invalidates_receipt_s03(tmp_path: Path) -> None:
+    """S-03 regression: Git C-quotes non-ASCII paths in line-oriented porcelain output
+    (``? "caf\\303\\251.py"``). The digest must resolve the real on-disk file (via ``-z`` NUL
+    records) so byte drift in such files, in renamed files, and in paths with special characters
+    invalidates receipt parity instead of silently hashing a non-existent quoted name."""
+    repo = _init_git_repo(tmp_path, "repo_s03")
+
+    # 1. Untracked non-ASCII file: content drift with unchanged status must break parity
+    cafe = repo / "caf\u00e9.py"
+    cafe.write_bytes(b"VALUE = 2\n")
+    receipt = serialize_verification_receipt(
+        repo_roots=[str(repo)],
+        proof_command_signature=("pytest -q",),
+        proof_exit_code=0,
+        proof_output_digest="1 passed",
+    )
+    assert verify_receipt_parity(receipt) is True
+    cafe.write_bytes(b"VALUE = 3\n")
+    assert verify_receipt_parity(receipt) is False
+    cafe.write_bytes(b"VALUE = 2\n")
+    assert verify_receipt_parity(receipt) is True
+
+    # 2. Tracked-dirty non-ASCII file (modified in worktree, status unchanged) also drifts
+    _git(repo, "add", "caf\u00e9.py")
+    _git(repo, "commit", "-m", "add non-ascii file")
+    cafe.write_bytes(b"VALUE = 10\n")
+    receipt_tracked = serialize_verification_receipt(
+        repo_roots=[str(repo)],
+        proof_command_signature=("pytest -q",),
+        proof_exit_code=0,
+        proof_output_digest="1 passed",
+    )
+    assert verify_receipt_parity(receipt_tracked) is True
+    cafe.write_bytes(b"VALUE = 11\n")
+    assert verify_receipt_parity(receipt_tracked) is False
+
+    # 3. Staged rename with non-ASCII destination: `2 ...` record + NUL-separated origPath
+    _git(repo, "checkout", "--", "caf\u00e9.py")
+    _git(repo, "mv", "module.py", "r\u00e9named.py")
+    renamed = repo / "r\u00e9named.py"
+    receipt_rename = serialize_verification_receipt(
+        repo_roots=[str(repo)],
+        proof_command_signature=("pytest -q",),
+        proof_exit_code=0,
+        proof_output_digest="1 passed",
+    )
+    assert verify_receipt_parity(receipt_rename) is True
+    renamed.write_bytes(b"VALUE = 99\n")
+    assert verify_receipt_parity(receipt_rename) is False
+    renamed.write_bytes(b"VALUE = 1\n")
+    assert verify_receipt_parity(receipt_rename) is True
+
+    # 4. Untracked path with ASCII special characters (space, '#') must also track content drift
+    quoted = repo / "sp ace #1.txt"
+    quoted.write_bytes(b"a\n")
+    receipt_quoted = serialize_verification_receipt(
+        repo_roots=[str(repo)],
+        proof_command_signature=("pytest -q",),
+        proof_exit_code=0,
+        proof_output_digest="1 passed",
+    )
+    assert verify_receipt_parity(receipt_quoted) is True
+    quoted.write_bytes(b"b\n")
+    assert verify_receipt_parity(receipt_quoted) is False

@@ -286,8 +286,26 @@ def _sha256_file(path: Path) -> str:
                     entries.append(f"{rel}:{_sha256_file(child)}")
             return _sha256_bytes("\n".join(entries).encode("utf-8"))
         return _sha256_bytes(path.read_bytes())
-    except OSError as exc:
-        return f"<error:{type(exc).__name__}>"
+    except Exception as exc:
+        # Fail closed: an extant-but-unreadable/unresolvable path yields a unique nonce so it can
+        # never match a previously serialized receipt digest (S-03).
+        return f"<unreadable:{time.time_ns()}:{type(exc).__name__}>"
+
+
+def _run_git_bytes(repo_root: str, *args: str) -> tuple[int, bytes, str]:
+    """Run git and return raw stdout bytes (for NUL-delimited output where paths must be byte-exact)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, *args],
+            capture_output=True,
+            env=noninteractive_git_env(),
+            timeout=_GIT_PROBE_TIMEOUT_S,
+            check=False,
+        )
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+        return proc.returncode, proc.stdout or b"", stderr
+    except Exception as exc:
+        return -1, b"", f"{type(exc).__name__}: {exc}"
 
 
 def _run_git(repo_root: str, *args: str) -> tuple[int, str, str]:
@@ -307,29 +325,50 @@ def _run_git(repo_root: str, *args: str) -> tuple[int, str, str]:
         return -1, "", f"{type(exc).__name__}: {exc}"
 
 
-def _extract_porcelain_v2_paths(porcelain_v2_output: str) -> list[str]:
+def _parse_porcelain_v2_z(raw_bytes: bytes) -> tuple[list[str], list[str]]:
+    """Parse ``git status --porcelain=v2 -z`` output.
+
+    With ``-z`` records are NUL-terminated and paths are emitted byte-exact (never C-quoted or
+    octal-escaped), so non-ASCII / special-character filenames resolve on disk (S-03). Rename
+    records (``2 ...``) carry ``<path>`` in the record and ``<origPath>`` as the following NUL token.
+
+    Returns ``(porcelain_entries, sorted(set(paths)))``.
+    """
+    tokens = raw_bytes.split(b"\0")
+    if tokens and tokens[-1] == b"":
+        tokens.pop()
+    entries: list[str] = []
     paths: list[str] = []
-    for raw_line in porcelain_v2_output.splitlines():
-        line = raw_line.strip()
+    i = 0
+    while i < len(tokens):
+        line = tokens[i].decode("utf-8", errors="surrogateescape")
+        i += 1
         if not line or line.startswith("#"):
             continue
         if line.startswith(("? ", "! ")):
-            paths.append(line[2:].strip())
-        elif line.startswith("1 ") or line.startswith("u "):
+            paths.append(line[2:])
+            entries.append(line)
+        elif line.startswith(("1 ", "u ")):
             # 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
             # u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
             max_splits = 8 if line.startswith("1 ") else 10
             parts = line.split(" ", max_splits)
-            if len(parts) > max_splits:
-                paths.append(parts[max_splits].strip())
+            if len(parts) > max_splits and parts[max_splits]:
+                paths.append(parts[max_splits])
+            entries.append(line)
         elif line.startswith("2 "):
-            # 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>\t<origPath>
+            # 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>NUL<origPath>NUL
             parts = line.split(" ", 9)
-            if len(parts) > 9:
-                path_part = parts[9].split("\t", 1)[0].strip()
-                if path_part:
-                    paths.append(path_part)
-    return sorted(set(paths))
+            orig_path = ""
+            if i < len(tokens):
+                orig_path = tokens[i].decode("utf-8", errors="surrogateescape")
+                i += 1
+            if len(parts) > 9 and parts[9]:
+                paths.append(parts[9])
+            entries.append(f"{line}\t{orig_path}")
+        else:
+            entries.append(line)
+    return entries, sorted(set(paths))
 
 
 def _probe_submodules(repo_root: str) -> Optional[dict[str, str]]:
@@ -384,8 +423,8 @@ def compute_multi_repo_digest(
             )
             continue
 
-        rc, porcelain_out, err_out = _run_git(
-            root, "status", "--porcelain=v2", "--untracked-files=all"
+        rc, porcelain_raw, err_out = _run_git_bytes(
+            root, "status", "--porcelain=v2", "--untracked-files=all", "-z"
         )
         if rc != 0:
             records.append(
@@ -399,10 +438,7 @@ def compute_multi_repo_digest(
             )
             continue
 
-        porcelain_lines = [
-            line.rstrip("\r") for line in porcelain_out.splitlines() if line.strip()
-        ]
-        dirty_paths = _extract_porcelain_v2_paths(porcelain_out)
+        porcelain_lines, dirty_paths = _parse_porcelain_v2_z(porcelain_raw)
         dirty_hashes: dict[str, str] = {}
         for rel_path in dirty_paths:
             dirty_hashes[rel_path] = _sha256_file(root_path / rel_path)
