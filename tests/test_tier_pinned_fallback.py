@@ -350,3 +350,28 @@ def test_stream_chunk_tier_guard_rejects_downgraded_chunk_body():
     with pytest.raises(TierFloorViolationError) as exc_info:
         stream_call._accept_chat_chunk(0, bad_chunk)
     assert "nemotron-free" in str(exc_info.value)
+
+
+def test_dynamic_tier_floor_configuration(monkeypatch):
+    """Verify tier_floor allowlist, prefixes and forbidden markers can be configured dynamically."""
+    import agent.tier_floor_policy as tfp
+
+    # 1. Custom model not in default allowlist
+    custom_model = "cb-custom-fine-tuned-model"
+    assert not tfp.is_tier1_model_id(custom_model)
+
+    # 2. Add via environment variable HERMES_TIER1_EXTRA_ALLOWLIST
+    monkeypatch.setenv("HERMES_TIER1_EXTRA_ALLOWLIST", custom_model)
+    assert tfp.is_tier1_model_id(custom_model)
+    monkeypatch.delenv("HERMES_TIER1_EXTRA_ALLOWLIST", raising=False)
+    assert not tfp.is_tier1_model_id(custom_model)
+
+    # 3. Add via config dict source
+    cfg_source = {"tier_floor": {"extra_allowlist": [custom_model]}}
+    assert tfp.is_tier1_model_id(custom_model, source=cfg_source)
+
+    # 4. Custom prefix via config
+    custom_prefixed = "internal-llm/deep-thinker"
+    assert not tfp.is_tier1_model_id(custom_prefixed)
+    prefix_source = {"tier_floor": {"extra_prefixes": ["internal-llm/"]}}
+    assert tfp.is_tier1_model_id(custom_prefixed, source=prefix_source)

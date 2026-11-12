@@ -38,14 +38,19 @@ SPECIALIST_COMBO_IDS: tuple[str, ...] = (
 )
 SPECIALIST_PROFILES: tuple[str, ...] = ("coder", "reviewer", "leader", "designer", "qa")
 
-# Exact combo / alias names a tier-pinned profile may be answered by (mirrors open-sse/services/tierFloor.js).
-TIER_1_ALLOWLIST: tuple[str, ...] = SPECIALIST_COMBO_IDS + (
+# Default baseline models / aliases permitted inside a TIER_1-floored combo (mirrors open-sse/services/tierFloor.js).
+# Operators can extend or override dynamically via config.yaml (tier_floor: {extra_allowlist: [...]}) or env vars.
+DEFAULT_TIER_1_ALLOWLIST: tuple[str, ...] = SPECIALIST_COMBO_IDS + (
     "cb-gemini-argon", "cb-claude-opus", "cb-gpt-sol-review", "cb-gemini-pro", "cb-opus-5.5", "cb-gpt-astra",
 )
-TIER_1_PROVIDER_MODEL_PREFIXES: tuple[str, ...] = (
+DEFAULT_TIER_1_PROVIDER_MODEL_PREFIXES: tuple[str, ...] = (
     "ag/gemini-3-pro", "ag/claude-opus", "cc/claude-opus", "cc/claude-sonnet-4", "cx/gpt-5",
 )
-TIER_3_FORBIDDEN_MARKERS: tuple[str, ...] = ("nemotron", "crouton", "cb-always-on", "cb-nous-free", ":free")
+DEFAULT_TIER_3_FORBIDDEN_MARKERS: tuple[str, ...] = ("nemotron", "crouton", "cb-always-on", "cb-nous-free", ":free")
+
+TIER_1_ALLOWLIST: tuple[str, ...] = DEFAULT_TIER_1_ALLOWLIST
+TIER_1_PROVIDER_MODEL_PREFIXES: tuple[str, ...] = DEFAULT_TIER_1_PROVIDER_MODEL_PREFIXES
+TIER_3_FORBIDDEN_MARKERS: tuple[str, ...] = DEFAULT_TIER_3_FORBIDDEN_MARKERS
 
 TIER1_BACKOFF_SCHEDULE_S: tuple[int, ...] = (15, 30, 60, 120)
 TIER1_WAIT_S = 120
@@ -76,17 +81,88 @@ class TierFloorReadbackError(RuntimeError):
         super().__init__(f"9Router combo readback failed with {len(violations)} violation(s): {violations}")
 
 
-# ---------------------------------------------------------------------------- allowlist
-def is_tier1_model_id(model_id: Any) -> bool:
+# ---------------------------------------------------------------------------- allowlist & dynamic config
+def _extract_tier_floor_config(source: Any = None) -> dict[str, Any]:
+    """Extract tier_floor configuration from an agent instance, config dict, or hermes_cli.config."""
+    cfg: dict[str, Any] = {}
+    if isinstance(source, dict):
+        cfg = source.get("tier_floor") or {}
+    elif source is not None and hasattr(source, "config"):
+        c = getattr(source, "config", None)
+        if isinstance(c, dict):
+            cfg = c.get("tier_floor") or {}
+    if not cfg:
+        try:
+            from hermes_cli.config import load_config
+            c = load_config()
+            if isinstance(c, dict):
+                cfg = c.get("tier_floor") or {}
+        except Exception:
+            pass
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def get_tier1_allowlist(source: Any = None) -> set[str]:
+    """Get the effective TIER_1 allowlist, dynamically merged from defaults, config.yaml, and env."""
+    cfg = _extract_tier_floor_config(source)
+    allowlist = set(DEFAULT_TIER_1_ALLOWLIST)
+    if "allowlist" in cfg and isinstance(cfg["allowlist"], (list, tuple)):
+        allowlist = set(str(x).strip() for x in cfg["allowlist"] if str(x).strip())
+    if "extra_allowlist" in cfg and isinstance(cfg["extra_allowlist"], (list, tuple)):
+        allowlist.update(str(x).strip() for x in cfg["extra_allowlist"] if str(x).strip())
+    env_override = os.environ.get("HERMES_TIER1_ALLOWLIST")
+    if env_override:
+        allowlist = set(x.strip() for x in env_override.split(",") if x.strip())
+    env_extra = os.environ.get("HERMES_TIER1_EXTRA_ALLOWLIST")
+    if env_extra:
+        allowlist.update(x.strip() for x in env_extra.split(",") if x.strip())
+    return allowlist
+
+
+def get_tier1_provider_prefixes(source: Any = None) -> tuple[str, ...]:
+    """Get the effective provider model prefixes, dynamically merged from defaults, config, and env."""
+    cfg = _extract_tier_floor_config(source)
+    prefixes = list(DEFAULT_TIER_1_PROVIDER_MODEL_PREFIXES)
+    if "prefixes" in cfg and isinstance(cfg["prefixes"], (list, tuple)):
+        prefixes = [str(x).strip() for x in cfg["prefixes"] if str(x).strip()]
+    if "extra_prefixes" in cfg and isinstance(cfg["extra_prefixes"], (list, tuple)):
+        prefixes.extend(str(x).strip() for x in cfg["extra_prefixes"] if str(x).strip())
+    env_override = os.environ.get("HERMES_TIER1_PREFIXES")
+    if env_override:
+        prefixes = [x.strip() for x in env_override.split(",") if x.strip()]
+    env_extra = os.environ.get("HERMES_TIER1_EXTRA_PREFIXES")
+    if env_extra:
+        prefixes.extend(x.strip() for x in env_extra.split(",") if x.strip())
+    return tuple(prefixes)
+
+
+def get_tier3_forbidden_markers(source: Any = None) -> tuple[str, ...]:
+    """Get the effective forbidden markers, dynamically merged from defaults, config, and env."""
+    cfg = _extract_tier_floor_config(source)
+    markers = list(DEFAULT_TIER_3_FORBIDDEN_MARKERS)
+    if "forbidden_markers" in cfg and isinstance(cfg["forbidden_markers"], (list, tuple)):
+        markers = [str(x).strip().lower() for x in cfg["forbidden_markers"] if str(x).strip()]
+    if "extra_forbidden_markers" in cfg and isinstance(cfg["extra_forbidden_markers"], (list, tuple)):
+        markers.extend(str(x).strip().lower() for x in cfg["extra_forbidden_markers"] if str(x).strip())
+    env_override = os.environ.get("HERMES_TIER3_FORBIDDEN")
+    if env_override:
+        markers = [x.strip().lower() for x in env_override.split(",") if x.strip()]
+    env_extra = os.environ.get("HERMES_TIER3_EXTRA_FORBIDDEN")
+    if env_extra:
+        markers.extend(x.strip().lower() for x in env_extra.split(",") if x.strip())
+    return tuple(markers)
+
+
+def is_tier1_model_id(model_id: Any, source: Any = None) -> bool:
     if not isinstance(model_id, str) or not model_id.strip():
         return False
     m = model_id.strip()
-    if m in TIER_1_ALLOWLIST:
+    if m in get_tier1_allowlist(source):
         return True
     lower = m.lower()
-    if any(marker in lower for marker in TIER_3_FORBIDDEN_MARKERS):
+    if any(marker in lower for marker in get_tier3_forbidden_markers(source)):
         return False
-    return any(lower.startswith(prefix) for prefix in TIER_1_PROVIDER_MODEL_PREFIXES)
+    return any(lower.startswith(prefix) for prefix in get_tier1_provider_prefixes(source))
 
 
 def is_tier_pinned_model(profile_model: Any) -> bool:
@@ -130,7 +206,7 @@ def _header_lookup(source: Any) -> Callable[[str], Optional[str]]:
 
 
 def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Optional[str],
-                                 require_header: bool = False) -> Optional[str]:
+                                 require_header: bool = False, agent: Any = None) -> Optional[str]:
     """Return the model provenance that answered (or ``None``) — raising ``TierFloorViolationError`` when
     ``profile_model`` is a specialist combo and either ``x-model-id`` or ``response.model`` is outside
     ``TIER_1_ALLOWLIST``, or if model provenance is missing/empty on a specialist profile. Non-specialist
@@ -150,10 +226,10 @@ def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Opt
     if not header_model_id and not body_model:
         raise TierFloorViolationError(model_id=None, profile_model=profile_model, reason="missing provenance")
 
-    if header_model_id and not is_tier1_model_id(header_model_id):
+    if header_model_id and not is_tier1_model_id(header_model_id, source=agent):
         raise TierFloorViolationError(model_id=header_model_id, profile_model=profile_model, reason="header rejected")
 
-    if body_model and not is_tier1_model_id(str(body_model)):
+    if body_model and not is_tier1_model_id(str(body_model), source=agent):
         raise TierFloorViolationError(model_id=str(body_model), profile_model=profile_model, reason="body model rejected")
 
     return header_model_id or str(body_model)
@@ -164,7 +240,7 @@ def check_stream_chunk_tier_floor(agent: Any, chunk: Any) -> None:
     chunk_model = getattr(chunk, "model", None)
     if chunk_model:
         pinned = getattr(agent, "_tier_pinned_primary", None) or getattr(agent, "model", None)
-        enforce_tier1_response_guard(chunk, profile_model=pinned)
+        enforce_tier1_response_guard(chunk, profile_model=pinned, agent=agent)
 
 
 # ---------------------------------------------------------------------------- backoff
@@ -373,7 +449,11 @@ __all__ = [
     "TierFloorReadbackError",
     "TierFloorViolationError",
     "audit_specialist_cheap_model",
+    "check_stream_chunk_tier_floor",
     "enforce_tier1_response_guard",
+    "get_tier1_allowlist",
+    "get_tier1_provider_prefixes",
+    "get_tier3_forbidden_markers",
     "is_tier1_model_id",
     "is_tier_pinned_model",
     "main",
