@@ -34,6 +34,7 @@ from hermes_cli.version_info import get_version_info
 from hermes_constants import get_process_hermes_home, profile_name_for_home
 from hermes_cli.web_models import CuratorPause, LearningNodeRef, LearningNodeEdit, DebugShareRequest
 from hermes_cli.web_routers._common import config_scoped_to_thread, destructive_profile, scoped_to_thread
+from hermes_cli.web_routers.status_public import redact_status_for_unverified
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Tuple, TypedDict
 
@@ -784,22 +785,28 @@ _WEBAPP_SIGNED_OUT_STATUS_KEYS = frozenset({
     "auth_required", "auth_providers", "auth_flows"})
 
 
-async def _webapp_caller_signed_out(request: Request) -> bool:
-    """True when this request reached the gateway's Webapp behind its sign-in gate with no
-    session the gate would accept. ``/api/status`` is public, so the gate never verified one."""
+async def _status_caller_verified(request: Request) -> bool:
+    """True when the caller carries a credential the auth gate would accept on a gated route
+    (session cookie/bearer, native principal, or the loopback session token). ``/api/status`` is
+    public, so the gate never verified one. ``None`` is an in-process caller, not a network one."""
     from hermes_cli.web_server import _require_token
-    from hermes_cli.web_server_surface import surface
-    if request is None or surface(request.app.state) != "webapp" \
-            or not getattr(request.app.state, "auth_required", False):
-        return False
-    if getattr(request.state, "session", None) is None:
+    if request is None:
+        return True
+    if getattr(request.app.state, "auth_required", False) and getattr(request.state, "session", None) is None:
         from hermes_cli.dashboard_auth.middleware import peek_session
         request.state.session = await run_in_threadpool(peek_session, request)
     try:
         _require_token(request)
     except HTTPException:
-        return True
-    return False
+        return False
+    return True
+
+
+def _webapp_caller_signed_out(request: Request, verified: bool) -> bool:
+    """True when this request reached the gateway's Webapp behind its sign-in gate unverified."""
+    from hermes_cli.web_server_surface import surface
+    return (not verified and surface(request.app.state) == "webapp"
+            and bool(getattr(request.app.state, "auth_required", False)))
 
 
 async def _collect_canonical_status_snapshot(
@@ -890,7 +897,7 @@ async def _collect_canonical_status_snapshot(
     return status
 
 
-def _shape_status_response(canonical: dict[str, Any], signed_out: bool) -> dict[str, Any]:
+def _shape_status_response(canonical: dict[str, Any], signed_out: bool, verified: bool = True) -> dict[str, Any]:
     payload = copy.deepcopy(canonical)
     auth = _auth_gate_status()
     payload.update(auth)
@@ -908,6 +915,8 @@ def _shape_status_response(canonical: dict[str, Any], signed_out: bool) -> dict[
     payload.pop("_gateway_health_url", None)
     payload.pop("_gateways", None)
 
+    if not verified:
+        redact_status_for_unverified(payload)
     if signed_out:
         return {key: value for key, value in payload.items() if key in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
     return payload
@@ -1059,10 +1068,11 @@ class StatusSnapshotProvider:
         profile_dir: Optional[Path],
         gateway_health_url: str,
         signed_out: bool,
+        verified: bool = True,
     ) -> dict[str, Any]:
         if _is_status_runtime_probe_monkeypatched():
             raw = await self._collect_fn(hermes_home, requested_profile, profile_dir, gateway_health_url)
-            return _shape_status_response(raw, signed_out)
+            return _shape_status_response(raw, signed_out, verified=verified)
 
         key = (str(hermes_home), requested_profile or "")
         entry = self._get_entry(key)
@@ -1077,7 +1087,7 @@ class StatusSnapshotProvider:
             age = (now - entry.ts) if entry.value is not None else float("inf")
 
             if entry.state == "FRESH" and age <= self.ttl_s and entry.value is not None:
-                return _shape_status_response(entry.value, signed_out)
+                return _shape_status_response(entry.value, signed_out, verified=verified)
 
             # Preserve slot if worker is running: singleflight max_concurrent_workers_per_key == 1
             if entry.fut is not None and not entry.fut.done():
@@ -1139,7 +1149,7 @@ class StatusSnapshotProvider:
                 raise HTTPException(status_code=503, detail="Status probe unavailable")
             try:
                 val = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=self.cold_timeout_s)
-                return _shape_status_response(val, signed_out)
+                return _shape_status_response(val, signed_out, verified=verified)
             except TimeoutError:
                 with entry.lock:
                     if entry.state == "COMPUTING_COLD" and entry.fut is fut:
@@ -1156,12 +1166,12 @@ class StatusSnapshotProvider:
                     await asyncio.sleep(0.02)
                     with entry.lock:
                         if entry.state == "FRESH" and entry.value is not None:
-                            return _shape_status_response(entry.value, signed_out)
+                            return _shape_status_response(entry.value, signed_out, verified=verified)
                         next_fut = entry.fut if (entry.fut is not None and not entry.fut.done() and entry.fut is not fut) else None
                     if next_fut is not None:
                         try:
                             val = await asyncio.wait_for(asyncio.wrap_future(next_fut), timeout=max(0.1, t_end - time.time()))
-                            return _shape_status_response(val, signed_out)
+                            return _shape_status_response(val, signed_out, verified=verified)
                         except (asyncio.CancelledError, concurrent.futures.CancelledError):
                             continue
                         except TimeoutError:
@@ -1174,14 +1184,14 @@ class StatusSnapshotProvider:
             if stale_val is None:
                 raise HTTPException(status_code=503, detail="Status probe unavailable")
             if fut is None:
-                return _shape_status_response(stale_val, signed_out)
+                return _shape_status_response(stale_val, signed_out, verified=verified)
             try:
                 val = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=self.swr_soft_deadline_s)
-                return _shape_status_response(val, signed_out)
+                return _shape_status_response(val, signed_out, verified=verified)
             except (TimeoutError, asyncio.CancelledError, concurrent.futures.CancelledError):
-                return _shape_status_response(stale_val, signed_out)
+                return _shape_status_response(stale_val, signed_out, verified=verified)
             except Exception:
-                return _shape_status_response(stale_val, signed_out)
+                return _shape_status_response(stale_val, signed_out, verified=verified)
 
 
 STATUS_SNAPSHOT_PROVIDER = StatusSnapshotProvider()
@@ -1209,7 +1219,8 @@ async def get_status(profile: Optional[str] = None,
     process-global skills-module attributes a concurrent request would cross-restore.
     """
     from hermes_cli.web_server import _GATEWAY_HEALTH_URL
-    signed_out = await _webapp_caller_signed_out(request)
+    verified = await _status_caller_verified(request)
+    signed_out = _webapp_caller_signed_out(request, verified)
     status_scope = None
     # A signed-out caller's ``?profile=`` is ignored: an unknown name's 404 would tell it which exist.
     requested_profile = "" if signed_out else (profile or "").strip()
@@ -1227,6 +1238,7 @@ async def get_status(profile: Optional[str] = None,
             profile_dir=profile_dir,
             gateway_health_url=_GATEWAY_HEALTH_URL,
             signed_out=signed_out,
+            verified=verified,
         )
     finally:
         if status_scope is not None:

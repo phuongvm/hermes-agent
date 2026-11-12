@@ -98,7 +98,7 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
             ("ai_observe_me", True), ("ai_observe_others", True),
             ("ai_authoritative", False),
         ):
-            setattr(self, f"_{name}", getattr(config, name) if config else default)
+            setattr(self, f"_{name}", getattr(config, name, default) if config else default)
         self._turn_counter: int = 0
         # honcho session id -> observation booleans. Whole dicts are swapped in one assignment, so readers never see a partial one.
         self._session_observation: dict[str, dict[str, bool]] = {}
