@@ -305,3 +305,48 @@ def test_response_model_tier_guard_rejects_downgraded_x_model_id():
     for bad in ("nemotron-free", "crouton-alpha", "cb-always-on"):
         test_guard_raises_on_tier3_model_id(bad)
     test_guard_passes_tier1_and_is_noop_for_non_specialist()
+
+
+def test_tier_floor_wait_override_cumulative_capped_at_300s_and_parks():
+    """SP-05R: verify cumulative wait stops at 300s and never overflows across 10 retries."""
+    from types import SimpleNamespace
+    from agent.turn_api_error import tier_floor_wait_override
+    agent = SimpleNamespace(model="cb-agent-coder")
+    waits = [tier_floor_wait_override(agent, RuntimeError("429"), status_code=429) for _ in range(10)]
+    assert waits == [15, 30, 60, 120, 120, 120, 120, 120, 120, 120]
+    assert agent._tier1_cumulative_wait_s == 300
+
+
+def test_stream_chunk_tier_guard_rejects_downgraded_chunk_body():
+    """SP-03R: verify stream chunk validation rejects forbidden body model even with allowed header."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from agent.chat_completion_helpers import _StreamingCall
+    from agent.tier_floor_policy import TierFloorViolationError
+
+    agent = SimpleNamespace(
+        model="cb-agent-coder",
+        _tier_pinned_primary="cb-agent-coder",
+        _capture_rate_limits=MagicMock(),
+        _capture_credits=MagicMock(),
+        _capture_nous_model_switch=MagicMock(),
+        _stream_diag_capture_response=MagicMock(),
+        _check_openrouter_cache_status=MagicMock(),
+        _touch_activity=MagicMock(),
+        api_mode="openai_chat",
+        stream_writer_token=1,
+    )
+    stream_call = _StreamingCall(agent=agent, api_kwargs={"model": "cb-agent-coder"}, on_first_delta=lambda d: None)
+    raw_stream = SimpleNamespace(
+        response=SimpleNamespace(headers={"x-model-id": "cb-gemini-argon"}, model="cb-gemini-argon")
+    )
+    stream_call._chat_stream_created(raw_stream)
+
+    bad_chunk = SimpleNamespace(
+        model="nemotron-free",
+        choices=[SimpleNamespace(delta=SimpleNamespace(content="downgraded answer"), finish_reason=None)],
+    )
+
+    with pytest.raises(TierFloorViolationError) as exc_info:
+        stream_call._accept_chat_chunk(0, bad_chunk)
+    assert "nemotron-free" in str(exc_info.value)

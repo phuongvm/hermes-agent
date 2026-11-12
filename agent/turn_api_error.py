@@ -260,7 +260,8 @@ def tier_floor_wait_override(agent: Any, api_error: Any, *, status_code: Any) ->
         except Exception:
             retry_after = None
     wait = tier1_backoff_for_attempt(attempt, retry_after_s=retry_after)
-    cumulative = int(getattr(agent, "_tier1_cumulative_wait_s", 0) or 0) + wait
+    prior_cumulative = int(getattr(agent, "_tier1_cumulative_wait_s", 0) or 0)
+    cumulative = min(300, prior_cumulative + wait)
     agent._tier1_cumulative_wait_s = cumulative
     logger.warning("TIER_1 floor (%s): %s — waiting %ss (attempt %d, cumulative %ds) instead of downgrading", pinned,
                    type(api_error).__name__, wait, attempt + 1, cumulative)
@@ -423,6 +424,13 @@ def settle_unrecovered_error(
         logger.info("%sFree-tier cooldown outlasts the attended wait — ending retries after attempt %s",
                     agent.log_prefix, retry_count)
         retry_count = max_retries
+    # Tier-pinned models follow their own (15, 30, 60, 120) schedule up to 300s cumulative wait;
+    # do not exhaust generic retries prematurely while tier-1 backoff is active and budget remains.
+    from agent.tier_floor_policy import is_tier_pinned_model
+    _pinned_model = getattr(agent, "_tier_pinned_primary", None) or getattr(agent, "model", None)
+    if is_tier_pinned_model(_pinned_model) and getattr(agent, "_tier1_cumulative_wait_s", 0) < 300:
+        max_retries = max(max_retries, 5)
+
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
         # transient transport errors (stale pool, TCP reset).
@@ -472,8 +480,17 @@ def settle_unrecovered_error(
         base_url=_base, model=_model,
     )
     _tier_wait = tier_floor_wait_override(agent, api_error, status_code=status_code)
+    if _tier_wait is None and getattr(agent, "_tier1_cumulative_wait_s", 0) >= 300:
+        _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        return _verdict("return", {
+            "error": "Tier 1 floor wait budget exhausted (>= 300s); parked in WAIT(120s)",
+            "status": "wait_parked",
+            "delivered": _delivered,
+        })
     if _tier_wait is not None:
         wait_time = max(float(wait_time or 0), float(_tier_wait))
+        if wait_time > _tier_wait:
+            agent._tier1_cumulative_wait_s = min(300, int(getattr(agent, "_tier1_cumulative_wait_s", 0) or 0) + int(wait_time - _tier_wait))
     # Same preserve-redirect rule as the invalid-response wait: a steering correction
     # must survive backoff, not die as "Operation interrupted".
     _interrupted = interruptible_backoff_sleep(

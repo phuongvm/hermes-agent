@@ -159,6 +159,14 @@ def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Opt
     return header_model_id or str(body_model)
 
 
+def check_stream_chunk_tier_floor(agent: Any, chunk: Any) -> None:
+    """Validate parsed stream chunk provenance against TIER_1 allowlist for specialist profiles."""
+    chunk_model = getattr(chunk, "model", None)
+    if chunk_model:
+        pinned = getattr(agent, "_tier_pinned_primary", None) or getattr(agent, "model", None)
+        enforce_tier1_response_guard(chunk, profile_model=pinned)
+
+
 # ---------------------------------------------------------------------------- backoff
 def tier1_backoff_for_attempt(attempt: int, *, retry_after_s: Optional[float] = None) -> int:
     """Seconds to WAIT before retrying a tier-pinned combo: schedule step for ``attempt`` (0-based), then the

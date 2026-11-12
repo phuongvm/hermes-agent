@@ -2975,6 +2975,8 @@ class _StreamingCall(StreamingWaitMonitor):
             abort(self._attempt_request_client, reason="cancelled_attempt_late_connect")
 
     def _accept_chat_chunk(self, stream_attempt_id: int, chunk: Any) -> bool:
+        from agent.tier_floor_policy import check_stream_chunk_tier_floor
+        check_stream_chunk_tier_floor(self.agent, chunk)
         with contextlib.suppress(Exception):
             choices = getattr(chunk, "choices", None)
             choice = choices[0] if choices else None
