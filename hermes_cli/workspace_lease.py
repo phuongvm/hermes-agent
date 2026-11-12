@@ -703,16 +703,56 @@ class WorkspaceLeaseCoordinator:
             )
         return None
 
+    @staticmethod
+    def _resolve_worktree_repo_scope(wt_dir: Path) -> str | None:
+        try:
+            raw = subprocess.check_output(
+                ["git", "-C", str(wt_dir), "rev-parse", "--git-common-dir"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+            ).strip()
+            common_path = Path(raw)
+            if not common_path.is_absolute():
+                common_path = (wt_dir / common_path).resolve()
+            else:
+                common_path = common_path.resolve()
+            posix = common_path.as_posix()
+            if ".git/modules/" in posix:
+                sub_part = posix.split(".git/modules/", 1)[1]
+                return f"repo:{sub_part}"
+            if posix.endswith("/.git"):
+                parent_posix = posix[:-5]
+                if "/workspaces/" in parent_posix:
+                    rel = parent_posix.split("/workspaces/", 1)[1]
+                    if rel:
+                        return f"repo:{rel}"
+                    return "repo:root"
+                return f"repo:{Path(parent_posix).name}"
+            return None
+        except Exception:
+            return None
+
     def _check_external_contention_locked(
-        self, now: float
+        self, now: float, canonical_scopes: Sequence[str] = ()
     ) -> tuple[str, dict[str, Any]] | None:
         state_db_result = self._probe_state_db_sessions_locked(now)
         if state_db_result is not None:
             return state_db_result
 
         if self.worktrees_root is not None and self.worktrees_root.is_dir():
+            target_repo_scopes = [
+                sc for sc in canonical_scopes if sc.startswith("repo:")
+            ]
+            if not target_repo_scopes:
+                return None
             for wt_dir in sorted(self.worktrees_root.glob("wt-*")):
                 if not wt_dir.is_dir():
+                    continue
+                wt_scope = self._resolve_worktree_repo_scope(wt_dir)
+                if wt_scope is None or not any(
+                    scopes_overlap(req, wt_scope) for req in target_repo_scopes
+                ):
                     continue
                 try:
                     out = subprocess.check_output(
@@ -777,7 +817,9 @@ class WorkspaceLeaseCoordinator:
                     )
 
             if mode == "exclusive_cutover":
-                ext_conflict = self._check_external_contention_locked(now)
+                ext_conflict = self._check_external_contention_locked(
+                    now, canonical_scopes
+                )
                 if ext_conflict is not None:
                     reason_code, details = ext_conflict
                     for sc in canonical_scopes:

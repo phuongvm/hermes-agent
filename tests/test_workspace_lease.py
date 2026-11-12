@@ -1686,3 +1686,73 @@ def test_state_db_without_sessions_schema_defers_exclusive_acquire_exit_75(
     assert rc == 75
     assert out["status"] == "DEFERRED"
     assert out["reason_code"] == "STATE_DB_QUERY_FAILED"
+
+
+def test_worktree_contention_scoped_to_target_repository(tmp_path: Path) -> None:
+    """Worktree contention checks must be scoped strictly to the target repository."""
+    import subprocess
+
+    leases_dir = tmp_path / "leases_wt"
+    wts_root = tmp_path / "worktrees"
+    wts_root.mkdir()
+
+    wt_target = wts_root / "wt-crew-active"
+    wt_target.mkdir()
+    subprocess.check_call(["git", "init"], cwd=str(wt_target), stdout=subprocess.DEVNULL)
+    (wt_target / "file.txt").write_text("hello", encoding="utf-8")
+
+    wt_other = wts_root / "wt-other-repo"
+    wt_other.mkdir()
+    subprocess.check_call(["git", "init"], cwd=str(wt_other), stdout=subprocess.DEVNULL)
+    (wt_other / "dirty.txt").write_text("dirty", encoding="utf-8")
+
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=leases_dir,
+        worktrees_root=wts_root,
+        process_inspector=lambda _: 1,
+        clock=lambda: 1000.0,
+    )
+
+    # 1. Dirty worktree of different repo does NOT block crew cutover
+    # wt_other resolves to repo:wt-other-repo or repo:other-repo, not repo:oss/crew
+    rep_other = coord.acquire_workspace_lease(
+        scopes=("repo:oss/crew",),
+        mode="exclusive_cutover",
+        holder="cron-crew",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    # wt_target is also dirty because of file.txt, but its scope is repo:wt-crew-active,
+    # neither matches repo:oss/crew unless common-dir matches.
+    assert rep_other.status == "ACQUIRED"
+    coord.release_workspace_lease(scopes=("repo:oss/crew",), fencing_tokens=rep_other.fencing_token, pid=11)
+
+    # 2. When worktree scope matches target scope (via git common dir or name)
+    # Set up mock or simulated common dir matching
+    target_scope = f"repo:{wt_target.name}"
+    rep_contention = coord.acquire_workspace_lease(
+        scopes=(target_scope,),
+        mode="exclusive_cutover",
+        holder="holder-test",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    assert rep_contention.status == "DEFERRED"
+    assert rep_contention.reason_code == "DEFERRED_ACTIVE_WORKTREE"
+    assert rep_contention.details["worktree"] == str(wt_target)
+
+    # 3. Clean worktree does NOT defer
+    subprocess.check_call(["git", "add", "."], cwd=str(wt_target), stdout=subprocess.DEVNULL)
+    subprocess.check_call(
+        ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+        cwd=str(wt_target),
+        stdout=subprocess.DEVNULL,
+    )
+    rep_clean = coord.acquire_workspace_lease(
+        scopes=(target_scope,),
+        mode="exclusive_cutover",
+        holder="holder-test",
+        holder_pid=11,
+        process_start_time_ns=1,
+    )
+    assert rep_clean.status == "ACQUIRED"
