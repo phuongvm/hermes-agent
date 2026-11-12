@@ -1756,3 +1756,41 @@ def test_worktree_contention_scoped_to_target_repository(tmp_path: Path) -> None
         process_start_time_ns=1,
     )
     assert rep_clean.status == "ACQUIRED"
+
+
+def test_probe_state_db_prefers_session_turn_leases(tmp_path: Path) -> None:
+    """When session_turn_leases table exists, active turn lease defers; idle turn lease acquires."""
+    state_db = tmp_path / "state_turn_leases.db"
+    conn = sqlite3.connect(state_db)
+    conn.execute(
+        "CREATE TABLE session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT, acquired_at REAL, expires_at REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, last_activity_at REAL, ended_at REAL)"
+    )
+    # Session had recent activity within 180s, but ended_at is NULL
+    conn.execute("INSERT INTO sessions (id, last_activity_at, ended_at) VALUES ('s1', 1000.0, NULL)")
+    # Active turn lease expiring in the future
+    conn.execute("INSERT INTO session_turn_leases VALUES ('s1', 'holder1', 990.0, 1050.0)")
+    conn.commit()
+    conn.close()
+
+    coord = WorkspaceLeaseCoordinator(
+        lease_dir=tmp_path / "leases_tl",
+        state_db_path=state_db,
+        clock=lambda: 1000.0,
+    )
+    # 1. Active turn lease -> DEFERRED
+    rep = coord.acquire_workspace_lease(scopes=("repo:oss/crew",), mode="exclusive_cutover", holder="test")
+    assert rep.status == "DEFERRED"
+    assert rep.reason_code == "DEFERRED_ACTIVE_SESSION"
+    assert rep.details["status"] == "running_turn"
+
+    # 2. Expired/cleared turn lease (turn finished) -> ACQUIRED even though session has recent last_activity_at!
+    conn = sqlite3.connect(state_db)
+    conn.execute("DELETE FROM session_turn_leases")
+    conn.commit()
+    conn.close()
+
+    rep_idle = coord.acquire_workspace_lease(scopes=("repo:oss/crew",), mode="exclusive_cutover", holder="test")
+    assert rep_idle.status == "ACQUIRED"

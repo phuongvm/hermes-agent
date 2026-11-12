@@ -668,6 +668,20 @@ class WorkspaceLeaseCoordinator:
             failure["error"] = f"sqlite open failed: {err}"
             return ("STATE_DB_QUERY_FAILED", failure)
         try:
+            tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "session_turn_leases" in tables:
+                turn_sql = (
+                    "SELECT conversation_id, holder, expires_at FROM session_turn_leases "
+                    "WHERE expires_at >= ? LIMIT 1"
+                )
+                turn_row = conn.execute(turn_sql, (now,)).fetchone()
+                if turn_row is not None:
+                    return (
+                        "DEFERRED_ACTIVE_SESSION",
+                        {"session_id": turn_row[0], "status": "running_turn", "holder": turn_row[1], "expires_at": turn_row[2]},
+                    )
+                return None
+
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
             if not columns:
                 failure["error"] = "state.db is missing the required `sessions` table"
