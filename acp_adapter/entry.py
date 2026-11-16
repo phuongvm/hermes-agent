@@ -37,6 +37,7 @@ import sys
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from hermes_cli._startup_fast import project_root_str
 
 
 # Liveness-probe methods outside the ACP schema. The router correctly answers JSON-RPC -32601
@@ -202,7 +203,7 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("Starting hermes-agent ACP adapter")
 
     # Ensure the project root is on sys.path so ``from run_agent import AIAgent`` works
-    project_root = str(Path(__file__).resolve().parent.parent)
+    project_root = project_root_str()
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
