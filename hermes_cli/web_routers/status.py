@@ -845,6 +845,7 @@ async def _collect_canonical_status_snapshot(
     status: dict[str, Any] = {
         "version": local["version"],
         "release_date": __release_date__,
+        "import_keep_host": 1,
         "config_version": local["config_version"],
         "latest_config_version": local["latest_config_version"],
         "can_update_hermes": local["can_update_hermes"],
@@ -1217,8 +1218,8 @@ async def get_status(profile: Optional[str] = None,
     active session count and the auth-gate shape — no bodies, no session content, no secrets.
 
     ``?profile=`` (dashboard management switcher) uses the config-only contextvar scope, NOT
-    _profile_scope: this handler awaits the remote health probe, and _profile_scope swaps
-    process-global skills-module attributes a concurrent request would cross-restore.
+    _profile_scope: this handler awaits the remote health probe, and _profile_scope holds a
+    process-wide lock that must never be held across an await.
     """
     from hermes_cli.web_server import _GATEWAY_HEALTH_URL
     verified = await _status_caller_verified(request)
@@ -1416,6 +1417,17 @@ async def get_portal_status(profile: Optional[str] = None):
     # load_config() + auth/subscription snapshots are disk reads on a polled endpoint —
     # keep them off the event loop.
     return await config_scoped_to_thread(profile, _get_portal_status_sync)
+
+
+@router.get("/api/cloud/agents")
+async def list_cloud_agents(org: Optional[str] = None, profile: Optional[str] = None):
+    """The signed-in Nous account's Hermes Cloud agents, for a client with no portal session of its
+    own (the Webapp's browser tab): ``hermes_cli.cloud_agents``."""
+    from hermes_cli.cloud_agents import CloudAgentsError, discover
+    try:
+        return await config_scoped_to_thread(profile, lambda: discover(org))
+    except CloudAgentsError as exc:
+        raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc)}) from None
 
 
 def _feature_state(feat) -> str:

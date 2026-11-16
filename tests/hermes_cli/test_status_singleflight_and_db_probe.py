@@ -403,7 +403,7 @@ async def test_signed_out_and_authenticated_callers_share_snapshot_with_isolated
     monkeypatch.setattr(
         status_router,
         "_webapp_caller_signed_out",
-        lambda _req: asyncio.sleep(0, result=signed_out_flag),
+        lambda _req, _verified: signed_out_flag,
     )
 
     full_body = await status_router.get_status()

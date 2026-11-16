@@ -7521,6 +7521,7 @@ interface GatewayFileConnection extends RegistryBackendRequestScope {
 interface GatewayFileSavePayload {
   sessionId?: string
   connectionId?: unknown
+  downloadPath?: unknown
   path?: unknown
   profile?: unknown
   suggestedName?: unknown
@@ -7556,7 +7557,8 @@ async function saveGatewayFile(payload: GatewayFileSavePayload = {}): Promise<Ga
   const requestPaths = gatewayFileRequestPaths(
     filePath,
     requestPath => gatewayFileRequestPath(connection, connectionId, profile, requestPath),
-    payload.sessionId
+    payload.sessionId,
+    payload.downloadPath
   )
 
   const deps: GatewayFileSaveDeps = {
@@ -15033,12 +15035,6 @@ async function fetchJsonForBackend(
         Object.assign(err, { statusCode: 401, code: 'ERR_SIGNED_OUT' })
         throw err
       }
-      // The OAuth cookie path rides electron.net with JSON headers; multipart
-      // isn't wired there. Fail loudly rather than corrupting the upload.
-      if (opts.upload) {
-        throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
-      }
-
       const options = {
         method: opts.method,
         body: opts.body,
@@ -15052,11 +15048,16 @@ async function fetchJsonForBackend(
           executeWithNativeBearerSingleReplay(
             descriptor.baseUrl,
             bearer,
-            activeBearer => fetchJson(url, null, { ...options, bearer: activeBearer }),
+            activeBearer => fetchJson(url, null, { ...options, upload: opts.upload, bearer: activeBearer }),
             (rejectedBaseUrl, rejectedBearer) =>
               ensureNativeAccessToken(rejectedBaseUrl, { forceRefresh: true, rejectedAccessToken: rejectedBearer })
           ),
-        requestWithCookie: () => fetchJsonViaOauthSession(url, options)
+        requestWithCookie: () => {
+          if (opts.upload) {
+            throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+          }
+          return fetchJsonViaOauthSession(url, options)
+        }
       })
     }
 

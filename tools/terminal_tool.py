@@ -1889,4 +1889,3 @@ registry.register(
 
 
 
-registry.register_toolset_check("terminal", check_terminal_requirements)
