@@ -8,6 +8,9 @@ closed for them without mutating the process-global environment.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from hashlib import sha256
+from uuid import uuid4
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
@@ -16,6 +19,57 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
+
+@dataclass(frozen=True)
+class TaskIntent:
+    """Host provenance for a native assignment; carries no tool authorization."""
+
+    version: int
+    assignment_id: str
+    actor_session_id: str
+    parent_session_id: str
+    goal_text: str
+    goal_hash: str
+    context_hash: str
+
+
+_TASK_INTENT: ContextVar[TaskIntent | None] = ContextVar("hermes_task_intent", default=None)
+
+
+@contextmanager
+def native_task_intent(
+    *, actor_session_id: str, parent_session_id: str, goal: str, context: str | None,
+    resumed: bool = False,
+) -> Iterator[None]:
+    """Bind separate native producer inputs, never deserialize a model envelope.
+
+    Unknown resumed state receives no fresh provenance. Lifecycle retention is
+    owned by the native assignment owner, not reconstructed from transcript text.
+    """
+    valid = all(isinstance(value, str) and value for value in (actor_session_id, parent_session_id, goal))
+    valid = valid and (context is None or isinstance(context, str))
+    record = None
+    if valid and not resumed:
+        record = TaskIntent(1, uuid4().hex, actor_session_id, parent_session_id, goal,
+                            sha256(goal.encode()).hexdigest(), sha256((context or "").encode()).hexdigest())
+    token = _TASK_INTENT.set(record)
+    try:
+        yield
+    finally:
+        _TASK_INTENT.reset(token)
+
+
+def current_task_intent(actor_session_id: str, parent_session_id: str) -> TaskIntent | None:
+    """Return only a versioned, identity-bound record from the active host scope."""
+    record = _TASK_INTENT.get()
+    if type(record) is not TaskIntent or record.version != 1:
+        return None
+    if record.actor_session_id != actor_session_id or record.parent_session_id != parent_session_id:
+        return None
+    if not record.assignment_id or record.goal_hash != sha256(record.goal_text.encode()).hexdigest():
+        return None
+    return record
+
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 

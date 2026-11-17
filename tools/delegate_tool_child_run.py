@@ -13,6 +13,7 @@ from tools.delegation_redaction import redact_child_result, redact_child_text
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 from agent.compression_marker import elide
+from agent.delegation_context import native_task_intent
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1070,7 +1071,11 @@ class _ChildRun:
             from agent.delegation_context import delegated_child_context
             from tools.delegate_tool_routes import child_profile_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
-            with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")), native_task_intent(
+                actor_session_id=getattr(child, "session_id", ""),
+                parent_session_id=getattr(self.parent_agent, "session_id", ""),
+                goal=self.goal, context=getattr(child, "_delegate_context", None), resumed=bool(resume),
+            ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,
                 )

@@ -72,6 +72,23 @@ timeouts are explicitly rejected until Hermes can
 support them without weakening isolation. Use `allowed_toolsets` to narrow a
 child; Hermes's existing unsafe-tool block remains enforced.
 
+## Native assignment intent (internal hook contract)
+
+Native child execution supplies an optional immutable `task_intent` record to
+`pre_llm_call` hooks. Version 1 binds an opaque assignment ID, actor and parent
+session IDs, the separate goal text and its UTF-8 SHA-256, and a context hash.
+The rendered brief, image parts and cached prompt prefix are unchanged. Context
+text is not used to derive the goal. Prompt markers, tool arguments and public
+request `metadata` cannot populate this internal record.
+
+This is cooperative host provenance, not a sandbox against arbitrary Python
+running inside the host. It conveys **no tool permission or prerequisite
+allowance**. Missing/invalid records and unknown resumed state supply `None`;
+consumers retain ordinary handling. The current producer binds fresh native
+execution only and restores the previous context on exit, including exceptions.
+Assignment retention across continuation is a separate lifecycle capability;
+consumers must not infer it from transcript text or mint renewed allowance.
+
 ## Routing
 
 Children follow the `delegation` config (`provider`, `model`, `base_url`,

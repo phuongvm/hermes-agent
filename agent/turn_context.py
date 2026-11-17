@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
+from agent.delegation_context import current_task_intent
 from agent.memory_context import build_memory_context_block, sanitize_context
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
@@ -929,6 +930,7 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            task_intent=current_task_intent(agent.session_id, getattr(agent, "_parent_session_id", None) or ""),
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
