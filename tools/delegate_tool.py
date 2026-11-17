@@ -534,23 +534,23 @@ def _build_children(
             if _m:
                 _slice_id = _m.group(1)
         if _slice_id:
-            setattr(child, "_delegate_slice_id", _slice_id)
+            child._delegate_slice_id = _slice_id
             _m_dir = t.get("manifest_dir") or t.get("delegate_manifest_dir") or getattr(parent_agent, "_delegate_manifest_dir", None)
             if _m_dir:
-                setattr(child, "_delegate_manifest_dir", str(_m_dir))
+                child._delegate_manifest_dir = str(_m_dir)
             if t.get("repo_root"):
-                setattr(child, "_delegate_repo_root", str(t["repo_root"]))
+                child._delegate_repo_root = str(t["repo_root"])
             if t.get("head_sha"):
-                setattr(child, "_delegate_head_sha", str(t["head_sha"]))
+                child._delegate_head_sha = str(t["head_sha"])
             if t.get("proof_commands"):
-                setattr(child, "_delegate_proof_commands", list(t["proof_commands"]))
+                child._delegate_proof_commands = list(t["proof_commands"])
             if "proof_exit_code" in t:
-                setattr(child, "_delegate_proof_exit_code", int(t["proof_exit_code"]))
+                child._delegate_proof_exit_code = int(t["proof_exit_code"])
         _t_timeout = t.get("timeout_s")
         if _t_timeout is not None:
-            setattr(child, "_delegate_timeout_s", float(_t_timeout))
+            child._delegate_timeout_s = float(_t_timeout)
         elif _slice_id:
-            setattr(child, "_delegate_timeout_s", float(MAX_SLICE_TIMEOUT_S))
+            child._delegate_timeout_s = float(MAX_SLICE_TIMEOUT_S)
         if isinstance(getattr(child, "_delegate_resume", None), dict):
             child._delegate_resume["route"] = route
         if _task_schema is not None:

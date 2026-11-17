@@ -116,6 +116,8 @@ def test_file_credential_check_runs_off_the_event_loop(home_client, monkeypatch,
 
     monkeypatch.setattr(files, "resolved_home_credential_stores", slow_stores)
     with TestClient(web_server.app) as loop_client, ThreadPoolExecutor(max_workers=1) as pool:
+        # TestClient enters the lifespan without the server's post-bind readiness callback.
+        monkeypatch.setattr(web_server.app.state, "startup_ready", True)
         loop_client.headers.update(client.headers)
         if route == "/api/files/upload-stream":
             blocked = pool.submit(loop_client.post, route, data={"path": str(home / "up.txt")}, files={"file": ("up.txt", b"hi")})

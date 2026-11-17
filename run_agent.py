@@ -219,6 +219,15 @@ class AIAgent(
 ):
     """AI Agent with tool calling capabilities."""
 
+    # Assigned only to delegated children; absence preserves getattr fallback behavior.
+    _delegate_slice_id: str
+    _delegate_manifest_dir: str
+    _delegate_repo_root: str
+    _delegate_head_sha: str
+    _delegate_proof_commands: list[Any]
+    _delegate_proof_exit_code: int
+    _delegate_timeout_s: float
+
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"

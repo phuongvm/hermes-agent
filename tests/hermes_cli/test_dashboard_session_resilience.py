@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_constants import get_hermes_home
+from hermes_state import SessionDB
 from hermes_cli import web_server
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_cli.dashboard_auth import clear_providers, register_provider
@@ -350,7 +351,7 @@ class TestConcurrentSessionTokenResolution:
         token2 = web_server._resolve_session_token()
         assert token2 == token1
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_acl_restricts_permissions(self, monkeypatch, tmp_path):
         """Verify Windows DACL restricts access to service user with inheritance removed."""
         import subprocess
@@ -360,7 +361,7 @@ class TestConcurrentSessionTokenResolution:
         monkeypatch.setenv("HERMES_HOME", str(test_home))
         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
 
-        token = web_server._resolve_session_token()
+        web_server._resolve_session_token()
         token_file = test_home / ".dashboard_session_token"
         assert token_file.is_file()
 
@@ -376,7 +377,7 @@ class TestConcurrentSessionTokenResolution:
             assert username in output
         assert "everyone" not in output
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_acl_repair_removes_explicit_everyone(self, monkeypatch, tmp_path):
         """Verify explicit Everyone grant on existing token file is removed upon repair."""
         import subprocess
@@ -401,7 +402,7 @@ class TestConcurrentSessionTokenResolution:
         assert "everyone:(" not in chk_after
         assert "*s-1-1-0:(" not in chk_after
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_acl_failure_fails_closed_and_rejects_insecure_file(self, monkeypatch, tmp_path):
         """Verify failure in icacls causes resolver to reject insecure file and fail closed."""
         import subprocess
@@ -427,7 +428,7 @@ class TestConcurrentSessionTokenResolution:
         assert token != "insecure-secret-token"
         assert len(token) >= 32
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_pre_write_temporary_file_is_secured_before_secret_written(self, monkeypatch, tmp_path):
         """Verify temporary token file is secured with restricted DACL while empty before secret bytes are written."""
         test_home = tmp_path / "win_pre_write_acl"
@@ -445,14 +446,14 @@ class TestConcurrentSessionTokenResolution:
             return ok
 
         with patch.object(web_server, "_secure_token_file", side_effect=hook_secure):
-            token = web_server._resolve_session_token()
+            web_server._resolve_session_token()
 
         assert len(recorded_states) >= 1
         # Must be empty (0 bytes) when secured before secret is written
         assert recorded_states[0][0] == 0
         assert recorded_states[0][1] is True
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_unix_permissions_0600_enforced(self, monkeypatch, tmp_path):
         """Verify Unix mode 0600 on created token file."""
         test_home = tmp_path / "unix_mode_home"
@@ -460,7 +461,7 @@ class TestConcurrentSessionTokenResolution:
         monkeypatch.setenv("HERMES_HOME", str(test_home))
         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
 
-        token = web_server._resolve_session_token()
+        web_server._resolve_session_token()
         token_file = test_home / ".dashboard_session_token"
         assert token_file.is_file()
         mode = token_file.stat().st_mode & 0o777
@@ -480,7 +481,7 @@ class TestConcurrentSessionTokenResolution:
         resp2 = gated_client.get("/api/sessions")
         assert resp2.status_code == 401
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_acl_repair_removes_arbitrary_principal_grant(self, monkeypatch, tmp_path):
         """Verify Windows ACL repair strips arbitrary principal/SID (e.g. S-1-5-19 LOCAL SERVICE) from DACL."""
         import subprocess
@@ -505,7 +506,7 @@ class TestConcurrentSessionTokenResolution:
         assert "LOCAL SERVICE" not in chk_after
         assert "S-1-5-19" not in chk_after
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_acl_rejects_unauthorized_principal_when_unrepairable(self, monkeypatch, tmp_path):
         """Verify resolver fails closed and rejects file if an unauthorized principal remains in DACL."""
         import subprocess
@@ -677,13 +678,15 @@ class TestConcurrentSessionTokenResolution:
         test_home = tmp_path / "prod_startup_home"
         test_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(test_home))
+        monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", test_home / "state.db")
+        SessionDB(db_path=test_home / "state.db").close()
         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
 
         web_server.set_startup_ready(False)
         prev_required = getattr(web_server.app.state, "auth_required", None)
         web_server.app.state.auth_required = False
 
-        bound_info = {"port": None}
+        bound_info: dict[str, int] = {"port": 0}
         server_ready_event = threading.Event()
 
         config = uvicorn.Config(
@@ -714,6 +717,7 @@ class TestConcurrentSessionTokenResolution:
                         host="127.0.0.1",
                         port=0,
                         headless=True,
+                        isolated=True,
                         open_browser=False,
                         initial_profile="",
                         start_mcp_discovery_after_bind=False,
@@ -773,13 +777,15 @@ class TestConcurrentSessionTokenResolution:
         test_home = tmp_path / "grace_transition_home"
         test_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(test_home))
+        monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", test_home / "state.db")
+        SessionDB(db_path=test_home / "state.db").close()
         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
 
         web_server.set_startup_ready(False)
         prev_required = getattr(web_server.app.state, "auth_required", None)
         web_server.app.state.auth_required = False
 
-        bound_info = {"port": None}
+        bound_info: dict[str, int] = {"port": 0}
         server_listening_event = threading.Event()
         init_work_done = threading.Event()
 
@@ -817,6 +823,7 @@ class TestConcurrentSessionTokenResolution:
                             host="127.0.0.1",
                             port=bound_info["port"],
                             headless=True,
+                            isolated=True,
                             open_browser=False,
                             initial_profile="",
                             start_mcp_discovery_after_bind=False,
@@ -881,7 +888,7 @@ class TestConcurrentSessionTokenResolution:
             web_server.app.state.auth_required = prev_required
             web_server.set_startup_ready(True)
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_native_win32_process_identity_direct_branch(self):
         """Verify primary Win32 ctypes branch resolves SID and account name without whoami fallback."""
         import subprocess
@@ -901,7 +908,7 @@ class TestConcurrentSessionTokenResolution:
         assert name is not None and len(name) > 0
         assert len(whoami_calls) == 0, f"Expected 0 whoami fallback calls, got {len(whoami_calls)}"
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_native_whoami_fallback_when_ctypes_fails(self):
         """Verify whoami /user fallback succeeds and resolves SID when ctypes Win32 lookup fails."""
         import ctypes
@@ -912,7 +919,7 @@ class TestConcurrentSessionTokenResolution:
         assert sid is not None and sid.startswith("S-1-")
         assert name is not None and len(name) > 0
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_native_identity_failure_fails_closed_without_env_fallback(self, monkeypatch):
         """Verify native identity failure returns (None, None) and never authorizes untrusted USERNAME env."""
         import ctypes
@@ -934,7 +941,7 @@ class TestConcurrentSessionTokenResolution:
         assert sid is None
         assert name is None
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_native_identity_failure_preserves_acl_and_rejects_credential(self, monkeypatch, tmp_path):
         """Verify native identity failure rejects token file, preserves existing DACL/content, and does not grant Everyone."""
         import ctypes
@@ -950,7 +957,7 @@ class TestConcurrentSessionTokenResolution:
         assert web_server._secure_token_file(token_file)
 
         real_run = subprocess.run
-        initial_acl = real_run(["icacls", str(token_file)], capture_output=True, text=True, check=True).stdout
+        real_run(["icacls", str(token_file)], capture_output=True, text=True, check=True)
 
         def fail_whoami(args, **kwargs):
             if args and args[0] == "whoami":
@@ -977,7 +984,7 @@ class TestConcurrentSessionTokenResolution:
             # 4. Token file content must remain preserved
             assert token_file.read_text(encoding="utf-8") == "secret-token-to-preserve\n"
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_native_identity_failure_when_creating_token_publishes_no_secrets(self, monkeypatch, tmp_path):
         """Verify native identity failure during token creation does not publish secret token file to disk."""
         import ctypes

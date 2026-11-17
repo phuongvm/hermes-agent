@@ -1626,6 +1626,7 @@ export function useBackgroundSync({
   // model + config so the composer pill reflects the profile default.
   const prevFreshDraftStateRef = useRef({ activeSessionId, freshDraftReady, gatewayState })
 
+  // eslint-disable-next-line no-restricted-syntax -- Previous-commit transition history, not an atom mirror read by callbacks.
   useEffect(() => {
     const prev = prevFreshDraftStateRef.current
     prevFreshDraftStateRef.current = { activeSessionId, freshDraftReady, gatewayState }
