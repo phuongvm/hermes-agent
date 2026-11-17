@@ -1,6 +1,7 @@
 """Native child-run metadata reaches the pre-LLM hook without changing the brief."""
 from hashlib import sha256
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -88,7 +89,16 @@ def test_untyped_metadata_is_not_trusted(replacement, monkeypatch):
     assert dc.current_task_intent("child", "parent") is None
 
 
-@pytest.mark.parametrize("field,value", [("version", 0), ("version", 2), ("goal_hash", "bad"), ("assignment_id", "")])
+@pytest.mark.parametrize("field,value", [
+    ("version", 0), ("version", 2), ("version", True), ("version", 1.0),
+    ("goal_text", None), ("goal_text", 42), ("goal_text", ""), ("goal_text", "\ud800"),
+    ("goal_hash", "bad"), ("goal_hash", None),
+    ("assignment_id", ""), ("assignment_id", 1), ("assignment_id", "not-a-uuid"),
+    ("assignment_id", "g" * 32),
+    ("actor_session_id", None), ("actor_session_id", 1),
+    ("parent_session_id", None), ("parent_session_id", []),
+    ("context_hash", None), ("context_hash", "bad"), ("context_hash", "g" * 64),
+])
 def test_invalid_host_record_is_not_trusted(field, value, monkeypatch):
     from contextvars import ContextVar
     from dataclasses import replace
@@ -100,6 +110,40 @@ def test_invalid_host_record_is_not_trusted(field, value, monkeypatch):
         with monkeypatch.context() as scoped:
             scoped.setattr(dc, "_TASK_INTENT", ContextVar("test_intent", default=replace(record, **{field: value})))
             assert dc.current_task_intent("child", "parent") is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("actor_session_id", None), ("actor_session_id", " "),
+    ("parent_session_id", 7), ("parent_session_id", ""),
+    ("goal", None), ("goal", " "), ("goal", "\ud800"),
+    ("context", {}), ("context", "\ud800"),
+])
+def test_invalid_native_inputs_leave_no_record(field, value):
+    from agent.delegation_context import current_task_intent, native_task_intent
+
+    inputs: dict[str, Any] = dict(actor_session_id="child", parent_session_id="parent", goal="Create proposal.md.", context=None)
+    inputs[field] = value
+    with native_task_intent(**inputs):
+        assert current_task_intent("child", "parent") is None
+
+
+def test_malformed_record_does_not_skip_other_pre_llm_callbacks(captured_hook, monkeypatch):
+    from contextvars import ContextVar
+    from dataclasses import replace
+    from agent import delegation_context as dc
+
+    agent = SimpleNamespace(session_id="child", _parent_session_id="parent", model="offline", _persist_disabled=False)
+    with dc.native_task_intent(actor_session_id="child", parent_session_id="parent", goal="Create proposal.md.", context=None):
+        record = dc.current_task_intent("child", "parent")
+        assert record is not None
+        with monkeypatch.context() as scoped:
+            scoped.setattr(dc, "_TASK_INTENT", ContextVar("invalid_intent", default=replace(record, goal_text=None)))
+            _collect_pre_llm_call_context(
+                agent, effective_task_id="task", turn_id="turn", original_user_message="Inspect.",
+                messages=[], conversation_history=None,
+            )
+    assert len(captured_hook) == 1
+    assert captured_hook[0]["task_intent"] is None
 
 
 def test_nested_assignments_restore_parent_and_unknown_resume_cannot_mint():

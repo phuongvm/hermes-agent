@@ -46,12 +46,17 @@ def native_task_intent(
     Unknown resumed state receives no fresh provenance. Lifecycle retention is
     owned by the native assignment owner, not reconstructed from transcript text.
     """
-    valid = all(isinstance(value, str) and value for value in (actor_session_id, parent_session_id, goal))
-    valid = valid and (context is None or isinstance(context, str))
+    valid = all(type(value) is str and value.strip() for value in (actor_session_id, parent_session_id, goal))
+    valid = valid and (context is None or type(context) is str)
     record = None
     if valid and not resumed:
-        record = TaskIntent(1, uuid4().hex, actor_session_id, parent_session_id, goal,
-                            sha256(goal.encode()).hexdigest(), sha256((context or "").encode()).hexdigest())
+        try:
+            goal_hash = sha256(goal.encode("utf-8")).hexdigest()
+            context_hash = sha256((context or "").encode("utf-8")).hexdigest()
+        except UnicodeEncodeError:
+            pass  # Invalid text retains legacy handling, never partial provenance.
+        else:
+            record = TaskIntent(1, uuid4().hex, actor_session_id, parent_session_id, goal, goal_hash, context_hash)
     token = _TASK_INTENT.set(record)
     try:
         yield
@@ -62,13 +67,22 @@ def native_task_intent(
 def current_task_intent(actor_session_id: str, parent_session_id: str) -> TaskIntent | None:
     """Return only a versioned, identity-bound record from the active host scope."""
     record = _TASK_INTENT.get()
-    if type(record) is not TaskIntent or record.version != 1:
+    if type(record) is not TaskIntent or type(record.version) is not int or record.version != 1:
         return None
+    text_fields = (record.actor_session_id, record.parent_session_id, record.goal_text,
+                   actor_session_id, parent_session_id)
+    if any(type(value) is not str or not value.strip() for value in text_fields):
+        return None
+    for value, length in ((record.assignment_id, 32), (record.goal_hash, 64), (record.context_hash, 64)):
+        if type(value) is not str or len(value) != length or any(c not in "0123456789abcdef" for c in value):
+            return None
     if record.actor_session_id != actor_session_id or record.parent_session_id != parent_session_id:
         return None
-    if not record.assignment_id or record.goal_hash != sha256(record.goal_text.encode()).hexdigest():
+    try:
+        goal_hash = sha256(record.goal_text.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
         return None
-    return record
+    return record if record.goal_hash == goal_hash else None
 
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
