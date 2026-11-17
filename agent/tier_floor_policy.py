@@ -243,6 +243,59 @@ def check_stream_chunk_tier_floor(agent: Any, chunk: Any) -> None:
         enforce_tier1_response_guard(chunk, profile_model=pinned, agent=agent)
 
 
+class Tier1StreamGuard:
+    """Validate provenance before delivering any chunk; reset for each HTTP attempt."""
+
+    def __init__(self, agent: Any, response: Any) -> None:
+        self.agent = agent
+        self.profile_model = str(getattr(agent, "_tier_pinned_primary", None) or getattr(agent, "model", ""))
+        self.pinned = is_tier_pinned_model(self.profile_model)
+        self.model_id: Optional[str] = None
+        if self.pinned:
+            header = _header_lookup(response)(MODEL_ID_HEADER)
+            if header:
+                self._validate(header)
+
+    def _is_router_route(self) -> bool:
+        provider = getattr(self.agent, "provider", "")
+        requested = getattr(self.agent, "requested_provider", provider)
+        if provider not in ("custom", "ai-router", "custom:ai-router") or requested not in ("ai-router", "custom:ai-router"):
+            return False
+        config = getattr(self.agent, "config", None)
+        if not isinstance(config, dict):
+            from hermes_cli.config import load_config
+            config = load_config()
+        configured = config.get("providers", {}).get("ai-router", {}).get("base_url", "")
+        actual = getattr(self.agent, "base_url", "")
+        return bool(configured and actual and configured.rstrip("/") == actual.rstrip("/"))
+
+    def _validate(self, model: str) -> None:
+        canonical = model
+        # Codex routes expose a bare upstream model in OpenAI SSE. Only exact
+        # approved cx entries authorize that spelling; prefixes grant no aliases.
+        if self._is_router_route():
+            qualified = f"cx/{model}"
+            if "/" not in model and qualified in get_tier1_allowlist(self.agent):
+                canonical = qualified
+        if any(marker in canonical.lower() for marker in get_tier3_forbidden_markers(self.agent)):
+            raise TierFloorViolationError(model_id=model, profile_model=self.profile_model, reason="forbidden model")
+        enforce_tier1_response_guard({"model": canonical}, profile_model=self.profile_model, agent=self.agent)
+        if self.model_id is not None and canonical != self.model_id:
+            raise TierFloorViolationError(model_id=model, profile_model=self.profile_model, reason="stream model changed")
+        self.model_id = canonical
+
+    def accept(self, chunk: Any) -> None:
+        if not self.pinned:
+            return
+        model = getattr(chunk, "model", None)
+        if model is not None and not isinstance(model, str):
+            raise TierFloorViolationError(model_id=None, profile_model=self.profile_model, reason="invalid provenance")
+        if model:
+            self._validate(model)
+        if self.model_id is None:
+            raise TierFloorViolationError(model_id=None, profile_model=self.profile_model, reason="missing provenance")
+
+
 # ---------------------------------------------------------------------------- backoff
 def tier1_backoff_for_attempt(attempt: int, *, retry_after_s: Optional[float] = None) -> int:
     """Seconds to WAIT before retrying a tier-pinned combo: schedule step for ``attempt`` (0-based), then the

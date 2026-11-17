@@ -2943,8 +2943,8 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
-        from agent.tier_floor_policy import enforce_tier1_response_guard
-        enforce_tier1_response_guard(response, profile_model=getattr(self.agent, "_tier_pinned_primary", None) or getattr(self.agent, "model", None))
+        from agent.tier_floor_policy import Tier1StreamGuard
+        self._tier_stream_guard = Tier1StreamGuard(self.agent, response)
         self.agent._capture_rate_limits(response)
         self.agent._capture_credits(response)
         self.agent._capture_nous_model_switch(response)
@@ -2973,8 +2973,7 @@ class _StreamingCall(StreamingWaitMonitor):
             abort(self._attempt_request_client, reason="cancelled_attempt_late_connect")
 
     def _accept_chat_chunk(self, stream_attempt_id: int, chunk: Any) -> bool:
-        from agent.tier_floor_policy import check_stream_chunk_tier_floor
-        check_stream_chunk_tier_floor(self.agent, chunk)
+        self._tier_stream_guard.accept(chunk)
         with contextlib.suppress(Exception):
             choices = getattr(chunk, "choices", None)
             choice = choices[0] if choices else None
