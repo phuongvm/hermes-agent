@@ -654,7 +654,7 @@ class SessionAuthority:
         if event is not None:
             event._gateway_accepted = True
             if hasattr(event, '_proposal_command'):
-                from agent.prerequisite_workflow import queue_proposal_command
+                from agent.prerequisite.workflow import queue_proposal_command
                 queue_proposal_command(self, event, row)
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
                 committed()  # a queued slash command's ack follows its commit (``_queue_command_turn``)

@@ -213,7 +213,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _turn_started_monotonic = time.monotonic()
             event._heartbeat_execution_started = True
             _turn_channel_prompt, _turn_source = channel
-            from agent.prerequisite_workflow import proposal_turn
+            from agent.prerequisite.workflow import proposal_turn
             with proposal_turn(event, _quick_key, _run_start_session_id):
                 agent_result = await self._run_agent(
                     message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
@@ -1645,7 +1645,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from agent.prerequisite_workflow import retire_proposal_turn
+        from agent.prerequisite.workflow import retire_proposal_turn
         from gateway.run import _preserve_queued_followup_history_offset
         retire_proposal_turn()
         source, session_id, session_key, run_generation = (

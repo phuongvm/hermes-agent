@@ -96,7 +96,7 @@ async def test_queued_followup_persists_authored_text_and_retires_proposal_bindi
 
     from contextvars import copy_context
 
-    from agent.prerequisite_workflow import (
+    from agent.prerequisite.workflow import (
         _original_delivery_scope, authenticate_proposal_command, child_proposal_selection,
         note_proposal_command, proposal_turn,
     )

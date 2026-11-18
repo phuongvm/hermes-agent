@@ -44,6 +44,62 @@ def test_config_check_diagnoses_effective_prerequisite_catalog(tmp_path, monkeyp
     assert "must-not-echo" not in output
 
 
+@pytest.mark.parametrize("broken", [False, True], ids=["absent", "unreadable-present"])
+def test_managed_catalog_requires_readable_user_layer(tmp_path, monkeypatch, capsys, caplog, broken):
+    from json import dumps
+
+    from agent.prerequisite.workflow import _selection
+    from hermes_cli.config_effective import load_user_config_effective
+    from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
+
+    home, managed = tmp_path / "user", tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    user_path = home / "config.yaml"
+    config = profile_config(proposal_entry(tmp_path / "planning"))
+    (managed / "config.yaml").write_text(dumps(config), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    if broken:
+        try:
+            user_path.symlink_to(tmp_path / "missing-user-config")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314:
+                raise
+            # Exercise a present entry with a missing target even without symlink privileges.
+            user_path.touch()
+            original = type(user_path).stat
+
+            def stat(path, *args, **kwargs):
+                if path == user_path and kwargs.get("follow_symlinks", True):
+                    raise FileNotFoundError("fixture target missing")
+                return original(path, *args, **kwargs)
+
+            from hermes_cli.config_backend import FileBackend
+
+            read_path = FileBackend.read_path
+            exists = FileBackend.exists
+
+            def exists_following_link(backend, home):
+                return backend.config_path(home) != user_path and exists(backend, home)
+
+            def read(path):
+                if path == user_path:
+                    raise FileNotFoundError("fixture target missing")
+                return read_path(path)
+
+            monkeypatch.setattr(type(user_path), "stat", stat)
+            monkeypatch.setattr(FileBackend, "read_path", staticmethod(read))
+            monkeypatch.setattr(FileBackend, "exists", exists_following_link)
+    assert load_user_config_effective()["prerequisite_catalog"] == config["prerequisite_catalog"]
+    caplog.set_level("INFO", logger=_selection.__module__)
+    assert (_selection(CHANGE) is None) is broken
+    assert ("PREREQUISITE_SELECTION_UNAVAILABLE: profile-config-unavailable" in caplog.messages) is broken
+    output = _check(home, monkeypatch, capsys)
+    assert ("prerequisite_catalog: profile-config-unavailable" in output) is broken
+    assert "missing-user-config" not in output
+
+
 def test_config_check_and_migrate_agree_on_stale_platform_toolsets(tmp_path, monkeypatch, capsys):
     # Only a plugin MCP server named 'portable' exists; keep host-installed plugins out of the verdict.
     monkeypatch.setattr(plugins_mod, "get_plugin_toolset_keys_nowait", set)

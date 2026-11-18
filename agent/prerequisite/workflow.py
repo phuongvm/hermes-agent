@@ -13,7 +13,7 @@ from threading import RLock
 from types import MethodType
 from weakref import ref
 
-from agent.prerequisite_catalog import (
+from agent.prerequisite.catalog import (
     WORKFLOW, InvalidCatalog, ProposalSelection, freeze_proposal_catalog, proposal_entries, valid_change_id,
     verify_catalog_metadata,
 )

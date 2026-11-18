@@ -17,7 +17,7 @@ import os
 import time
 import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
-from agent.prerequisite_workflow import original_proposal_delivery
+from agent.prerequisite.workflow import original_proposal_delivery
 from contextvars import Context
 from datetime import datetime, timedelta, timezone, UTC
 from gateway.config import (

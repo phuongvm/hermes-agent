@@ -290,7 +290,7 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     from copy import deepcopy
     from json import dumps
 
-    from agent.prerequisite_workflow import (
+    from agent.prerequisite.workflow import (
         _original_delivery_scope, authenticate_proposal_command, note_proposal_command, proposal_turn,
     )
     from gateway.platforms.event import MessageEvent

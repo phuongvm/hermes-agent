@@ -319,7 +319,7 @@ async def execute_admission(authority, ref, row):
     if 'native_text_v1' in row['payload']:
         event = restore_native(row['payload'], authority.runner)
         if proposal_ticket is not None:
-            from agent.prerequisite_workflow import restore_proposal_command
+            from agent.prerequisite.workflow import restore_proposal_command
             restore_proposal_command(proposal_ticket, event, route, ref.session_id, row)
     else:
         from gateway.session_ingress_media import restore_attachments

@@ -38,7 +38,7 @@ async def test_gateway_proposal_command_reaches_native_child_hook(tmp_path, monk
     pin.update(size=len(data), sha256=sha256(data).hexdigest())
     if case_mismatch:
         pin["path"] = str(planning / "Skills/openspec-propose/SKILL.md")
-        caplog.set_level("INFO", logger="agent.prerequisite_workflow")
+        caplog.set_level("INFO", logger="agent.prerequisite.workflow")
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", planning / "skills")
     monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda _: None)
     config = profile_config(entry)

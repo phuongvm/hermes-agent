@@ -42,7 +42,7 @@ def config_check_diagnostics(config: dict[str, Any], get_env_value: Callable[[st
 
 
 def _effective_catalog_diagnostics() -> list[str]:
-    from agent.prerequisite_catalog import catalog_diagnostics
+    from agent.prerequisite.catalog import catalog_diagnostics
     from hermes_cli.config_backend import ConfigBackendUnavailable
     from hermes_cli.config_effective import load_user_config_effective
     from hermes_yaml import YAMLError

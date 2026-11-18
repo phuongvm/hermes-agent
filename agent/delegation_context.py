@@ -17,8 +17,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
 
-from agent.prerequisite_catalog import ProposalSelection
-from agent.prerequisite_workflow import child_proposal_selection
+from agent.prerequisite.catalog import ProposalSelection
+from agent.prerequisite.workflow import child_proposal_selection
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate

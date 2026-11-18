@@ -149,8 +149,9 @@ async def test_busy_skill_slash_runs_after_the_turn_already_admitted(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["fresh", "db-only", "redelivered", "expired", "cancelled", "capacity", "mismatch"])
 async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_path, monkeypatch, caplog, case):
-    from agent import prerequisite_workflow as workflow, skill_commands as skills
-    from agent.prerequisite_catalog import freeze_proposal_catalog
+    from agent import skill_commands as skills
+    from agent.prerequisite import workflow
+    from agent.prerequisite.catalog import freeze_proposal_catalog
     from datetime import UTC, datetime
 
     from gateway.platforms.event import MessageEvent, MessageType
@@ -281,7 +282,8 @@ async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_p
     ("backend-unavailable", "profile-config-unavailable"),
 ])
 async def test_idle_proposal_catalog_requires_original_dispatch_command(tmp_path, monkeypatch, caplog, case, reason):
-    from agent import prerequisite_workflow as workflow, skill_commands as skills
+    from agent import skill_commands as skills
+    from agent.prerequisite import workflow
     from gateway.platforms.event import MessageEvent
     from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
 

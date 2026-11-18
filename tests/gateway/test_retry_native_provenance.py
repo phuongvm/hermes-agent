@@ -85,7 +85,7 @@ async def test_retry_redispatch_admits_natively_under_session_authority(
         source._transport_adapter_ref = weakref.ref(adapter)
         entry = await runner.async_session_store.get_or_create_session(source)
         sid = entry.session_id
-        from agent.prerequisite_workflow import original_proposal_delivery
+        from agent.prerequisite.workflow import original_proposal_delivery
         from tests.tools.proposal_catalog_fixture import CHANGE
 
         resend_text = f'/openspec-propose {CHANGE}' if proposal else 'probe ask'

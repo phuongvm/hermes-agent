@@ -252,7 +252,7 @@ class GatewayInboundMixin(
                 self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
             return None
         if event is original and not executing_admission.get():
-            from agent.prerequisite_workflow import authenticate_proposal_command
+            from agent.prerequisite.workflow import authenticate_proposal_command
             authenticate_proposal_command(event, original_text)
         return event, source, False
 
@@ -1196,7 +1196,7 @@ class GatewayInboundMixin(
                 ]
                 if _disabled_extra:
                     return t("gateway.skills.stacked_disabled", names=", ".join(_disabled_extra), platform=_plat)
-            from agent.prerequisite_workflow import proposal_skill_receipt
+            from agent.prerequisite.workflow import proposal_skill_receipt
             on_resolved = proposal_skill_receipt(event, _quick_key, user_instruction, stacked=bool(extra_keys))
             if extra_keys and _build_stacked is not None:
                 stacked_result = _build_stacked(

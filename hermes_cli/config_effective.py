@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli import config as _config
 from hermes_cli import managed_scope
-from hermes_cli.config_backend import read_config_doc
+from hermes_cli.config_backend import read_config_doc, read_current_config_doc
 from hermes_cli.config_read_errors import _warn_config_parse_failure
 
 # path -> raw user mapping from the last successful parse in this process; served (through the
@@ -53,10 +53,7 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
 
 
 def _read_current_user_config(config_path: Path) -> dict[str, Any]:
-    try:
-        current = read_config_doc(config_path)
-    except FileNotFoundError:
-        return {}
+    current = read_current_config_doc(config_path)
     if current is not None and not isinstance(current, dict):
         raise TypeError("config.yaml root is not a mapping")
     return current or {}

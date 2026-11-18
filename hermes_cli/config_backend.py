@@ -234,6 +234,16 @@ class FileBackend:
     def read_user_doc(self, home: Path) -> Any:
         return self.read_path(self.config_path(home))
 
+    def read_current_user_doc(self, home: Path) -> Any:
+        """Return None for genuine absence, not a present entry that fails on open."""
+        path = self.config_path(home)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            path.parent.stat()  # Do not mistake an unreachable profile directory for an absent file.
+            return None
+        return self.read_path(path)
+
     def read_user_doc_readonly(self, home: Path) -> Any:
         return self.read_path_readonly(self.config_path(home))
 
@@ -429,6 +439,14 @@ def local_file_layer(config_path: PathLike) -> tuple[ConfigBackend, Path]:
 def read_config_doc(config_path: PathLike) -> Any:
     """Parsed root of a config file (None when empty); raises like ``open`` + ``fast_safe_load``."""
     backend, home = _route(config_path)
+    return backend.read_user_doc(home)
+
+
+def read_current_config_doc(config_path: PathLike) -> Any:
+    """Read through the active backend without treating a failed read as absence."""
+    backend, home = _route(config_path)
+    if isinstance(backend, FileBackend):
+        return backend.read_current_user_doc(home)
     return backend.read_user_doc(home)
 
 

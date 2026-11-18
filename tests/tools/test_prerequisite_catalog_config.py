@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.prerequisite_catalog import catalog_diagnostics
+from agent.prerequisite.catalog import catalog_diagnostics
 from tests.tools.proposal_catalog_fixture import profile_config, proposal_entry
 
 
@@ -60,7 +60,7 @@ def test_catalog_diagnostics_reject_unknown_workflow(tmp_path):
     "governance/guides/ai-native-documentation.md",
 ])
 def test_catalog_rejects_incomplete_proposal_declaration(key, tmp_path):
-    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog
+    from agent.prerequisite.catalog import InvalidCatalog, freeze_proposal_catalog
     from tests.tools.proposal_catalog_fixture import CHANGE
 
     entry = proposal_entry(tmp_path / "planning")
@@ -73,7 +73,7 @@ def test_catalog_rejects_incomplete_proposal_declaration(key, tmp_path):
 def test_catalog_selection_rejects_invalid_managed_layer_after_nonstrict_read(tmp_path, monkeypatch, caplog, invalid):
     from json import dumps
 
-    from agent.prerequisite_workflow import _selection
+    from agent.prerequisite.workflow import _selection
     from hermes_cli.config_effective import load_user_config_effective
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tests.tools.proposal_catalog_fixture import CHANGE
@@ -85,7 +85,7 @@ def test_catalog_selection_rejects_invalid_managed_layer_after_nonstrict_read(tm
     (home / "config.yaml").write_text(dumps(config), encoding="utf-8")
     (managed / "config.yaml").write_text(invalid, encoding="utf-8")
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
-    caplog.set_level("INFO", logger="agent.prerequisite_workflow")
+    caplog.set_level("INFO", logger="agent.prerequisite.workflow")
     token = set_hermes_home_override(str(home))
     try:
         assert load_user_config_effective()["prerequisite_catalog"] == config["prerequisite_catalog"]
@@ -100,7 +100,7 @@ def test_catalog_selection_rejects_invalid_managed_layer_after_nonstrict_read(tm
 def test_unreadable_managed_entry_is_not_absent(tmp_path, monkeypatch, caplog, entry_kind):
     from json import dumps
 
-    from agent.prerequisite_workflow import _selection
+    from agent.prerequisite.workflow import _selection
     from hermes_cli import managed_scope
     from hermes_cli.config_effective import load_user_config_effective
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -147,7 +147,7 @@ def test_unreadable_managed_entry_is_not_absent(tmp_path, monkeypatch, caplog, e
 
         monkeypatch.setattr(path_cls, "stat", stat)
         monkeypatch.setattr(path_cls, "open", open_file)
-    caplog.set_level("INFO", logger="agent.prerequisite_workflow")
+    caplog.set_level("INFO", logger="agent.prerequisite.workflow")
     token = set_hermes_home_override(str(home))
     try:
         assert load_user_config_effective()["prerequisite_catalog"] == config["prerequisite_catalog"]
@@ -164,11 +164,11 @@ def test_unreadable_managed_entry_is_not_absent(tmp_path, monkeypatch, caplog, e
     ({"prerequisite_catalog": {"openspec-propose": {"other-change": {}}}}, "change-not-configured"),
 ])
 def test_catalog_selection_reports_distinct_bounded_reasons(monkeypatch, caplog, config, reason):
-    from agent.prerequisite_workflow import _selection
+    from agent.prerequisite.workflow import _selection
     from tests.tools.proposal_catalog_fixture import CHANGE
 
     monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda **_: config)
-    caplog.set_level("INFO", logger="agent.prerequisite_workflow")
+    caplog.set_level("INFO", logger="agent.prerequisite.workflow")
     assert _selection(CHANGE) is None
     assert caplog.messages == [f"PREREQUISITE_SELECTION_UNAVAILABLE: {reason}"]
 
@@ -182,7 +182,7 @@ def test_catalog_selection_reports_distinct_bounded_reasons(monkeypatch, caplog,
 def test_managed_catalog_preserves_explicit_absence(tmp_path, monkeypatch, caplog, managed_value, reason):
     from json import dumps
 
-    from agent.prerequisite_workflow import _selection
+    from agent.prerequisite.workflow import _selection
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tests.tools.proposal_catalog_fixture import CHANGE, resource_pin
 
@@ -197,7 +197,7 @@ def test_managed_catalog_preserves_explicit_absence(tmp_path, monkeypatch, caplo
     (user / "config.yaml").write_text(dumps(user_config), encoding="utf-8")
     (managed / "config.yaml").write_text(dumps(managed_config), encoding="utf-8")
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
-    caplog.set_level("INFO", logger="agent.prerequisite_workflow")
+    caplog.set_level("INFO", logger="agent.prerequisite.workflow")
     token = set_hermes_home_override(str(user))
     try:
         from hermes_cli.config_effective import load_user_config_effective
@@ -217,7 +217,7 @@ def test_managed_catalog_preserves_explicit_absence(tmp_path, monkeypatch, caplo
 
 @pytest.mark.parametrize("path", ["docs/REQUIREMENTS.md", "design/ARCHITECTURE.md"])
 def test_catalog_accepts_explicit_nested_optional_document(tmp_path, path):
-    from agent.prerequisite_catalog import freeze_proposal_catalog
+    from agent.prerequisite.catalog import freeze_proposal_catalog
     from tests.tools.proposal_catalog_fixture import CHANGE, resource_pin
 
     entry = proposal_entry(tmp_path)
@@ -232,7 +232,7 @@ def test_catalog_accepts_explicit_nested_optional_document(tmp_path, path):
     ("/REQUIREMENTS.md", "relative-project-path-required"),
 ])
 def test_catalog_rejects_optional_documents_outside_planning_home(tmp_path, path, reason):
-    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog
+    from agent.prerequisite.catalog import InvalidCatalog, freeze_proposal_catalog
     from tests.tools.proposal_catalog_fixture import CHANGE, resource_pin
 
     entry = proposal_entry(tmp_path)
@@ -251,7 +251,7 @@ def test_catalog_rejects_optional_documents_outside_planning_home(tmp_path, path
     ("project/exploration", "OpenSpec/workspace/explorations/approved.md", "invalid-exploration-selection"),
 ])
 def test_catalog_layout_requires_exact_path_spelling(tmp_path, key, path, reason):
-    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog
+    from agent.prerequisite.catalog import InvalidCatalog, freeze_proposal_catalog
     from tests.tools.proposal_catalog_fixture import CHANGE
 
     entry = proposal_entry(tmp_path)
@@ -262,7 +262,7 @@ def test_catalog_layout_requires_exact_path_spelling(tmp_path, key, path, reason
 
 @pytest.mark.platforms("windows")
 def test_catalog_checks_metadata_for_each_directory_spelling(tmp_path, monkeypatch):
-    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog, verify_catalog_metadata
+    from agent.prerequisite.catalog import InvalidCatalog, freeze_proposal_catalog, verify_catalog_metadata
     from tests.tools.proposal_catalog_fixture import CHANGE, resource_pin
 
     entry = proposal_entry(tmp_path)
@@ -290,7 +290,7 @@ def test_catalog_rejects_unassigned_drive_before_metadata_io(tmp_path, monkeypat
     from dataclasses import replace
     from string import ascii_uppercase
 
-    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog, verify_catalog_metadata
+    from agent.prerequisite.catalog import InvalidCatalog, freeze_proposal_catalog, verify_catalog_metadata
     from tests.tools.proposal_catalog_fixture import CHANGE
 
     mask = windll.kernel32.GetLogicalDrives()
