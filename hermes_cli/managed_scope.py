@@ -61,12 +61,13 @@ def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
     import stat
 
     try:
-        mode = p.stat().st_mode
+        p.lstat()
     except FileNotFoundError:
         if override:
             raise
         return None
-    if not stat.S_ISDIR(mode):
+    # An existing link whose target cannot be reached is not an absent policy.
+    if not stat.S_ISDIR(p.stat().st_mode):
         raise NotADirectoryError("managed scope is not a directory")
     return p
 
@@ -120,10 +121,14 @@ def _load_managed_file(name: str, cache: dict[str, tuple], parse, *, strict: boo
     if managed_dir is None:
         return {}
     if strict:
+        path = managed_dir / name
         try:
-            parsed = parse(managed_dir / name)
+            path.lstat()
         except FileNotFoundError:
+            # Confirm the directory is still reachable before treating the file as absent.
+            managed_dir.stat()
             return {}
+        parsed = parse(path)
         if parsed is not None and not isinstance(parsed, dict):
             raise TypeError("managed config root is not a mapping")
     else:

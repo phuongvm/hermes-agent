@@ -208,7 +208,14 @@ def restore_proposal_command(ticket: _ProposalTicket, event, route, session_id, 
     event._proposal_command = _Command(ref(event), route, ticket.selection)
 
 
-_active: ContextVar[tuple[object, str, ProposalSelection] | None] = ContextVar(
+@dataclass(frozen=True, slots=True)
+class _ActiveProposal:
+    key: object
+    parent: str
+    selection: ProposalSelection
+
+
+_active: ContextVar[_ActiveProposal | None] = ContextVar(
     "hermes_proposal_command", default=None
 )
 _lock = RLock()
@@ -222,7 +229,7 @@ def proposal_turn(event, route, parent):
     binding = None
     if (type(command) is _Command and command.event() is event and command.route == route and parent
             and not event.internal and event.allow_gateway_control):
-        binding = (key, parent, command.selection)
+        binding = _ActiveProposal(key, parent, command.selection)
         with _lock:
             _live.add(key)
     token = _active.set(binding)
@@ -239,7 +246,7 @@ def retire_proposal_turn() -> None:
     binding = _active.get()
     if binding is not None:
         with _lock:
-            _live.discard(binding[0])
+            _live.discard(binding.key)
         _active.set(None)
 
 
@@ -255,23 +262,23 @@ def _child_targets_planning_home(task_id: str, planning_home: str) -> bool:
         cwd = get_session_cwd(task_id) or terminal_env("TERMINAL_CWD", "")
     except TerminalPolicyUnavailable:
         return False
-    # No process-cwd fallback, link resolution, or repo discovery can create a binding.
-    return bool(cwd and Path(cwd).is_absolute() and Path(cwd) == Path(planning_home))
+    # Normalize path syntax, but do not case-fold or resolve aliases: Windows can
+    # host case-sensitive directories even though WindowsPath equality folds case.
+    return bool(cwd and Path(cwd).is_absolute() and str(Path(cwd)) == str(Path(planning_home)))
 
 
 def child_proposal_selection(parent: str, *, child_task_id: str = "") -> ProposalSelection | None:
     """Intersect both served profiles; never union their resource scope."""
     binding = _active.get()
-    if binding is None or binding[1] != parent:
+    if binding is None or binding.parent != parent:
         return None
-    key, _, selection = binding
     with _lock:
-        if key not in _live:
+        if binding.key not in _live:
             return None
-    child = _selection(selection.change)
+    child = _selection(binding.selection.change)
     if child is None:
         return None
-    selection = selection.intersect(child)
+    selection = binding.selection.intersect(child)
     if selection is None:
         _unavailable("parent-child-catalog-mismatch")
         return None
@@ -284,4 +291,4 @@ def child_proposal_selection(parent: str, *, child_task_id: str = "") -> Proposa
         _unavailable(str(exc))
         return None
     with _lock:
-        return selection if key in _live else None
+        return selection if binding.key in _live else None

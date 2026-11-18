@@ -96,6 +96,67 @@ def test_catalog_selection_rejects_invalid_managed_layer_after_nonstrict_read(tm
         reset_hermes_home_override(token)
 
 
+@pytest.mark.parametrize("entry_kind", ["config", "default-directory"])
+def test_unreadable_managed_entry_is_not_absent(tmp_path, monkeypatch, caplog, entry_kind):
+    from json import dumps
+
+    from agent.prerequisite_workflow import _selection
+    from hermes_cli import managed_scope
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tests.tools.proposal_catalog_fixture import CHANGE
+
+    home, managed = tmp_path / "user", tmp_path / "managed"
+    home.mkdir()
+    config = profile_config(proposal_entry(tmp_path / "planning"))
+    (home / "config.yaml").write_text(dumps(config), encoding="utf-8")
+    link = managed
+    if entry_kind == "config":
+        managed.mkdir()
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        link = managed / "config.yaml"
+    else:
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+        monkeypatch.setattr(managed_scope, "_DEFAULT_MANAGED_DIR", managed)
+        monkeypatch.setattr(managed_scope, "_under_pytest", lambda: False)
+    token = set_hermes_home_override(str(home))
+    try:
+        assert _selection(CHANGE) is not None  # A genuinely absent entry is not an error.
+    finally:
+        reset_hermes_home_override(token)
+    try:
+        link.symlink_to(tmp_path / "missing-policy", target_is_directory=entry_kind == "default-directory")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        # Windows hosts without the symlink privilege can still check the loader's
+        # decision with a present entry whose filesystem operations cannot follow it.
+        link.touch()
+        path_cls = type(link)
+        original_stat, original_open = path_cls.stat, path_cls.open
+
+        def stat(path, *args, **kwargs):
+            if path == link and kwargs.get("follow_symlinks", True):
+                raise FileNotFoundError("missing fixture target")
+            return original_stat(path, *args, **kwargs)
+
+        def open_file(path, *args, **kwargs):
+            if path == link:
+                raise FileNotFoundError("missing fixture target")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(path_cls, "stat", stat)
+        monkeypatch.setattr(path_cls, "open", open_file)
+    caplog.set_level("INFO", logger="agent.prerequisite_workflow")
+    token = set_hermes_home_override(str(home))
+    try:
+        assert load_user_config_effective()["prerequisite_catalog"] == config["prerequisite_catalog"]
+        assert _selection(CHANGE) is None
+        assert caplog.messages == ["PREREQUISITE_SELECTION_UNAVAILABLE: profile-config-unavailable"]
+    finally:
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("config,reason", [
     ({}, "catalog-absent"),
     ({"prerequisite_catalog": {}}, "catalog-absent"),

@@ -283,6 +283,7 @@ def test_native_child_stop_fences_intent_during_startup(stop_at, stop_via, monke
     "different-child-workspace", "unknown-child-workspace", "one-sided-optional",
     "one-sided-reference", "stale-file-identity", "conflicting-optional",
     "same-optional", "child-only-optional",
+    pytest.param("workspace-case-mismatch", marks=pytest.mark.platforms("windows")),
 ])
 def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path, monkeypatch, captured_hook):
     from contextvars import copy_context
@@ -378,6 +379,8 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     if case == "different-child-workspace":
         child_workspace = tmp_path / "other-workspace"
         child_workspace.mkdir()
+    if case == "workspace-case-mismatch":
+        child_workspace = root.with_name("Planning")
     home_token = set_hermes_home_override(str(parent_home))
     try:
         with child_profile_scope(child):
