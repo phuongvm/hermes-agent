@@ -100,6 +100,40 @@ def test_managed_catalog_requires_readable_user_layer(tmp_path, monkeypatch, cap
     assert "missing-user-config" not in output
 
 
+def test_non_directory_home_rejects_managed_catalog(tmp_path, monkeypatch, caplog):
+    from json import dumps
+
+    from agent.prerequisite.workflow import _selection
+    from hermes_cli.config_check_diagnostics import _effective_catalog_diagnostics
+    from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
+
+    home, managed = tmp_path / "not-a-directory", tmp_path / "managed"
+    home.touch()
+    managed.mkdir()
+    (managed / "config.yaml").write_text(dumps(profile_config(proposal_entry(tmp_path / "planning"))), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    caplog.set_level("INFO", logger=_selection.__module__)
+    assert _selection(CHANGE) is None
+    assert "PREREQUISITE_SELECTION_UNAVAILABLE: profile-config-unavailable" in caplog.messages
+    # The full CLI already refuses this home at initialization, before catalog diagnostics.
+    assert _effective_catalog_diagnostics() == ["prerequisite_catalog: profile-config-unavailable"]
+
+
+def test_catalog_diagnostics_report_backend_read_conflict(monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli import config_backend
+    from hermes_cli.config_check_diagnostics import _effective_catalog_diagnostics
+
+    def read_conflict(home):
+        raise config_backend.ConfigWriteError("must-not-echo", code="config_version_conflict")
+
+    backend = SimpleNamespace(read_user_doc=read_conflict)
+    monkeypatch.setattr(config_backend, "get_config_backend", lambda: backend)
+    assert _effective_catalog_diagnostics() == ["prerequisite_catalog: profile-config-unavailable"]
+
+
 def test_config_check_and_migrate_agree_on_stale_platform_toolsets(tmp_path, monkeypatch, capsys):
     # Only a plugin MCP server named 'portable' exists; keep host-installed plugins out of the verdict.
     monkeypatch.setattr(plugins_mod, "get_plugin_toolset_keys_nowait", set)

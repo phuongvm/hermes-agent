@@ -280,6 +280,7 @@ async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_p
     ("explicit", None), ("hook-rewrite", None), ("wrong-skill", "resolved-skill-mismatch"),
     ("missing-selector", "invalid-change-selector"), ("ambiguous-selector", "invalid-change-selector"),
     ("backend-unavailable", "profile-config-unavailable"),
+    ("backend-read-conflict", "profile-config-unavailable"),
 ])
 async def test_idle_proposal_catalog_requires_original_dispatch_command(tmp_path, monkeypatch, caplog, case, reason):
     from agent import skill_commands as skills
@@ -290,7 +291,8 @@ async def test_idle_proposal_catalog_requires_original_dispatch_command(tmp_path
     render = skills.build_skill_invocation_message
     _skill(monkeypatch)
     monkeypatch.setattr(skills, "build_skill_invocation_message", render)
-    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli import config_backend
+    from hermes_cli.config_effective import load_user_config_effective
 
     argument = "" if case == "missing-selector" else f"{CHANGE} must-not-echo" if case == "ambiguous-selector" else CHANGE
     command = f"/openspec-propose {argument}".rstrip()
@@ -310,7 +312,15 @@ async def test_idle_proposal_catalog_requires_original_dispatch_command(tmp_path
     def load_catalog(*, fail_closed, strict_managed):
         assert fail_closed is True and strict_managed is True
         if case == "backend-unavailable":
-            raise ConfigBackendUnavailable("must-not-echo")
+            raise config_backend.ConfigBackendUnavailable("must-not-echo")
+        if case == "backend-read-conflict":
+            def read_conflict(home):
+                raise config_backend.ConfigWriteError("must-not-echo", code="config_version_conflict")
+
+            with monkeypatch.context() as scope:
+                backend = SimpleNamespace(read_user_doc=read_conflict)
+                scope.setattr(config_backend, "get_config_backend", lambda: backend)
+                return load_user_config_effective(tmp_path / "config.yaml", fail_closed=True, strict_managed=True)
         return profile_config(entry)
 
     monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", load_catalog)
@@ -341,6 +351,8 @@ async def test_idle_proposal_catalog_requires_original_dispatch_command(tmp_path
     assert (selection is not None) == (case == "explicit")
     messages = [message for message in caplog.messages if message.startswith("PREREQUISITE_SELECTION_UNAVAILABLE:")]
     assert messages == ([f"PREREQUISITE_SELECTION_UNAVAILABLE: {reason}"] if reason else [])
+    if case == "backend-read-conflict":
+        assert "must-not-echo" not in caplog.text
 
 
 @pytest.mark.asyncio

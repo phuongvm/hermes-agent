@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -58,8 +59,6 @@ def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
         p = _DEFAULT_MANAGED_DIR
     if not strict:
         return p if p.is_dir() else None
-    import stat
-
     try:
         p.lstat()
     except FileNotFoundError:
@@ -125,8 +124,8 @@ def _load_managed_file(name: str, cache: dict[str, tuple], parse, *, strict: boo
         try:
             path.lstat()
         except FileNotFoundError:
-            # Confirm the directory is still reachable before treating the file as absent.
-            managed_dir.stat()
+            if not stat.S_ISDIR(managed_dir.stat().st_mode):
+                raise NotADirectoryError("managed scope is not a directory")
             return {}
         parsed = parse(path)
         if parsed is not None and not isinstance(parsed, dict):

@@ -24,6 +24,7 @@ import contextvars
 import importlib
 import os
 import re
+import stat
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -240,7 +241,8 @@ class FileBackend:
         try:
             path.lstat()
         except FileNotFoundError:
-            path.parent.stat()  # Do not mistake an unreachable profile directory for an absent file.
+            if not stat.S_ISDIR(path.parent.stat().st_mode):
+                raise NotADirectoryError("profile home is not a directory")
             return None
         return self.read_path(path)
 
@@ -447,7 +449,11 @@ def read_current_config_doc(config_path: PathLike) -> Any:
     backend, home = _route(config_path)
     if isinstance(backend, FileBackend):
         return backend.read_current_user_doc(home)
-    return backend.read_user_doc(home)
+    try:
+        return backend.read_user_doc(home)
+    except ConfigWriteError:
+        # The remote backend can refuse a read when it cannot obtain a consistent snapshot.
+        raise ConfigBackendUnavailable("Cannot read current profile configuration") from None
 
 
 def read_config_doc_readonly(config_path: PathLike) -> Any:

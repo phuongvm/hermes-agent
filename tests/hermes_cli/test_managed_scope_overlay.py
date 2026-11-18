@@ -42,3 +42,14 @@ def test_overlay_preserves_user_siblings(managed):
     assert out["display"]["show_reasoning"] is True
 
 
+def test_strict_overlay_rejects_managed_directory_replaced_by_file(managed, monkeypatch):
+    from hermes_cli import managed_scope
+
+    managed.rmdir()
+    managed.touch()
+    # Model the directory being replaced after the initial strict lookup.
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda *, strict: managed)
+    with pytest.raises(NotADirectoryError):
+        managed_scope.load_managed_config(strict=True)
+
+
