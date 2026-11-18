@@ -243,6 +243,48 @@ def test_catalog_rejects_optional_documents_outside_planning_home(tmp_path, path
 
 
 @pytest.mark.platforms("windows")
+@pytest.mark.parametrize("key,path,reason", [
+    ("governance/shared/safety.md", "Rules/shared/safety.md", "unexpected-governance-resource"),
+    ("reference/verification-before-claim/references/completion-gate.md",
+     "Skills/verification-before-claim/references/completion-gate.md", "reference-outside-pinned-skill"),
+    ("project/agent-share", "OpenSpec/workspace/sessions/agent_share.md", "unexpected-project-resource"),
+    ("project/exploration", "OpenSpec/workspace/explorations/approved.md", "invalid-exploration-selection"),
+])
+def test_catalog_layout_requires_exact_path_spelling(tmp_path, key, path, reason):
+    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog
+    from tests.tools.proposal_catalog_fixture import CHANGE
+
+    entry = proposal_entry(tmp_path)
+    entry["resources"][key]["path"] = path if key.startswith("project/") else str(tmp_path / path)
+    with pytest.raises(InvalidCatalog, match=f"^{reason}$"):
+        freeze_proposal_catalog(CHANGE, entry)
+
+
+@pytest.mark.platforms("windows")
+def test_catalog_checks_metadata_for_each_directory_spelling(tmp_path, monkeypatch):
+    from agent.prerequisite_catalog import InvalidCatalog, freeze_proposal_catalog, verify_catalog_metadata
+    from tests.tools.proposal_catalog_fixture import CHANGE, resource_pin
+
+    entry = proposal_entry(tmp_path)
+    entry["resources"]["project/architecture"] = resource_pin(tmp_path, "docs/architecture.md")
+    entry["resources"]["project/requirements"] = resource_pin(tmp_path, "docs/requirements.md")
+    entry["resources"]["project/requirements"]["path"] = "Docs/requirements.md"
+    selection = freeze_proposal_catalog(CHANGE, entry)
+    original_lstat = type(tmp_path).lstat
+
+    def check_spelling(path):
+        if str(path) == str(tmp_path / "Docs"):
+            raise PermissionError("fixture directory metadata unavailable")
+        if str(path) == str(tmp_path / "Docs/requirements.md"):
+            return original_lstat(tmp_path / "docs/requirements.md")
+        return original_lstat(path)
+
+    monkeypatch.setattr(type(tmp_path), "lstat", check_spelling)
+    with pytest.raises(InvalidCatalog, match="^resource-metadata-unavailable$"):
+        verify_catalog_metadata(selection)
+
+
+@pytest.mark.platforms("windows")
 def test_catalog_rejects_unassigned_drive_before_metadata_io(tmp_path, monkeypatch):
     from ctypes import windll
     from dataclasses import replace

@@ -132,6 +132,14 @@ def proposal_skill_receipt(event, route, argument, *, stacked: bool) -> Callable
     return resolved
 
 
+def _matches_pinned_path(candidate: object, pinned: str) -> bool:
+    """Compare absolute path spellings without resolving aliases or folding case."""
+    if not isinstance(candidate, str):
+        return False
+    path = Path(candidate)
+    return path.is_absolute() and path.parts == Path(pinned).parts
+
+
 def note_proposal_command(event, route, skill, argument, skill_path):
     """Called after successful skill resolution on the authorized inbound command path."""
     receipt = vars(event).pop("_authenticated_proposal_command", None)
@@ -148,7 +156,7 @@ def note_proposal_command(event, route, skill, argument, skill_path):
     selection = _selection(argument)
     if selection is not None:
         pin = next(pin for pin in selection.resources if pin.key == f"skill/{WORKFLOW}")
-        if not isinstance(skill_path, str) or Path(skill_path) != Path(pin.path):
+        if not _matches_pinned_path(skill_path, pin.path):
             _unavailable("resolved-skill-mismatch")
             return
         event._proposal_command = _Command(ref(event), route, selection)
@@ -262,9 +270,7 @@ def _child_targets_planning_home(task_id: str, planning_home: str) -> bool:
         cwd = get_session_cwd(task_id) or terminal_env("TERMINAL_CWD", "")
     except TerminalPolicyUnavailable:
         return False
-    # Normalize path syntax, but do not case-fold or resolve aliases: Windows can
-    # host case-sensitive directories even though WindowsPath equality folds case.
-    return bool(cwd and Path(cwd).is_absolute() and str(Path(cwd)) == str(Path(planning_home)))
+    return _matches_pinned_path(cwd, planning_home)
 
 
 def child_proposal_selection(parent: str, *, child_task_id: str = "") -> ProposalSelection | None:

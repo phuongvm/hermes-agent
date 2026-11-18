@@ -11,8 +11,12 @@ from tests.waiting import async_wait_until
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("explicit", [True, False], ids=["original-command", "plain-text"])
-async def test_gateway_proposal_command_reaches_native_child_hook(tmp_path, monkeypatch, explicit):
+@pytest.mark.parametrize("explicit,case_mismatch", [
+    pytest.param(True, False, id="original-command"),
+    pytest.param(False, False, id="plain-text"),
+    pytest.param(True, True, id="skill-case-mismatch", marks=pytest.mark.platforms("windows")),
+])
+async def test_gateway_proposal_command_reaches_native_child_hook(tmp_path, monkeypatch, caplog, explicit, case_mismatch):
     from agent.turn_context import _collect_pre_llm_call_context
     from gateway.platforms.event import MessageEvent, MessageType
     from hermes_cli.plugins import PluginManager
@@ -32,6 +36,9 @@ async def test_gateway_proposal_command_reaches_native_child_hook(tmp_path, monk
     data = (f"---\nname: openspec-propose\ndescription: Offline test skill\n---\n\n{marker}\n").encode()
     skill.write_bytes(data)
     pin.update(size=len(data), sha256=sha256(data).hexdigest())
+    if case_mismatch:
+        pin["path"] = str(planning / "Skills/openspec-propose/SKILL.md")
+        caplog.set_level("INFO", logger="agent.prerequisite_workflow")
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", planning / "skills")
     monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda _: None)
     config = profile_config(entry)
@@ -87,8 +94,10 @@ async def test_gateway_proposal_command_reaches_native_child_hook(tmp_path, monk
     assert record.goal_text == GOAL
     assert record.context_hash == sha256(CONTEXT.encode()).hexdigest()
     selection = record.proposal_selection
-    if not explicit:
+    if not explicit or case_mismatch:
         assert selection is None
+        if case_mismatch:
+            assert "PREREQUISITE_SELECTION_UNAVAILABLE: resolved-skill-mismatch" in caplog.messages
         return
     assert selection is not None
     assert (selection.change, selection.planning_home) == (CHANGE, str(planning))
@@ -121,6 +130,6 @@ async def test_gateway_proposal_command_reaches_native_child_hook(tmp_path, monk
         "snapshot/instructions/specs", "snapshot/instructions/tasks",
     }
     initiating_skill = next(pin for pin in selection.resources if pin.key == "skill/openspec-propose")
-    assert Path(initiating_skill.path) == skill
+    assert initiating_skill.path == str(skill)
     assert initiating_skill.sha256 == sha256(data).hexdigest()
     assert set(selection.absent_optional) == {"project/requirements", "project/architecture"}

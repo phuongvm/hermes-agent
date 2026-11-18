@@ -149,16 +149,17 @@ def _resource(key: str, row: Any, home: Path, change: str) -> ResourcePin:
         raise InvalidCatalog("invalid-resource")
     absolute = _local_path(row["path"], home if key.startswith(("project/", "baseline/", "snapshot/")) else None)
     expected = PROJECT_DOCUMENTS.get(key)
-    if key in OPTIONAL_DOCUMENTS and (absolute == home or absolute.suffix.lower() not in {".md", ".txt"}):
+    if key in OPTIONAL_DOCUMENTS and (absolute.parts == home.parts or absolute.suffix.lower() not in {".md", ".txt"}):
         raise InvalidCatalog("unexpected-project-resource")
     if key.startswith("baseline/"):
         expected = f"openspec/specs/{key.removeprefix('baseline/')}/spec.md"
     if key in SNAPSHOTS:
         expected = f"openspec/workspace/prerequisites/{change}/{key.removeprefix('snapshot/')}.json"
-    if expected is not None and absolute != home / expected:
+    if expected is not None and absolute.parts != (home / expected).parts:
         raise InvalidCatalog("unexpected-project-resource")
     if key in {"project/exploration", "project/receipt"}:
-        if absolute.suffix.lower() != ".md" or not absolute.is_relative_to(home / "openspec/workspace/explorations"):
+        root_parts = (home / "openspec/workspace/explorations").parts
+        if absolute.suffix.lower() != ".md" or absolute.parts[:len(root_parts)] != root_parts:
             raise InvalidCatalog("invalid-exploration-selection")
     if key.startswith("reference/"):
         if absolute.suffix.lower() not in {".md", ".txt"}:
@@ -204,13 +205,14 @@ def freeze_proposal_catalog(change: str, entry: Any) -> ProposalSelection:
     governance_root = Path(by_key["governance/AGENTS.md"].path).parent
     for pin in pins:
         path = Path(pin.path)
-        if pin.key.startswith("governance/") and path != governance_root / pin.key.removeprefix("governance/"):
+        if (pin.key.startswith("governance/")
+                and path.parts != (governance_root / pin.key.removeprefix("governance/")).parts):
             raise InvalidCatalog("unexpected-governance-resource")
         if pin.key.startswith("skill/") and (path.parent.name, path.name) != (pin.key.removeprefix("skill/"), "SKILL.md"):
             raise InvalidCatalog("unexpected-skill-resource")
         if pin.key.startswith("reference/"):
             _, skill, name = pin.key.split("/", 2)
-            if Path(pin.path) != Path(by_key[f"skill/{skill}"].path).parent / name:
+            if path.parts != (Path(by_key[f"skill/{skill}"].path).parent / name).parts:
                 raise InvalidCatalog("reference-outside-pinned-skill")
     if len({(pin.device, pin.inode) for pin in pins}) != len(pins):
         raise InvalidCatalog("duplicate-resource-identity")
@@ -223,7 +225,7 @@ def freeze_proposal_catalog(change: str, entry: Any) -> ProposalSelection:
 
 def verify_catalog_metadata(selection: ProposalSelection) -> None:
     """Reject missing or stale identities without reading content. Dispatch must recheck."""
-    checked_dirs: set[Path] = set()
+    checked_dirs: set[tuple[str, ...]] = set()
     checked_volumes: set[str] = set()
 
     def inspect(path: Path):
@@ -242,10 +244,10 @@ def verify_catalog_metadata(selection: ProposalSelection) -> None:
                     raise InvalidCatalog("nonlocal-volume")
                 checked_volumes.add(path.anchor)
             for parent in reversed(path.parents):
-                if parent not in checked_dirs:
+                if parent.parts not in checked_dirs:
                     if not stat.S_ISDIR(inspect(parent).st_mode):
                         raise InvalidCatalog("invalid-resource-parent")
-                    checked_dirs.add(parent)
+                    checked_dirs.add(parent.parts)
             info = inspect(path)
             if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size) != (
                 pin.device, pin.inode, pin.size,
