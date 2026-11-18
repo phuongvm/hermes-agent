@@ -57,9 +57,16 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
     try:
         from agent.verify_hooks import max_verify_nudges
         from hermes_cli.lifecycle import has_hook
-        from hermes_cli.plugins import get_pre_verify_continue_message
+        from hermes_cli.plugins import PRE_VERIFY_NO_EDITS, get_pre_verify_continue_message
 
-        if _edited and has_hook("pre_verify") and attempt < max_verify_nudges():
+        extra = {}
+        if not _edited:
+            from agent.delegation_context import current_task_intent
+            intent = current_task_intent(getattr(agent, "session_id", "") or "", getattr(agent, "_parent_session_id", "") or "")
+            if intent is None:
+                return None
+            extra["no_edit_assignment_id"] = intent.assignment_id
+        if has_hook("pre_verify" if _edited else PRE_VERIFY_NO_EDITS) and attempt < max_verify_nudges():
             # Posture is fixed for the session — resolve once + cache.
             coding = getattr(agent, "_resolved_is_coding", None)
             if coding is None:
@@ -70,7 +77,7 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
                 session_id=getattr(agent, "session_id", None) or "",
                 platform=getattr(agent, "platform", "") or "",
                 model=getattr(agent, "model", "") or "", coding=coding, attempt=attempt,
-                final_response=final_response, changed_paths=_edited,
+                final_response=final_response, changed_paths=_edited, **extra,
             )
     except Exception:
         logger.debug("pre_verify hook check failed", exc_info=True)

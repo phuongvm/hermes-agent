@@ -768,6 +768,10 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
                 _facade().logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
+    def register_pre_verify_no_edits(self, callback: Callable) -> PluginRegistration:
+        """Opt in to bounded stop checks for native assignments with no recorded edits."""
+        return self.register_hook(_facade().PRE_VERIFY_NO_EDITS, callback)
+
     def register_hook(self, hook_name: str, callback: Callable, *, hold_stream: bool = False) -> PluginRegistration:
         """Register a lifecycle hook callback (``PluginDispatchMixin.track_hook``)."""
         return self._manager.track_hook(self, hook_name, callback, hold_stream=hold_stream)

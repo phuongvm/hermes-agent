@@ -687,6 +687,7 @@ def _parse_pre_llm_call(data: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 _RESPONSE_PARSERS: dict[str, Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = {
     "pre_tool_call": _parse_pre_tool_call, "pre_verify": _parse_pre_verify, "pre_llm_call": _parse_pre_llm_call,
+    "pre_verify_no_edits": _parse_pre_verify,
 }
 
 
