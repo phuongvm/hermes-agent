@@ -1634,6 +1634,14 @@ The kanban lifecycle hooks fire **after** the board DB change commits, so a call
 
 The **API request hooks** are observers for the raw provider request, one level below the per-turn `pre_llm_call` / `post_llm_call` pair: a single turn that calls tools makes several API requests, and these hooks fire around each one. They exist for observability plugins (tracing, cost accounting, latency dashboards). The `request` and `response` kwargs are sanitized, size-capped JSON views of the provider payload (sensitive keys redacted, long strings truncated, SDK objects normalized), and `usage` is a plain token-summary dict. Every payload carries the correlation fields `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count`, so a plugin can stitch requests, tool calls, and turns together. `api_request_error` fires when a provider call raises and adds `status_code`, `retry_count` / `max_retries`, `retryable`, `reason`, and an `error` dict with `type` and `message`.
 
+### Checking a native assignment with no recorded edits
+
+Use `ctx.register_pre_verify_no_edits(callback)` if your plugin needs to check a native assignment even when a write failed before the host recorded a changed path. Subscribing to `pre_verify` alone does not opt in. To support older hosts, check that this registration method exists before calling it.
+
+At a text-response stop with no recorded edits, Hermes checks for an active native assignment bound to the current session and its parent. Without that binding, the no-edit hook does not fire. With the binding, the callback receives `assignment_id`, `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, and `changed_paths=[]`. The empty list means **no edits were recorded**, not that the assignment succeeded or failed. Compare `assignment_id` with the assignment your plugin is supervising before requesting another turn.
+
+Return `None` to leave the stop unchanged, or `{"action": "continue", "message": "..."}` to request another turn. The edited and no-edit paths share the same per-turn nudge limit (`agent.max_verify_nudges`): the hook is not called when `attempt` reaches `max_verify_nudges()`. A turn with recorded edits follows the existing `pre_verify` path instead.
+
 ### Where each hook fires {#hook-fire-sites}
 
 Every name in `hermes_cli.plugins.VALID_HOOKS` has at least one core fire site. This table names the function that fires each one, so you can read the exact call and payload. Paths are relative to the repository root. When you add a hook, add its row here in the same change.
@@ -1650,7 +1658,8 @@ Every name in `hermes_cli.plugins.VALID_HOOKS` has at least one core fire site. 
 | `on_stream_start` / `on_stream_end` | `agent/stream_delivery.py` `StreamDeliveryMixin._emit_stream_start` / `_emit_stream_end` |
 | `on_stream_delta` | `agent/stream_delivery.py` `StreamDeliveryMixin._fire_stream_delta` (text) and `_fire_reasoning_delta` (reasoning) |
 | `on_interim_message` | `agent/stream_delivery.py` `StreamDeliveryMixin._emit_interim_assistant_message` |
-| `pre_verify` | `hermes_cli/plugins.py` `get_pre_verify_continue_message`, called from `agent/turn_stop_gates.py` `_pre_verify_nudge` |
+| `pre_verify` | `hermes_cli/plugins.py` `get_pre_verify_continue_message`, called from `agent/turn_stop_gates.py` `_pre_verify_nudge` when the turn has recorded edits |
+| `pre_verify_no_edits` | `agent/turn_stop_gates.py` `_pre_verify_nudge` calls `hermes_cli/plugins.py` `get_pre_verify_continue_message` when a native assignment has no recorded edits and a plugin has opted in |
 | `pre_api_request` | `agent/turn_api_request.py` `_fire_pre_api_request_hook` |
 | `post_api_request` | `agent/turn_response_intake.py` `_fire_post_api_request_hook` |
 | `api_request_error` | `agent/api_request_hooks.py` `ApiRequestHooksMixin._invoke_api_request_error_hook` |
