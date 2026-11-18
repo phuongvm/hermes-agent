@@ -19,7 +19,6 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run import GatewayRunner
 from gateway.run_runtime import initialize_gateway_runtime
 from gateway.runtime_ownership import process_ownership
 from gateway.session import SessionSource
@@ -56,6 +55,8 @@ def _reserve_homes(tmp_path, monkeypatch, names=('beta',)):
 
 
 def _runner(root, homes):
+    from gateway.run import GatewayRunner
+
     config = GatewayConfig()
     config.multiplex_profiles = True
     config._runtime_profile_homes = tuple(homes)
@@ -63,8 +64,9 @@ def _runner(root, homes):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("proposal", [False, True], ids=["ordinary", "proposal"])
 async def test_retry_redispatch_admits_natively_under_session_authority(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, proposal):
     root, homes = _reserve_homes(tmp_path, monkeypatch)
     runner = _runner(root, homes)
     process_ownership.reserve([home for _, home in homes])
@@ -83,15 +85,28 @@ async def test_retry_redispatch_admits_natively_under_session_authority(
         source._transport_adapter_ref = weakref.ref(adapter)
         entry = await runner.async_session_store.get_or_create_session(source)
         sid = entry.session_id
+        from agent.prerequisite_workflow import original_proposal_delivery
+        from tests.tools.proposal_catalog_fixture import CHANGE
+
+        resend_text = f'/openspec-propose {CHANGE}' if proposal else 'probe ask'
         runner.session_store.append_to_transcript(
-            sid, {'role': 'user', 'content': 'probe ask'})
+            sid, {'role': 'user', 'content': resend_text})
         runner.session_store.append_to_transcript(
             sid, {'role': 'assistant', 'content': 'probe answer'})
 
         seen = []
 
         async def spy_handle_message(event):
+            assert event.text == resend_text
             prov = capture_provenance(runner, event)
+            if proposal:
+                # Slash commands pass the ingress gate before dispatch; the native
+                # text envelope below intentionally refuses undispatched commands.
+                admitted = await runner._hm_admit_event(event)
+                assert admitted is not None
+                assert not hasattr(admitted[0], '_authenticated_proposal_command')
+                seen.append(('command', prov is not None))
+                return 'spy-ok'
             try:
                 payload = await prepare_native(runner, event)
                 seen.append(('prepared',
@@ -107,8 +122,11 @@ async def test_retry_redispatch_admits_natively_under_session_authority(
             text='/retry', message_type=MessageType.TEXT, source=source,
             message_id='probe-msg')
         with native_callback(runner, retry_event, root, None):
-            await runner._handle_retry_command(retry_event)
+            await original_proposal_delivery(runner._handle_retry_command)(retry_event)
 
+        if proposal:
+            assert seen == [('command', True)]
+            return
         assert seen, 'the re-dispatched turn was never admitted'
         assert seen[0][0] == 'prepared', f'retry was refused: {seen}'
         assert seen[0][1] is True, 'provenance not resolved on re-dispatch'

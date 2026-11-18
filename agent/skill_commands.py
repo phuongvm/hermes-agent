@@ -7,7 +7,7 @@ import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from hermes_constants import display_hermes_home
 from agent.prompt_cache_boundary import register_stable_prefix
@@ -888,15 +888,21 @@ def resolve_slash_key(command: str, table: Mapping[str, Any]) -> Optional[str]:
 
 def build_skill_invocation_message(
     cmd_key: str, user_instruction: str = "", task_id: str | None = None, runtime_note: str = "",
+    *, on_resolved: Callable[[str, str | None], None] | None = None,
 ) -> Optional[str]:
-    """Build the user message for a skill slash command, or None if not found."""
+    """Build a skill slash message and optionally report the skill actually rendered."""
     skill_info = get_interactive_skill_commands().get(cmd_key)
     loaded = _load_skill_payload(skill_info.get("skill_identifier") or skill_info["skill_dir"], task_id=task_id) if skill_info else None
     if not loaded:
         return None
     note = (f'[IMPORTANT: The user has invoked the "{loaded[2]}" skill, indicating they want '
             "you to follow its instructions. The full skill content is loaded below.]")
-    return _render_skill_block(loaded, note, task_id, user_instruction=user_instruction, runtime_note=runtime_note)
+    message = _render_skill_block(loaded, note, task_id, user_instruction=user_instruction, runtime_note=runtime_note)
+    if message and on_resolved is not None:
+        # Only a directory skill can satisfy a catalog's explicit SKILL.md pin.
+        directory = loaded[0].get("skill_dir")
+        on_resolved(loaded[2], str(Path(directory) / "SKILL.md") if isinstance(directory, str) and directory else None)
+    return message
 
 
 # Stacked slash-skill invocations — `/skill-a /skill-b do XYZ` loads every

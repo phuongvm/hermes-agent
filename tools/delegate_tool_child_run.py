@@ -1083,7 +1083,7 @@ class _ChildRun:
                 actor_session_id=getattr(child, "session_id", ""),
                 parent_session_id=getattr(self.parent_agent, "session_id", ""),
                 goal=self.goal, context=getattr(child, "_delegate_context", None), resumed=bool(resume),
-                handoff=getattr(child, "_delegate_intent_handoff", None), owner=child,
+                handoff=getattr(child, "_delegate_intent_handoff", None), owner=child, child_task_id=self.child_task_id,
             ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,

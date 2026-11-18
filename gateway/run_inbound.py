@@ -1196,6 +1196,8 @@ class GatewayInboundMixin(
                 ]
                 if _disabled_extra:
                     return t("gateway.skills.stacked_disabled", names=", ".join(_disabled_extra), platform=_plat)
+            from agent.prerequisite_workflow import proposal_skill_receipt
+            on_resolved = proposal_skill_receipt(event, _quick_key, user_instruction, stacked=bool(extra_keys))
             if extra_keys and _build_stacked is not None:
                 stacked_result = _build_stacked(
                     [cmd_key, *extra_keys], stacked_instruction, task_id=_quick_key,
@@ -1204,11 +1206,11 @@ class GatewayInboundMixin(
                     return t("gateway.skills.stacked_load_failed", command=command)
                 event.text, _loaded, _missing = stacked_result
             else:
-                msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=_quick_key)
+                if on_resolved is None:
+                    msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=_quick_key)
+                else:
+                    msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=_quick_key, on_resolved=on_resolved)
                 if msg:
-                    if _skill_name == "openspec-propose" and not extra_keys:
-                        from agent.prerequisite_workflow import note_proposal_command
-                        note_proposal_command(event, _quick_key, _skill_name, user_instruction, skill_cmds[cmd_key].get("skill_md_path"))
                     event.text = msg
             # Fall through to normal message processing with skill content
         except Exception as e:

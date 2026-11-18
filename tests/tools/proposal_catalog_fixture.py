@@ -17,10 +17,11 @@ GOVERNANCE_PATHS = (
     "AGENTS.md", "shared/startup-rules.md", "shared/safety.md", "skills/task-verification-mandate.md",
     "shared/rules-index.md", "user/communication-language.md", "shared/lessons-digest.md",
     "skills/anti-deception-instruction.md", "skills/compliance-enforcer.md",
+    "workflow/plan-execution-standards.md", "guides/ai-native-documentation.md",
 )
 SKILL_NAMES = (
     "verification-before-claim", "openspec-propose", "openspec-workflow-governance", "codebase-design",
-    "deep-reference-protocol", "ai-agent-collaboration", "hermes-agent",
+    "deep-reference-protocol", "ai-agent-collaboration", "hermes-agent", "hermes-boot-protocol",
 )
 BASELINE_NAMES = ("nerve-crew-dod-and-role-handoff", "nerve-reflex-resilience")
 PROJECT_PATHS = {

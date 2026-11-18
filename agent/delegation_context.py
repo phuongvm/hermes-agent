@@ -89,7 +89,7 @@ def stop_child_task_intent(child) -> None:
 @contextmanager
 def native_task_intent(
     *, actor_session_id: str, parent_session_id: str, goal: str, context: str | None,
-    resumed: bool = False, handoff: _ResumeIntent | None = None, owner=None,
+    resumed: bool = False, handoff: _ResumeIntent | None = None, owner=None, child_task_id: str = "",
 ) -> Iterator[TaskIntent | None]:
     """Bind separate native producer inputs, never deserialize a model envelope.
 
@@ -108,7 +108,7 @@ def native_task_intent(
         else:
             record = TaskIntent(
                 1, uuid4().hex, actor_session_id, parent_session_id, goal, goal_hash, context_hash,
-                child_proposal_selection(parent_session_id),
+                child_proposal_selection(parent_session_id, child_task_id=child_task_id),
             )
     scope = object()
     with _ACTIVE_LOCK:

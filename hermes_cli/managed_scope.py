@@ -42,7 +42,7 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
-def get_managed_dir() -> Optional[Path]:
+def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
     """Resolve the managed-scope directory, or None when no scope is present.
 
     Priority: ``$HERMES_MANAGED_DIR`` (IT-only bootstrap override; never persisted to any .env;
@@ -56,7 +56,19 @@ def get_managed_dir() -> Optional[Path]:
         return None
     else:
         p = _DEFAULT_MANAGED_DIR
-    return p if p.is_dir() else None
+    if not strict:
+        return p if p.is_dir() else None
+    import stat
+
+    try:
+        mode = p.stat().st_mode
+    except FileNotFoundError:
+        if override:
+            raise
+        return None
+    if not stat.S_ISDIR(mode):
+        raise NotADirectoryError("managed scope is not a directory")
+    return p
 
 
 def invalidate_managed_cache() -> None:
@@ -104,10 +116,18 @@ def _cached_read(path: Path, cache: dict[str, tuple], parse, *, strict: bool = F
 
 
 def _load_managed_file(name: str, cache: dict[str, tuple], parse, *, strict: bool = False) -> dict:
-    managed_dir = get_managed_dir()
+    managed_dir = get_managed_dir(strict=True) if strict else get_managed_dir()
     if managed_dir is None:
         return {}
-    parsed = _cached_read(managed_dir / name, cache, parse, strict=strict)
+    if strict:
+        try:
+            parsed = parse(managed_dir / name)
+        except FileNotFoundError:
+            return {}
+        if parsed is not None and not isinstance(parsed, dict):
+            raise TypeError("managed config root is not a mapping")
+    else:
+        parsed = _cached_read(managed_dir / name, cache, parse)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -119,7 +139,7 @@ def load_managed_config(*, strict: bool = False) -> dict:
 
     if not get_config_backend().honors_managed_config():
         return {}
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {},
+    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")),
                               strict=strict)
 
 
@@ -135,7 +155,7 @@ def _parse_managed_env(path: Path) -> dict[str, str]:
     return load_env_file(path)
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, *, strict: bool = False) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
@@ -145,7 +165,7 @@ def apply_managed_overlay(config: dict) -> dict:
     ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
     """
     try:
-        managed = load_managed_config()
+        managed = load_managed_config(strict=True) if strict else load_managed_config()
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
@@ -159,6 +179,8 @@ def apply_managed_overlay(config: dict) -> dict:
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded)
     except Exception:
+        if strict:
+            raise
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
 

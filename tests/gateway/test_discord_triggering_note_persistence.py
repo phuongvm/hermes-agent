@@ -97,23 +97,26 @@ async def test_queued_followup_persists_authored_text_and_retires_proposal_bindi
     from contextvars import copy_context
 
     from agent.prerequisite_workflow import (
-        authenticate_proposal_command, child_proposal_selection, note_proposal_command, proposal_turn,
+        _original_delivery_scope, authenticate_proposal_command, child_proposal_selection,
+        note_proposal_command, proposal_turn,
     )
     from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
 
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "planning"))
     config = profile_config(proposal_entry(tmp_path / "planning"))
-    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *, fail_closed: config)
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *, fail_closed, strict_managed: config)
     opener = MessageEvent(text=f"/openspec-propose {CHANGE}", source=source)
-    authenticate_proposal_command(opener, opener.text)
-    note_proposal_command(opener, turn_ctx.session_key, "openspec-propose", CHANGE,
-                          str(tmp_path / "planning/skills/openspec-propose/SKILL.md"))
+    with _original_delivery_scope(opener):
+        authenticate_proposal_command(opener, opener.text)
+        note_proposal_command(opener, turn_ctx.session_key, "openspec-propose", CHANGE,
+                              str(tmp_path / "planning/skills/openspec-propose/SKILL.md"))
     with proposal_turn(opener, turn_ctx.session_key, turn_ctx.session_id):
         original_scope = copy_context()
-        assert original_scope.run(child_proposal_selection, turn_ctx.session_id) is not None
+        assert original_scope.run(child_proposal_selection, turn_ctx.session_id, child_task_id="followup-child") is not None
 
         async def observe_followup(**kwargs):
-            assert child_proposal_selection(kwargs["session_id"]) is None
-            assert original_scope.run(child_proposal_selection, turn_ctx.session_id) is None
+            assert child_proposal_selection(kwargs["session_id"], child_task_id="followup-child") is None
+            assert original_scope.run(child_proposal_selection, turn_ctx.session_id, child_task_id="followup-child") is None
             return {"final_response": "done", "messages": []}
 
         runner._run_agent.side_effect = observe_followup

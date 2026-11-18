@@ -280,13 +280,17 @@ def test_native_child_stop_fences_intent_during_startup(stop_at, stop_via, monke
     "complete", "missing-required", "missing-reference", "different-project", "different-digest",
     "stale-missing-file", "stale-size", "corrupt-child-config",
     "wrong-parent", "forged-model-selection", "internal-event", "unauthorized-event", "closed-turn",
+    "different-child-workspace", "unknown-child-workspace", "one-sided-optional",
+    "one-sided-reference", "stale-file-identity",
 ])
 def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path, monkeypatch, captured_hook):
     from contextvars import copy_context
     from copy import deepcopy
     from json import dumps
 
-    from agent.prerequisite_workflow import authenticate_proposal_command, note_proposal_command, proposal_turn
+    from agent.prerequisite_workflow import (
+        _original_delivery_scope, authenticate_proposal_command, note_proposal_command, proposal_turn,
+    )
     from gateway.platforms.event import MessageEvent
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tests.tools.proposal_catalog_fixture import CHANGE, CONTEXT, GOAL, profile_config, proposal_entry
@@ -304,8 +308,26 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     elif case == "different-digest":
         child_entry["resources"]["governance/AGENTS.md"]["sha256"] = "0" * 64
 
+    if case in {"one-sided-optional", "one-sided-reference"}:
+        relative = "REQUIREMENTS.md" if case == "one-sided-optional" else "skills/codebase-design/references/extra.md"
+        extra = root / relative
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        content = b"Extra fixture document."
+        extra.write_bytes(content)
+        stat = extra.stat()
+        key = ("project/requirements" if case == "one-sided-optional"
+               else "reference/codebase-design/references/extra.md")
+        parent_entry["resources"][key] = {"path": relative if case == "one-sided-optional" else str(extra),
+                                         "device": stat.st_dev, "inode": stat.st_ino, "size": len(content),
+                                         "max_file_bytes": 512, "sha256": sha256(content).hexdigest()}
+
     governance = root / "rules" / "AGENTS.md"
-    if case == "stale-missing-file":
+    if case == "stale-file-identity":
+        replacement = governance.with_suffix(".replacement")
+        replacement.write_bytes(governance.read_bytes())
+        assert replacement.stat().st_ino != governance.stat().st_ino
+        replacement.replace(governance)
+    elif case == "stale-missing-file":
         governance.unlink()
     elif case == "stale-size":
         governance.write_bytes(b"Changed after pinning")
@@ -340,12 +362,24 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
         return {"final_response": "offline"}
 
     child.run_conversation = converse
-    run = _ChildRun(child, SimpleNamespace(session_id=parent_id), 0, GOAL, None, None)
+    from tools.delegate_tool_routes import child_profile_scope
+    from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+    run = _ChildRun(child, SimpleNamespace(session_id=parent_id), 0, GOAL, None, None, child_task_id="proposal-child")
+    child_workspace = root
+    if case == "different-child-workspace":
+        child_workspace = tmp_path / "other-workspace"
+        child_workspace.mkdir()
     home_token = set_hermes_home_override(str(parent_home))
     try:
+        with child_profile_scope(child):
+            if case != "unknown-child-workspace":
+                record_session_cwd(run.child_task_id, str(child_workspace))
         if case != "forged-model-selection":
-            authenticate_proposal_command(event, event.text)
-            note_proposal_command(event, "route", "openspec-propose", CHANGE, parent_entry["resources"]["skill/openspec-propose"]["path"])
+            with _original_delivery_scope(event):
+                authenticate_proposal_command(event, event.text)
+                skill_path = parent_entry["resources"]["skill/openspec-propose"]["path"]
+                note_proposal_command(event, "route", "openspec-propose", CHANGE, skill_path)
         if case == "closed-turn":
             with proposal_turn(event, "route", "parent"):
                 deferred_context = copy_context()
@@ -354,13 +388,17 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
             with proposal_turn(event, "route", "parent"):
                 result, error, deferred = run.await_child()
     finally:
-        reset_hermes_home_override(home_token)
+        try:
+            with child_profile_scope(child):
+                clear_session_cwd(run.child_task_id)
+        finally:
+            reset_hermes_home_override(home_token)
 
     assert result == {"final_response": "offline"} and error is None and not deferred
     record = captured_hook[0]["task_intent"]
     assert record is not None and record.goal_text == GOAL
     selection = record.proposal_selection
-    if case != "complete":
+    if case not in {"complete", "one-sided-optional"}:
         assert selection is None
         return
     assert selection is not None
@@ -370,6 +408,9 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     assert set(selection.absent_optional) == {"project/requirements", "project/architecture"}
     pins = {pin.key: pin for pin in selection.resources}
     expected = {key: row for key, row in parent_entry["resources"].items() if row is not None}
+    if case == "one-sided-optional":
+        assert expected.pop("project/requirements") is not None
+        assert "project/requirements" not in pins
     assert pins.keys() == expected.keys()
     for key, row in expected.items():
         assert pins[key].path == str(root / row["path"])

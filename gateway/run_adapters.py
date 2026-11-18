@@ -17,6 +17,7 @@ import os
 import time
 import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
+from agent.prerequisite_workflow import original_proposal_delivery
 from contextvars import Context
 from datetime import datetime, timedelta, timezone, UTC
 from gateway.config import (
@@ -1387,10 +1388,10 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
-        adapter.set_message_handler(message_handler or self._primary_message_handler())
+        adapter.set_message_handler(original_proposal_delivery(message_handler or self._primary_message_handler()))
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
-        adapter.set_busy_session_handler(busy_session_handler or self._primary_busy_session_handler())
+        adapter.set_busy_session_handler(original_proposal_delivery(busy_session_handler or self._primary_busy_session_handler()))
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)

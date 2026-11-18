@@ -30,10 +30,12 @@ GOVERNANCE = (
     "shared/lessons-digest.md",
     "skills/anti-deception-instruction.md",
     "skills/compliance-enforcer.md",
+    "workflow/plan-execution-standards.md",
+    "guides/ai-native-documentation.md",
 )
 REQUIRED_SKILLS = frozenset({
     "verification-before-claim", "openspec-propose", "openspec-workflow-governance",
-    "codebase-design", "deep-reference-protocol", "ai-agent-collaboration", "hermes-agent",
+    "codebase-design", "deep-reference-protocol", "ai-agent-collaboration", "hermes-agent", "hermes-boot-protocol",
 })
 BASELINES = ("nerve-crew-dod-and-role-handoff", "nerve-reflex-resilience")
 ARTIFACTS = ("proposal", "design", "specs", "tasks")
@@ -105,13 +107,25 @@ def _integer(value: Any, low: int, high: int) -> int:
     return value
 
 
+_WINDOWS_DEVICE_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"{prefix}{digit}" for prefix in ("COM", "LPT") for digit in "123456789¹²³"),
+})
+
+
+def _windows_reserved_component(part: str) -> bool:
+    # Match the reserved-component rules on Python versions without os.path.isreserved.
+    return (part.endswith((".", " ")) or any(char in '\"*:<>?|\\' or ord(char) < 32 for char in part)
+            or part.partition(".")[0].rstrip(" ").upper() in _WINDOWS_DEVICE_NAMES)
+
+
 def _local_path(value: Any, base: Path | None = None) -> Path:
     if not isinstance(value, str) or not 1 <= len(value) <= 1024 or any(ord(c) < 32 for c in value):
         raise InvalidCatalog("invalid-path")
     if is_nt_namespace_path(value) or value.replace("\\", "/").startswith("//"):
         raise InvalidCatalog("unsupported-path")
     windows_path = PureWindowsPath(value)
-    if os.name == "nt" and any(os.path.isreserved(part) for part in windows_path.parts if part != windows_path.anchor):
+    if os.name == "nt" and any(_windows_reserved_component(part) for part in windows_path.parts if part != windows_path.anchor):
         raise InvalidCatalog("unsupported-path")
     path = Path(value)
     if (value.startswith(("//", "\\\\")) or ".." in path.parts or path.drive.startswith(("//", "\\\\"))

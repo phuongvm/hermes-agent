@@ -31,9 +31,11 @@ _LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
 _EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
 
 
-def _effective(raw: dict[str, Any]) -> dict[str, Any]:
+def _effective(raw: dict[str, Any], *, strict_managed: bool = False) -> dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
-    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+    user = expanded if isinstance(expanded, dict) else {}
+    merged = (managed_scope.apply_managed_overlay(user, strict=True) if strict_managed
+              else managed_scope.apply_managed_overlay(user))
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
@@ -50,7 +52,9 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
-def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
+def load_user_config_effective(
+    config_path: Optional[Path] = None, *, fail_closed: bool = False, strict_managed: bool = False,
+) -> dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -61,16 +65,26 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Cached on the user + managed file signatures and the values of every referenced env var.
+    ``strict_managed`` reads both current layers without reusing a fail-open result.
+    """
     from agent.safe_worker_policy import worker_config_snapshot
 
     # A frozen-policy worker is detached from the profile's files: the owner-supplied
     # snapshot IS the user layer (same seam load_config / read_raw_config honour).
     snapshot = worker_config_snapshot()
     if snapshot is not None:
-        return _effective(snapshot)
+        return _effective(snapshot, strict_managed=strict_managed)
     if config_path is None:
         config_path = _config.get_config_path()
+    if strict_managed:
+        try:
+            current = read_config_doc(config_path)
+        except FileNotFoundError:
+            current = None
+        if current is not None and not isinstance(current, dict):
+            raise TypeError("config.yaml root is not a mapping")
+        return _effective(current or {}, strict_managed=True)
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
         user_sig, cache_sig = _config._load_config_cache_sig(config_path)

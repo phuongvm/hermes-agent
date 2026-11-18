@@ -5,10 +5,12 @@ import logging
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
+from types import MethodType
 from weakref import ref
 
 from agent.prerequisite_catalog import (
@@ -29,9 +31,14 @@ def _selection(change: str) -> ProposalSelection | None:
     from hermes_yaml import YAMLError
 
     try:
-        config = load_user_config_effective(fail_closed=True)
-        entry = proposal_entries(config.get("prerequisite_catalog")).get(change)
-        return freeze_proposal_catalog(change, entry)
+        config = load_user_config_effective(fail_closed=True, strict_managed=True)
+        catalog = config.get("prerequisite_catalog", {})
+        if catalog == {}:
+            raise InvalidCatalog("catalog-absent")
+        entries = proposal_entries(catalog)
+        if change not in entries:
+            raise InvalidCatalog("change-not-configured")
+        return freeze_proposal_catalog(change, entries[change])
     except InvalidCatalog as exc:
         _unavailable(str(exc))
     except (ConfigBackendUnavailable, OSError, TypeError, ValueError, YAMLError):
@@ -53,19 +60,84 @@ class _AuthenticatedCommand:
     sender: str
 
 
+@dataclass(slots=True)
+class _OriginalDelivery:
+    event: ref
+    text: str
+    sender: str | None
+    active: bool = True
+
+
+_delivery: ContextVar[_OriginalDelivery | None] = ContextVar("hermes_original_proposal_delivery", default=None)
+
+
+@contextmanager
+def _original_delivery_scope(event):
+    received = (_OriginalDelivery(ref(event), event.text, event.sender_id())
+                if not event.internal and event.get_command() == WORKFLOW else None)
+    token = _delivery.set(received)
+    try:
+        yield
+    finally:
+        if received is not None:
+            received.active = False
+        _delivery.reset(token)
+
+
+def original_proposal_delivery(handler):
+    """Wrap only adapter callbacks; routing provenance may be carried, this receipt may not."""
+    async def dispatch(event, *args, **kwargs):
+        with _original_delivery_scope(event):
+            return await handler(event, *args, **kwargs)
+
+    owner = getattr(handler, "__self__", None)
+    if owner is None:
+        return dispatch
+
+    # The adapter uses the bound runner to route busy messages to durable FIFO.
+    async def bound_dispatch(_owner, event, *args, **kwargs):
+        return await dispatch(event, *args, **kwargs)
+
+    return MethodType(bound_dispatch, owner)
+
+
 def authenticate_proposal_command(event, original_text: str) -> None:
     """Capture only the unchanged original command after ingress authorization."""
     vars(event).pop("_authenticated_proposal_command", None)
     sender = event.sender_id()
+    delivery = _delivery.get()
+    if (delivery is None or not delivery.active or delivery.event() is not event
+            or delivery.sender != sender or delivery.text != original_text):
+        return
     if (event.internal or not event.allow_gateway_control or getattr(event.source, "is_bot", False)
             or not sender or event.text != original_text or event.get_command() != WORKFLOW):
         return
     event._authenticated_proposal_command = _AuthenticatedCommand(ref(event), original_text, sender)
 
 
+def proposal_skill_receipt(event, route, argument, *, stacked: bool) -> Callable[[str, str | None], None] | None:
+    """Return a host-only observer of the renderer's single successful load."""
+    delivery = _delivery.get()
+    if (delivery is None or not delivery.active or delivery.event() is not event
+            or not isinstance(getattr(event, "_authenticated_proposal_command", None), _AuthenticatedCommand)):
+        return None
+    if stacked:
+        vars(event).pop("_authenticated_proposal_command", None)
+        _unavailable("invalid-change-selector")
+        return None
+
+    def resolved(name: str, path: str | None) -> None:
+        note_proposal_command(event, route, name, argument, path)
+
+    return resolved
+
+
 def note_proposal_command(event, route, skill, argument, skill_path):
     """Called after successful skill resolution on the authorized inbound command path."""
     receipt = vars(event).pop("_authenticated_proposal_command", None)
+    delivery = _delivery.get()
+    if (delivery is None or not delivery.active or delivery.event() is not event):
+        return
     if (skill != WORKFLOW or event.internal or not event.allow_gateway_control or not route
             or type(receipt) is not _AuthenticatedCommand or receipt.event() is not event
             or receipt.text != event.text or receipt.sender != event.sender_id()):
@@ -171,7 +243,23 @@ def retire_proposal_turn() -> None:
         _active.set(None)
 
 
-def child_proposal_selection(parent: str) -> ProposalSelection | None:
+def _child_targets_planning_home(task_id: str, planning_home: str) -> bool:
+    from tools.terminal_scope import TerminalPolicyUnavailable, terminal_env
+    from tools.terminal_tool import get_session_cwd
+
+    if not task_id:
+        return False
+    try:
+        if terminal_env("TERMINAL_ENV", "local").strip().lower() != "local":
+            return False
+        cwd = get_session_cwd(task_id) or terminal_env("TERMINAL_CWD", "")
+    except TerminalPolicyUnavailable:
+        return False
+    # No process-cwd fallback, link resolution, or repo discovery can create a binding.
+    return bool(cwd and Path(cwd).is_absolute() and Path(cwd) == Path(planning_home))
+
+
+def child_proposal_selection(parent: str, *, child_task_id: str = "") -> ProposalSelection | None:
     """Intersect both served profiles; never union their resource scope."""
     binding = _active.get()
     if binding is None or binding[1] != parent:
@@ -186,6 +274,9 @@ def child_proposal_selection(parent: str) -> ProposalSelection | None:
     selection = selection.intersect(child)
     if selection is None:
         _unavailable("parent-child-catalog-mismatch")
+        return None
+    if not _child_targets_planning_home(child_task_id, selection.planning_home):
+        _unavailable("child-project-unavailable-or-mismatch")
         return None
     try:
         verify_catalog_metadata(selection)
