@@ -2,19 +2,23 @@
 API-bound user message but must never be persisted as the user row's ``content``
 (every transcript surface rendered it as if the user typed it).
 """
+from __future__ import annotations
+
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
-from gateway.platforms.event import MessageEvent
-from gateway.run import GatewayRunner
-from gateway.run_inbound import discord_triggering_note
-from gateway.session import SessionSource
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
 
 
 def _runner() -> GatewayRunner:
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(group_sessions_per_user=False)
     runner.adapters = {}
@@ -24,6 +28,9 @@ def _runner() -> GatewayRunner:
 
 
 def _discord_source() -> SessionSource:
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
     return SessionSource(platform=Platform.DISCORD, chat_id="dm1", chat_type="dm", user_id="u1", user_name="Owen")
 
 
@@ -31,6 +38,9 @@ def _discord_source() -> SessionSource:
 async def test_discord_note_rides_model_text_but_not_persisted_content(monkeypatch):
     """Real inbound prep → persist seam: the model sees the note (outermost, ahead of the reply
     pointer); the durable row keeps the reply pointer and the authored text only."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.run_inbound import discord_triggering_note
+
     monkeypatch.setattr("gateway.session._discord_tools_loaded", lambda: True)
     runner = _runner()
     source = _discord_source()
@@ -54,9 +64,14 @@ async def test_discord_note_rides_model_text_but_not_persisted_content(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_queued_followup_persists_authored_text():
+async def test_queued_followup_persists_authored_text_and_retires_proposal_binding(monkeypatch, tmp_path):
     """The in-band queued follow-up runs the same inbound prep; its recursive ``_run_agent`` must
     carry the clean persist text too, or a queued Discord turn re-persists the note."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.run_inbound import discord_triggering_note
+    from gateway.run_turn import TurnContext
+
     runner = _runner()
     runner._MAX_INTERRUPT_DEPTH = 8
     runner._run_agent = AsyncMock(return_value={"final_response": "done", "messages": []})
@@ -79,10 +94,29 @@ async def test_queued_followup_persists_authored_text():
         reply_expected=None,
     )
 
-    await GatewayRunner._run_agent_queued_followup(
-        runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
-        response="resp", result={"interrupted": True, "messages": []}, stream_task=None,
-    )
+    from contextvars import copy_context
+
+    from agent.prerequisite_workflow import child_proposal_selection, note_proposal_command, proposal_turn
+    from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
+
+    config = profile_config(proposal_entry(tmp_path / "planning"))
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    opener = MessageEvent(text=f"/openspec-propose {CHANGE}", source=source)
+    note_proposal_command(opener, turn_ctx.session_key, "openspec-propose", CHANGE)
+    with proposal_turn(opener, turn_ctx.session_key, turn_ctx.session_id):
+        original_scope = copy_context()
+        assert original_scope.run(child_proposal_selection, turn_ctx.session_id) is not None
+
+        async def observe_followup(**kwargs):
+            assert child_proposal_selection(kwargs["session_id"]) is None
+            assert original_scope.run(child_proposal_selection, turn_ctx.session_id) is None
+            return {"final_response": "done", "messages": []}
+
+        runner._run_agent.side_effect = observe_followup
+        await GatewayRunner._run_agent_queued_followup(
+            runner, cast(TurnContext, turn_ctx), adapter=None, pending="hi again", pending_event=pending_event,
+            response="resp", result={"interrupted": True, "messages": []}, stream_task=None,
+        )
 
     kwargs = runner._run_agent.await_args.kwargs
     assert kwargs["message"] == f"{note}\n\nthe follow-up"

@@ -148,6 +148,7 @@ class SessionAuthority:
         self.waiters = {}
         self.events = {}
         self.native_waiters = set()
+        self.proposal_commands = {}  # Ephemeral, bounded native admission sidecars.
         self.pending_results = {}
         # Replies of recovered no-waiter turns, sent only once their terminal outcome commits.
         self.pending_deliveries = {}
@@ -631,7 +632,8 @@ class SessionAuthority:
             payload = reconcile_native_retry(self.db, principal_id=principal_id, session_id=session_id,
                                              request_id=request_id, payload=payload, raw=raw)
             return admit_session_input(self.db, epoch=self.epoch, principal_id=principal_id, session_id=session_id,
-                                       request_id=request_id, payload=payload, _authorize_write=authorize)
+                                       request_id=request_id, payload=payload, _authorize_write=authorize,
+                                       _report_created=True)
         except Exception:
             # A refused admission owns nothing it captured (unless another admission holds the same bytes).
             drop_capture_lease()
@@ -651,6 +653,9 @@ class SessionAuthority:
     def _admitted(self, ref, event, row):
         if event is not None:
             event._gateway_accepted = True
+            if hasattr(event, '_proposal_command'):
+                from agent.prerequisite_workflow import queue_proposal_command
+                queue_proposal_command(self, event, row)
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
                 committed()  # a queued slash command's ack follows its commit (``_queue_command_turn``)
             mark_producer_admission(self, event, row)
@@ -868,6 +873,7 @@ class SessionAuthority:
         # Published once: a later exact retry re-collects media but never repeats the completion.
         self.cancel_obligations.discard(admission_id)
         self.native_waiters.discard(admission_id)
+        self.proposal_commands.pop(admission_id, None)
         drop_producer_turn(self, admission_id)
         waiter = self.waiters.pop(admission_id, None)
         if waiter is not None and not waiter.done():

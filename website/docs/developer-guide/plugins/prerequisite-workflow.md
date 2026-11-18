@@ -1,0 +1,39 @@
+# Native proposal workflow selection
+
+The authenticated Gateway command `/openspec-propose <change-id>` can select an operator-managed `prerequisite_catalog`. The command must resolve to the installed, enabled skill and take exactly one lowercase hyphen-separated identifier. A model tool argument, ordinary chat text, stacked skill command, or recovered transcript cannot select a catalog.
+
+Selection is not authorization to read. The Gateway binds the selection to the admitted turn. Its FIFO handoff is process-local, one-use, and expires after 120 seconds. DB-only recovery and in-band follow-ups do not inherit it. A native child intersects the parent declaration with its own served-profile catalog for the same planning home and change. Required pins must agree exactly, and the lower operation and time limits apply.
+
+## Saved configuration
+
+The following fragment is intentionally incomplete, with placeholder paths and identity values. Do not install it as-is. No profile or plugin is enabled by this example.
+
+```yaml
+prerequisite_catalog:
+  openspec-propose:
+    example-topic:
+      planning_home: /srv/planning/example
+      operations: 64
+      seconds: 600
+      resources:
+        governance/AGENTS.md:
+          path: /srv/governance/AGENTS.md
+          device: 0
+          inode: 1
+          size: 1024
+          max_file_bytes: 2048
+          sha256: '<reviewed-sha256>'
+        project/requirements: null
+        project/architecture: null
+```
+
+A complete entry includes:
+
+- All nine governance documents: `AGENTS.md`, `shared/startup-rules.md`, `shared/safety.md`, `skills/task-verification-mandate.md`, `shared/rules-index.md`, `user/communication-language.md`, `shared/lessons-digest.md`, `skills/anti-deception-instruction.md`, and `skills/compliance-enforcer.md`, using `governance/<path>` keys.
+- `skill/<name>` pins for `verification-before-claim`, `openspec-propose`, `openspec-workflow-governance`, `codebase-design`, `deep-reference-protocol`, `ai-agent-collaboration`, and `hermes-agent`. Pin `reference/verification-before-claim/references/completion-gate.md` and any other explicitly selected references relative to the corresponding pinned skill directory. There is no recursive discovery.
+- `project/agent-share`, `project/exploration`, and `project/receipt`, with paths relative to the planning home. Use `openspec/workspace/sessions/agent_share.md` and operator-selected Markdown documents under `openspec/workspace/explorations/`. Optional `project/requirements` and `project/architecture` are never discovered implicitly; use `null` to explicitly record absence.
+- `baseline/nerve-crew-dod-and-role-handoff` and `baseline/nerve-reflex-resilience`, each bound to `openspec/specs/<id>/spec.md`. Optional descriptors are `snapshot/status` and `snapshot/instructions/<artifact>` for `proposal`, `design`, `specs`, or `tasks` under `openspec/workspace/prerequisites/<change-id>/`.
+
+`hermes config check` reports catalog shape errors without echoing raw values or opening resource contents. At selection, local metadata checks reject missing files, symlinks or reparses, and mismatched device, file ID, or size. These are preflight checks, not an attestation of content. An eventual bounded reader must independently verify the opened handle and pinned SHA-256 after guards permit dispatch. In particular, an equal-size edit can pass metadata checks but must not pass content verification.
+
+Missing or incompatible catalog entries do not change ordinary tool controls. Selection failures use bounded reason codes in logs. Renew pins through operator configuration for new assignments only; existing assignments do not reload their selection on resume.

@@ -17,6 +17,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
 
+from agent.prerequisite_catalog import ProposalSelection
+from agent.prerequisite_workflow import child_proposal_selection
+
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
@@ -33,6 +36,7 @@ class TaskIntent:
     goal_text: str
     goal_hash: str
     context_hash: str
+    proposal_selection: ProposalSelection | None = None
 
 
 _TASK_INTENT: ContextVar[TaskIntent | None] = ContextVar("hermes_task_intent", default=None)
@@ -102,7 +106,10 @@ def native_task_intent(
         except UnicodeEncodeError:
             pass  # Invalid text retains legacy handling, never partial provenance.
         else:
-            record = TaskIntent(1, uuid4().hex, actor_session_id, parent_session_id, goal, goal_hash, context_hash)
+            record = TaskIntent(
+                1, uuid4().hex, actor_session_id, parent_session_id, goal, goal_hash, context_hash,
+                child_proposal_selection(parent_session_id),
+            )
     scope = object()
     with _ACTIVE_LOCK:
         if valid and resumed and type(handoff) is _ResumeIntent:

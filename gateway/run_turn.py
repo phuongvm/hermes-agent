@@ -211,27 +211,27 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # (a /new may move session_entry.session_id while the old run is still unwinding).
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            # Admission/typing is not execution. All routing, authorization and
-            # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
             _turn_channel_prompt, _turn_source = channel
-            agent_result = await self._run_agent(
-                message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
-                session_id=_run_start_session_id, session_key=session_key,
-                run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
-                inbound_message_id=str(event.message_id) if event.message_id else None,
-                channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
-                title_user_message=prepared.title_user_message,
-                persist_user_message=prepared.persist_user_message,
-                persist_user_timestamp=prepared.persist_user_timestamp,
-                persist_user_display_kind=prepared.persist_user_display_kind,
-                reply_expected=event.reply_expected,
-                persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner, **persisted_user_metadata_for_event(event),
-                    **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
-                message_type=event.message_type,
-                scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
-            )
+            from agent.prerequisite_workflow import proposal_turn
+            with proposal_turn(event, _quick_key, _run_start_session_id):
+                agent_result = await self._run_agent(
+                    message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
+                    session_id=_run_start_session_id, session_key=session_key,
+                    run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
+                    inbound_message_id=str(event.message_id) if event.message_id else None,
+                    channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
+                    title_user_message=prepared.title_user_message,
+                    persist_user_message=prepared.persist_user_message,
+                    persist_user_timestamp=prepared.persist_user_timestamp,
+                    persist_user_display_kind=prepared.persist_user_display_kind,
+                    reply_expected=event.reply_expected,
+                    persist_user_display_metadata={
+                        "gateway_input_owner": prepared.persistence_owner, **persisted_user_metadata_for_event(event),
+                        **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                    message_type=event.message_type,
+                    scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -1645,7 +1645,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        from agent.prerequisite_workflow import retire_proposal_turn
         from gateway.run import _preserve_queued_followup_history_offset
+        retire_proposal_turn()
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
         )
@@ -1654,7 +1656,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         )
         logger.debug("Processing pending message: '%s...'", pending[:40])
 
-        # Clear the interrupt event so the recursive _run_agent isn't re-interrupted (infinite loop).
         _active = getattr(adapter, "_active_sessions", None) if adapter else None
         if _active and session_key and session_key in _active:
             _active[session_key].clear()
@@ -1689,7 +1690,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
         next_reply_expected = pending_event.reply_expected if pending_event is not None else None
-        # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
             if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):

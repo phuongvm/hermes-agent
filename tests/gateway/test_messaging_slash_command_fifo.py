@@ -141,6 +141,52 @@ async def test_busy_skill_slash_runs_after_the_turn_already_admitted(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lose_ticket", [False, True], ids=["fresh", "db-only"])
+async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_path, monkeypatch, lose_ticket):
+    from agent import prerequisite_workflow as workflow, skill_commands as skills
+    from agent.prerequisite_catalog import freeze_proposal_catalog
+    from gateway.platforms.event import MessageEvent, MessageType
+    from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
+
+    _skill(monkeypatch)
+    monkeypatch.setattr(skills, 'get_skill_commands', lambda: {'/openspec-propose': {'name': 'openspec-propose'}})
+    monkeypatch.setattr(skills, 'resolve_skill_command_key',
+                        lambda command, **_: '/openspec-propose' if command == 'openspec-propose' else None)
+    entry = proposal_entry(tmp_path / 'planning')
+    config = profile_config(entry)
+    selection = freeze_proposal_catalog(CHANGE, entry)
+    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda: config)
+    rig = await _start_a(monkeypatch, 'queue')
+    observed = []
+    original = rig.runner._handle_message_with_agent
+
+    async def record(event, source, quick_key, run_generation):
+        if event.message_id == 'C':
+            session = rig.runner.session_store.peek_session_id(quick_key)
+            with workflow.proposal_turn(event, quick_key, session):
+                observed.append(workflow.child_proposal_selection(session))
+            with workflow.proposal_turn(event, quick_key, session):
+                observed.append(workflow.child_proposal_selection(session))
+        return await original(event, source, quick_key, run_generation)
+
+    monkeypatch.setattr(rig.runner, '_handle_message_with_agent', record)
+    try:
+        await rig.adapter.handle_message(MessageEvent(text=f'/openspec-propose {CHANGE}', message_type=MessageType.COMMAND,
+                                                      source=rig.source, message_id='C'))
+        await async_wait_until(lambda: 'C' in _rows(rig), what='proposal admission committed')
+        assert len(rig.authority.proposal_commands) == 1
+        if lose_ticket:
+            rig.authority.proposal_commands.clear()
+        rig.finish.set()
+        await async_wait_until(lambda: len(observed) == 2, what='proposal binding consumed')
+        assert observed == [None if lose_ticket else selection, None]
+        assert not rig.authority.proposal_commands
+    finally:
+        rig.finish.set()
+        await asyncio.gather(*(live.task for live in rig.authority.sessions.values() if live.task is not None))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('command', ['/queue C', '/steer C', '/plan C'])
 async def test_idle_rewrite_waits_behind_a_queued_row(monkeypatch, command):
     """Between turns (slot released, the drain has not claimed B yet), a slash command rewritten

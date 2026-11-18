@@ -296,6 +296,7 @@ def row_turn_author(policy, row):
 
 async def execute_admission(authority, ref, row):
     busy_turn_started(row['admission_id'])
+    proposal_ticket = getattr(authority, 'proposal_commands', {}).pop(row['admission_id'], None)
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
     if noted is not None:
@@ -317,6 +318,9 @@ async def execute_admission(authority, ref, row):
     authority.native_waiters.discard(row['admission_id'])
     if 'native_text_v1' in row['payload']:
         event = restore_native(row['payload'], authority.runner)
+        if proposal_ticket is not None:
+            from agent.prerequisite_workflow import restore_proposal_command
+            restore_proposal_command(proposal_ticket, event, route, ref.session_id, row)
     else:
         from gateway.session_ingress_media import restore_attachments
         event = MessageEvent(text=row['payload']['text'], source=live.source,
