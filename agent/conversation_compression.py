@@ -1600,6 +1600,8 @@ def _adopt_live_compression_child(
     confirmed = resolver(session_db, parent_session_id)
     if not confirmed or str(confirmed) != child_session_id:
         return None
+    from agent.delegation_context import rebind_compressed_task_intent
+    rebind_compressed_task_intent(parent_session_id, child_session_id, getattr(agent, "_parent_session_id", None))
     agent.session_id = child_session_id
     _rebind_session_context(child_session_id)
     _hand_off_metrics_segment(parent_session_id, child_session_id)
@@ -3278,6 +3280,8 @@ def _publish_rotated_compaction(
     for _handoff_message in compressed:
         if isinstance(_handoff_message, dict):
             _handoff_message[_DB_PERSISTED_MARKER] = True
+    from agent.delegation_context import rebind_compressed_task_intent
+    rebind_compressed_task_intent(old_session_id, new_session_id, getattr(agent, "_parent_session_id", None))
     agent.session_id = new_session_id
     agent._db_flush_scan_prefix = None
     _rebind_session_context(agent.session_id)

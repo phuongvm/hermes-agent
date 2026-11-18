@@ -397,6 +397,8 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
     if tip_row is None or tip_row.get("ended_at") is not None:
         return False
     logger.warning("Adopted live compression tip %s for closed session %s; retrying flush once", tip, old_id)
+    from agent.delegation_context import rebind_compressed_task_intent
+    rebind_compressed_task_intent(old_id, tip, getattr(agent, "_parent_session_id", None))
     agent.session_id, agent._flushed_db_message_ids, agent._last_flushed_db_idx = tip, set(), 0
     agent._compression_adoption_failed = False
     return True

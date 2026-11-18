@@ -36,11 +36,12 @@ class TestCompressionBoundaryHook:
             agent.compression_in_place = False
             return agent
 
-    def test_on_session_start_called_with_compression_boundary(self):
+    def test_on_session_start_called_with_compression_boundary(self, tmp_path):
+        from contextlib import closing
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
+            db.create_session("delegating-parent", "cli")
             agent = self._make_agent(db)
 
             # Stub the context compressor: we only need to observe the hook.
@@ -66,7 +67,16 @@ class TestCompressionBoundaryHook:
                 {"role": "user", "content": f"m{i}"} for i in range(10)
             ]
 
-            agent._compress_context(messages, "sys", approx_tokens=10_000)
+            from agent.delegation_context import current_task_intent, native_task_intent
+
+            agent._parent_session_id = "delegating-parent"
+            with native_task_intent(actor_session_id=original_sid, parent_session_id=agent._parent_session_id,
+                                    goal="Write proposal.md.", context=None) as original_intent:
+                assert original_intent is not None
+                agent._compress_context(messages, "sys", approx_tokens=10_000)
+                assert agent.session_id != original_sid
+                assert current_task_intent(agent.session_id, agent._parent_session_id) is original_intent
+                assert current_task_intent(original_sid, agent._parent_session_id) is None
 
             # Session_id rotated
             assert agent.session_id != original_sid, \

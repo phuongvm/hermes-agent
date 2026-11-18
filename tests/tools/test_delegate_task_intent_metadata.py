@@ -173,6 +173,33 @@ def test_nested_assignments_restore_parent_and_unknown_resume_cannot_mint():
     assert current_task_intent("child", "parent") is None
 
 
+@pytest.mark.parametrize("end", ["replace", "revoke", "stop"])
+def test_observers_and_retained_handoff_do_not_survive_invalidation(end):
+    from contextvars import copy_context
+    from agent import delegation_context as dc
+    from tools.delegate_tool_child_run import _signal_child_stop
+
+    args: dict[str, Any] = dict(actor_session_id="child", parent_session_id="parent", goal="Write proposal.md.", context=None)
+    with dc.native_task_intent(**args) as old:
+        assert old is not None
+        handoff = dc._ResumeIntent(old)
+        observer = copy_context()
+        if end == "replace":
+            with dc.native_task_intent(**args) as new:
+                assert new is not None and new.assignment_id != old.assignment_id
+                assert observer.run(dc.current_task_intent, "child", "parent") is None
+                dc.revoke_task_intent(old)
+                assert dc.current_task_intent("child", "parent") is new
+        elif end == "revoke":
+            dc.revoke_task_intent(old)
+        else:
+            child = SimpleNamespace(_delegate_running_intent=old, _interrupt_requested=False)
+            _signal_child_stop(child)
+        assert observer.run(dc.current_task_intent, "child", "parent") is None
+    with dc.native_task_intent(**args, resumed=True, handoff=handoff):
+        assert dc.current_task_intent("child", "parent") is None
+
+
 def test_direct_prompt_cannot_supply_task_metadata(captured_hook):
     captured = captured_hook
     agent = SimpleNamespace(session_id="direct", model="offline", _persist_disabled=False,

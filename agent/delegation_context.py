@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from hashlib import sha256
 from threading import RLock
-from weakref import WeakValueDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 from uuid import uuid4
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -43,6 +43,9 @@ _TASK_INTENT: ContextVar[TaskIntent | None] = ContextVar("hermes_task_intent", d
 _ACTIVE_LOCK = RLock()
 _ACTIVE: dict[str, tuple[TaskIntent, object]] = {}
 _LATEST: WeakValueDictionary[str, TaskIntent] = WeakValueDictionary()
+# The immutable record identifies the original actor. Only a host-confirmed
+# compression transition moves its current physical segment.
+_SEGMENT: WeakKeyDictionary[TaskIntent, str] = WeakKeyDictionary()
 _SCOPE: ContextVar[object | None] = ContextVar("hermes_assignment_scope", default=None)
 
 
@@ -55,7 +58,7 @@ class _ResumeIntent:
     def take(self, actor: str, parent: str) -> TaskIntent | None:
         with _ACTIVE_LOCK:
             record, self.record = self.record, None
-            if record and record.actor_session_id == actor and record.parent_session_id == parent:
+            if record and _SEGMENT.get(record) == actor and record.parent_session_id == parent:
                 return record
             return None
 
@@ -64,11 +67,10 @@ def revoke_task_intent(record: TaskIntent | None) -> None:
     """Invalidate a running worker without revoking a replacement actor's assignment."""
     if type(record) is TaskIntent:
         with _ACTIVE_LOCK:
-            active = _ACTIVE.get(record.actor_session_id)
-            if _LATEST.get(record.actor_session_id) is record:
-                del _LATEST[record.actor_session_id]
-            if active and active[0] is record:
-                del _ACTIVE[record.actor_session_id]
+            segment = _SEGMENT.pop(record, None)
+            if segment is not None and _LATEST.get(segment) is record:
+                del _LATEST[segment]
+                _ACTIVE.pop(segment, None)
 
 
 @contextmanager
@@ -99,6 +101,7 @@ def native_task_intent(
             if _LATEST.get(actor_session_id) is not record or actor_session_id in _ACTIVE:
                 record = None
         if record is not None:
+            _SEGMENT[record] = actor_session_id
             _LATEST[actor_session_id] = record
             _ACTIVE[actor_session_id] = (record, scope)
     token = _TASK_INTENT.set(record)
@@ -108,8 +111,9 @@ def native_task_intent(
     finally:
         if record is not None:
             with _ACTIVE_LOCK:
-                if _ACTIVE.get(actor_session_id) == (record, scope):
-                    del _ACTIVE[actor_session_id]
+                segment = _SEGMENT.get(record)
+                if segment is not None and _ACTIVE.get(segment) == (record, scope):
+                    del _ACTIVE[segment]
         _SCOPE.reset(scope_token)
         _TASK_INTENT.reset(token)
 
@@ -126,7 +130,7 @@ def current_task_intent(actor_session_id: str, parent_session_id: str) -> TaskIn
     for value, length in ((record.assignment_id, 32), (record.goal_hash, 64), (record.context_hash, 64)):
         if type(value) is not str or len(value) != length or any(c not in "0123456789abcdef" for c in value):
             return None
-    if record.actor_session_id != actor_session_id or record.parent_session_id != parent_session_id:
+    if record.parent_session_id != parent_session_id:
         return None
     try:
         goal_hash = sha256(record.goal_text.encode("utf-8")).hexdigest()
@@ -135,6 +139,23 @@ def current_task_intent(actor_session_id: str, parent_session_id: str) -> TaskIn
     with _ACTIVE_LOCK:
         active = _ACTIVE.get(actor_session_id)
         return record if record.goal_hash == goal_hash and active == (record, _SCOPE.get()) else None
+
+
+def rebind_compressed_task_intent(old: str, new: str, parent: str | None) -> None:
+    """Move only the calling native scope, after host publication/adoption succeeds."""
+    if parent is None or type(new) is not str or not new.strip() or old == new:
+        return
+    with _ACTIVE_LOCK:
+        record = current_task_intent(old, parent)
+        if record is None:
+            return  # DB-only recovery or a late callback cannot create a binding.
+        if new in _LATEST:
+            revoke_task_intent(record)
+            return  # Never displace a different assignment at the destination.
+        _ACTIVE[new] = _ACTIVE.pop(old)
+        del _LATEST[old]
+        _LATEST[new] = record
+        _SEGMENT[record] = new
 
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"

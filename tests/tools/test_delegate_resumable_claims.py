@@ -282,7 +282,7 @@ def test_a_continue_resumes_the_childs_newest_conversation_segment(stopped):
     """``compression.in_place: false``: the child's conversation moved to a new session mid-run."""
     from tools.delegate_tool import delegate_task
 
-    model = _ScriptedModel()
+    model = _ScriptedModel(first_complete=False)
     rotated = []
 
     def build(**kw):
@@ -324,6 +324,8 @@ def test_a_continue_resumes_the_childs_newest_conversation_segment(stopped):
         _completion(cont["delegation_id"])
     assert model.builds[1]["session_id"] == new
     assert [m["content"] for m in model.turns[1]["history"]][-1] == "after rotation"
+    assert model.turns[0]["intent"] is not None
+    assert model.turns[1]["intent"] is None  # DB-only resume must not rebuild provenance
 
 
 def test_each_profiles_pins_obey_that_profiles_own_cap():
