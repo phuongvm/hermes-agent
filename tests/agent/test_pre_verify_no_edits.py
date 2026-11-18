@@ -42,8 +42,16 @@ def test_stop_routes_only_to_eligible_subscribers(monkeypatch, registered, nativ
         assert seen[0][1]["assignment_id"] and seen[0][1]["changed_paths"] == []
 
 
-@pytest.mark.parametrize("goal,blocked", [("Write proposal.md.", True), ("Summarize findings.", False)])
-def test_registered_nerve_stop_after_failed_write(monkeypatch, tmp_path, goal, blocked):
+@pytest.mark.parametrize("goal,events,blocked", [
+    ("Write proposal.md.", ["failed"], True), ("Summarize findings.", ["failed"], False),
+    ("Create proposal.md.", ["write_file"], False),
+    ("Create proposal.md.", ["delete_file"], True),
+    ("Create proposal.md.", ["move_file"], True),
+    ("Create proposal.md.", ["rename_file"], True),
+    ("Create proposal.md.", ["write_file", "delete_file"], True),
+    ("Create proposal.md.", ["write_file", "rename_file", "write_file"], False),
+])
+def test_registered_nerve_output_effect(monkeypatch, tmp_path, goal, events, blocked):
     """Run both worktrees together with an isolated manager, no model or gateway."""
     import importlib.util
     import os
@@ -84,10 +92,16 @@ def test_registered_nerve_stop_after_failed_write(monkeypatch, tmp_path, goal, b
         with native_task_intent(actor_session_id="child", parent_session_id="parent", goal=goal, context=None):
             manager.invoke_hook("pre_llm_call", session_id="child", parent_session_id="parent", user_message=goal,
                                 turn_id="turn", task_intent=current_task_intent("child", "parent"))
-            manager.invoke_hook("post_tool_call", session_id="child", turn_id="turn", tool_name="write_file",
-                                args={"path": "proposal.md"}, status="error", result="write failed")
+            for event in events:
+                args = ({"source": "proposal.md", "destination": "archive.md"} if event in {"move_file", "rename_file"}
+                        else {"path": "proposal.md"})
+                failed = event == "failed"
+                manager.invoke_hook("post_tool_call", session_id="child", turn_id="turn", tool_name="write_file" if failed else event,
+                                    args=args, status="error" if failed else "ok", result="failed" if failed else "ok")
+                if not failed:
+                    agent._turn_file_mutation_paths.add("proposal.md")
             assert system.status(turn_id="turn")["task_intent_disposition"] == "trusted"
-            assert system.status(turn_id="turn")["mutation_attempts"] == 1
+            assert system.status(turn_id="turn")["mutation_attempts"] == len(events)
             msg = _pre_verify_nudge(agent, "finished", 0)
             assert (msg is not None and "Do not claim completion" in msg) if blocked else msg is None
     finally:
