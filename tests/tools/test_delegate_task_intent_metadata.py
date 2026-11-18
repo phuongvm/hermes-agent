@@ -278,16 +278,17 @@ def test_native_child_stop_fences_intent_during_startup(stop_at, stop_via, monke
 
 @pytest.mark.parametrize("case", [
     "complete", "missing-required", "missing-reference", "different-project", "different-digest",
-    "stale-missing-file", "stale-size",
+    "stale-missing-file", "stale-size", "corrupt-child-config",
     "wrong-parent", "forged-model-selection", "internal-event", "unauthorized-event", "closed-turn",
 ])
 def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path, monkeypatch, captured_hook):
     from contextvars import copy_context
     from copy import deepcopy
+    from json import dumps
 
-    from agent.prerequisite_workflow import note_proposal_command, proposal_turn
+    from agent.prerequisite_workflow import authenticate_proposal_command, note_proposal_command, proposal_turn
     from gateway.platforms.event import MessageEvent
-    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tests.tools.proposal_catalog_fixture import CHANGE, CONTEXT, GOAL, profile_config, proposal_entry
 
     root = tmp_path / "planning"
@@ -310,10 +311,23 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
         governance.write_bytes(b"Changed after pinning")
 
     parent_home, child_home = tmp_path / "parent", tmp_path / "child"
-    configs = {parent_home: profile_config(parent_entry), child_home: profile_config(child_entry)}
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: configs[get_hermes_home()])
+    for home, entry in ((parent_home, parent_entry), (child_home, child_entry)):
+        home.mkdir()
+        (home / "config.yaml").write_text(dumps(profile_config(entry)), encoding="utf-8")
+    if case == "corrupt-child-config":
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_effective import load_user_config_effective
+
+        token = set_hermes_home_override(str(child_home))
+        try:
+            assert load_user_config_effective(fail_closed=True)["prerequisite_catalog"]
+            assert load_config_readonly()["prerequisite_catalog"]
+            (child_home / "config.yaml").write_text("prerequisite_catalog: [\n", encoding="utf-8")
+            assert load_config_readonly()["prerequisite_catalog"]  # Ordinary settings retain fallback.
+        finally:
+            reset_hermes_home_override(token)
     monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda _: None)
-    event = MessageEvent(text=f"/openspec-propose {CHANGE}", internal=case == "internal-event",
+    event = MessageEvent(text=f"/openspec-propose {CHANGE}", user_id="test-user", internal=case == "internal-event",
                          allow_gateway_control=case != "unauthorized-event")
     event.metadata["proposal_selection"] = child_entry  # Untrusted event metadata is never consulted.
     parent_id = "other-parent" if case == "wrong-parent" else "parent"
@@ -330,7 +344,8 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     home_token = set_hermes_home_override(str(parent_home))
     try:
         if case != "forged-model-selection":
-            note_proposal_command(event, "route", "openspec-propose", CHANGE)
+            authenticate_proposal_command(event, event.text)
+            note_proposal_command(event, "route", "openspec-propose", CHANGE, parent_entry["resources"]["skill/openspec-propose"]["path"])
         if case == "closed-turn":
             with proposal_turn(event, "route", "parent"):
                 deferred_context = copy_context()

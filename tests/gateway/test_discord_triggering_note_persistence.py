@@ -96,13 +96,17 @@ async def test_queued_followup_persists_authored_text_and_retires_proposal_bindi
 
     from contextvars import copy_context
 
-    from agent.prerequisite_workflow import child_proposal_selection, note_proposal_command, proposal_turn
+    from agent.prerequisite_workflow import (
+        authenticate_proposal_command, child_proposal_selection, note_proposal_command, proposal_turn,
+    )
     from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
 
     config = profile_config(proposal_entry(tmp_path / "planning"))
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda *, fail_closed: config)
     opener = MessageEvent(text=f"/openspec-propose {CHANGE}", source=source)
-    note_proposal_command(opener, turn_ctx.session_key, "openspec-propose", CHANGE)
+    authenticate_proposal_command(opener, opener.text)
+    note_proposal_command(opener, turn_ctx.session_key, "openspec-propose", CHANGE,
+                          str(tmp_path / "planning/skills/openspec-propose/SKILL.md"))
     with proposal_turn(opener, turn_ctx.session_key, turn_ctx.session_id):
         original_scope = copy_context()
         assert original_scope.run(child_proposal_selection, turn_ctx.session_id) is not None

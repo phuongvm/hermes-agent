@@ -220,6 +220,7 @@ class GatewayInboundMixin(
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
+        original, original_text = event, event.text
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
@@ -250,6 +251,9 @@ class GatewayInboundMixin(
         if not getattr(event, "_bot_loop_admitted", False) and not (
                 self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
             return None
+        if event is original and not executing_admission.get():
+            from agent.prerequisite_workflow import authenticate_proposal_command
+            authenticate_proposal_command(event, original_text)
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: MessageEvent, source: SessionSource) -> bool:
@@ -1202,10 +1206,10 @@ class GatewayInboundMixin(
             else:
                 msg = build_skill_invocation_message(cmd_key, user_instruction, task_id=_quick_key)
                 if msg:
-                    event.text = msg
                     if _skill_name == "openspec-propose" and not extra_keys:
                         from agent.prerequisite_workflow import note_proposal_command
-                        note_proposal_command(event, _quick_key, _skill_name, user_instruction)
+                        note_proposal_command(event, _quick_key, _skill_name, user_instruction, skill_cmds[cmd_key].get("skill_md_path"))
+                    event.text = msg
             # Fall through to normal message processing with skill content
         except Exception as e:
             logger.debug("Skill command check failed (non-fatal): %s", e)

@@ -975,6 +975,8 @@ class GatewayBusySessionMixin:
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return False  # let default path handle it
+        from agent.prerequisite_workflow import authenticate_proposal_command
+        authenticate_proposal_command(event, event.text)
         _skill, _skill_reply = await self._busy_skill_turn(event, event.source, session_key, adapter)
         if _skill:
             if _skill_reply:

@@ -1660,6 +1660,7 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only).
     "quick_commands": {},
+    "prerequisite_catalog": {},  # Operator-managed; empty means no selection.
     # Per-platform system-prompt hint overrides, keyed by platform name (whatsapp, slack, telegram,
     # ...). Value: {"append": text} keeps the built-in hint and appends; {"replace": text}
     # substitutes it; a bare string is shorthand for append. `replace` wins over `append` if both

@@ -141,21 +141,25 @@ async def test_busy_skill_slash_runs_after_the_turn_already_admitted(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lose_ticket", [False, True], ids=["fresh", "db-only"])
-async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_path, monkeypatch, lose_ticket):
+@pytest.mark.parametrize("case", ["fresh", "db-only", "redelivered", "expired", "cancelled"])
+async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_path, monkeypatch, caplog, case):
     from agent import prerequisite_workflow as workflow, skill_commands as skills
     from agent.prerequisite_catalog import freeze_proposal_catalog
+    from datetime import UTC, datetime
+
     from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session_contract import SessionActor, SessionRef
     from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
 
     _skill(monkeypatch)
-    monkeypatch.setattr(skills, 'get_skill_commands', lambda: {'/openspec-propose': {'name': 'openspec-propose'}})
+    monkeypatch.setattr(skills, 'get_skill_commands', lambda: {'/openspec-propose': {'name': 'openspec-propose',
+                        'skill_md_path': str(tmp_path / 'planning/skills/openspec-propose/SKILL.md')}})
     monkeypatch.setattr(skills, 'resolve_skill_command_key',
                         lambda command, **_: '/openspec-propose' if command == 'openspec-propose' else None)
     entry = proposal_entry(tmp_path / 'planning')
     config = profile_config(entry)
     selection = freeze_proposal_catalog(CHANGE, entry)
-    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda: config)
+    monkeypatch.setattr('hermes_cli.config_effective.load_user_config_effective', lambda *, fail_closed: config)
     rig = await _start_a(monkeypatch, 'queue')
     observed = []
     original = rig.runner._handle_message_with_agent
@@ -170,20 +174,99 @@ async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_p
         return await original(event, source, quick_key, run_generation)
 
     monkeypatch.setattr(rig.runner, '_handle_message_with_agent', record)
+    caplog.set_level("INFO", logger=workflow.__name__)
+    timestamp = datetime.now(UTC)
+
+    def command_event():
+        return MessageEvent(text=f'/openspec-propose {CHANGE}', message_type=MessageType.COMMAND,
+                            source=rig.source, message_id='C', timestamp=timestamp)
+
     try:
-        await rig.adapter.handle_message(MessageEvent(text=f'/openspec-propose {CHANGE}', message_type=MessageType.COMMAND,
-                                                      source=rig.source, message_id='C'))
-        await async_wait_until(lambda: 'C' in _rows(rig), what='proposal admission committed')
-        assert len(rig.authority.proposal_commands) == 1
-        if lose_ticket:
+        await rig.adapter.handle_message(command_event())
+        await async_wait_until(lambda: len(rig.authority.proposal_commands) == 1,
+                               what='proposal admission committed with ticket')
+        assert _rows(rig).count('C') == 1
+        admission_id, ticket = next(iter(rig.authority.proposal_commands.items()))
+        if case == "db-only":
             rig.authority.proposal_commands.clear()
+        elif case == "redelivered":
+            # Send the original native delivery again; the ledger owns deduplication.
+            await rig.adapter.handle_message(command_event())
+        elif case == "expired":
+            monkeypatch.setattr(workflow, "time", SimpleNamespace(monotonic=lambda: ticket.expires))
+        elif case == "cancelled":
+            profile = rig.authority.profile_id
+            ref = SessionRef(profile, rig.runner.session_store.peek_session_id(rig.key))
+            actor = SessionActor('test-owner', profile, frozenset({'session:submit', 'session:control'}), 'test')
+            receipt = await rig.authority.cancel_queued(actor, ref, admission_id)
+            assert (receipt.status, receipt.outcome) == ('terminal', 'cancelled')
+            assert not rig.authority.proposal_commands
         rig.finish.set()
-        await async_wait_until(lambda: len(observed) == 2, what='proposal binding consumed')
-        assert observed == [None if lose_ticket else selection, None]
+        if case == "cancelled":
+            await asyncio.gather(*(live.task for live in rig.authority.sessions.values() if live.task is not None))
+            assert observed == []
+        else:
+            await async_wait_until(lambda: len(observed) == 2, what='proposal binding consumed')
+            assert observed == [selection if case in {"fresh", "redelivered"} else None, None]
+        if case == "expired":
+            assert "PREREQUISITE_SELECTION_UNAVAILABLE: admission-ticket-expired" in caplog.messages
+        assert _rows(rig).count('C') == 1
         assert not rig.authority.proposal_commands
     finally:
         rig.finish.set()
         await asyncio.gather(*(live.task for live in rig.authority.sessions.values() if live.task is not None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case, reason", [
+    ("explicit", None), ("hook-rewrite", None), ("wrong-skill", "resolved-skill-mismatch"),
+    ("missing-selector", "invalid-change-selector"), ("ambiguous-selector", "invalid-change-selector"),
+    ("backend-unavailable", "profile-config-unavailable"),
+])
+async def test_idle_proposal_catalog_requires_original_dispatch_command(tmp_path, monkeypatch, caplog, case, reason):
+    from agent import prerequisite_workflow as workflow, skill_commands as skills
+    from gateway.platforms.event import MessageEvent
+    from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
+
+    _skill(monkeypatch)
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
+    argument = "" if case == "missing-selector" else f"{CHANGE} must-not-echo" if case == "ambiguous-selector" else CHANGE
+    command = f"/openspec-propose {argument}".rstrip()
+    skill_root = "unselected" if case == "wrong-skill" else "planning"
+    monkeypatch.setattr(skills, "get_skill_commands", lambda: {"/openspec-propose": {"name": "openspec-propose",
+                        "skill_md_path": str(tmp_path / skill_root / "skills/openspec-propose/SKILL.md")}})
+    monkeypatch.setattr(skills, "resolve_skill_command_key", lambda value: f"/{value}" if value == "openspec-propose" else None)
+    entry = proposal_entry(tmp_path / "planning")
+    def load_catalog(*, fail_closed):
+        assert fail_closed is True
+        if case == "backend-unavailable":
+            raise ConfigBackendUnavailable("must-not-echo")
+        return profile_config(entry)
+
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", load_catalog)
+    caplog.set_level("INFO", logger=workflow.__name__)
+    runner, adapter, _ = _owner(monkeypatch)
+    source = adapter.build_source(chat_id="42", chat_type="dm", user_id="42")
+    route = runner._session_key_for_source(source)
+
+    rewrite = case == "hook-rewrite"
+
+    async def hook(name, **kwargs):
+        return [{"action": "rewrite", "text": command}] if rewrite and name == "pre_gateway_dispatch" else []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", hook)
+    admitted = await runner._hm_admit_event(MessageEvent(text="plain input" if rewrite else command, source=source))
+    assert admitted is not None
+    event, resolved_source, internal = admitted
+    assert not internal
+    assert runner._hm_skill_slash_rewrite(event, resolved_source, route, event.get_command()) is None
+    assert event.text == f"[demo skill] {argument}"
+    with workflow.proposal_turn(event, route, "parent"):
+        selection = workflow.child_proposal_selection("parent")
+    assert (selection is not None) == (case == "explicit")
+    messages = [message for message in caplog.messages if message.startswith("PREREQUISITE_SELECTION_UNAVAILABLE:")]
+    assert messages == ([f"PREREQUISITE_SELECTION_UNAVAILABLE: {reason}"] if reason else [])
 
 
 @pytest.mark.asyncio

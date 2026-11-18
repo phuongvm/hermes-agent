@@ -9,7 +9,10 @@ import os
 import re
 import stat
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+
+from agent.file_safety import is_blocked_device_path, is_nt_namespace_path
+from hermes_platform.host.local_volume import is_fixed_local_volume
 from typing import Any
 
 MAX_RESOURCES = 128
@@ -37,12 +40,15 @@ ARTIFACTS = ("proposal", "design", "specs", "tasks")
 SNAPSHOTS = frozenset({"snapshot/status", *(f"snapshot/instructions/{artifact}" for artifact in ARTIFACTS)})
 WORKFLOW = "openspec-propose"
 _CHANGE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-REQUIRED_REFERENCES = frozenset({"reference/verification-before-claim/references/completion-gate.md"})
+REQUIRED_REFERENCES = frozenset({
+    "reference/verification-before-claim/references/completion-gate.md",
+    "reference/openspec-workflow-governance/references/openspec-agent-workflow-guide.md",
+})
 PROJECT_DOCUMENTS = {"project/agent-share": "openspec/workspace/sessions/agent_share.md"}
 OPTIONAL_DOCUMENTS = {"project/requirements": "REQUIREMENTS.md", "project/architecture": "ARCHITECTURE.md"}
 _REQUIRED = frozenset({
     *(f"governance/{p}" for p in GOVERNANCE), *(f"skill/{s}" for s in REQUIRED_SKILLS),
-    *REQUIRED_REFERENCES, *PROJECT_DOCUMENTS, "project/exploration", "project/receipt",
+    *REQUIRED_REFERENCES, *SNAPSHOTS, *PROJECT_DOCUMENTS, "project/exploration", "project/receipt",
     *(f"baseline/{b}" for b in BASELINES),
 })
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -102,6 +108,11 @@ def _integer(value: Any, low: int, high: int) -> int:
 def _local_path(value: Any, base: Path | None = None) -> Path:
     if not isinstance(value, str) or not 1 <= len(value) <= 1024 or any(ord(c) < 32 for c in value):
         raise InvalidCatalog("invalid-path")
+    if is_nt_namespace_path(value) or value.replace("\\", "/").startswith("//"):
+        raise InvalidCatalog("unsupported-path")
+    windows_path = PureWindowsPath(value)
+    if os.name == "nt" and any(os.path.isreserved(part) for part in windows_path.parts if part != windows_path.anchor):
+        raise InvalidCatalog("unsupported-path")
     path = Path(value)
     if (value.startswith(("//", "\\\\")) or ".." in path.parts or path.drive.startswith(("//", "\\\\"))
             or any(":" in part or "*" in part or "?" in part for part in path.parts if part != path.anchor)):
@@ -151,7 +162,7 @@ def freeze_proposal_catalog(change: str, entry: Any) -> ProposalSelection:
         raise InvalidCatalog("invalid-entry")
     home = _local_path(entry.get("planning_home"))
     rows = entry.get("resources")
-    if not isinstance(rows, dict) or not _REQUIRED <= rows.keys() or len(rows) > MAX_RESOURCES:
+    if not isinstance(rows, dict) or not (_REQUIRED | OPTIONAL_DOCUMENTS.keys()) <= rows.keys() or len(rows) > MAX_RESOURCES:
         raise InvalidCatalog("incomplete-resource-set")
     pins = []
     absent = []
@@ -170,11 +181,19 @@ def freeze_proposal_catalog(change: str, entry: Any) -> ProposalSelection:
                 raise InvalidCatalog("unsupported-resource")
         pins.append(_resource(key, row, home, change))
     by_key = {pin.key: pin for pin in pins}
+    governance_root = Path(by_key["governance/AGENTS.md"].path).parent
     for pin in pins:
+        path = Path(pin.path)
+        if pin.key.startswith("governance/") and path != governance_root / pin.key.removeprefix("governance/"):
+            raise InvalidCatalog("unexpected-governance-resource")
+        if pin.key.startswith("skill/") and (path.parent.name, path.name) != (pin.key.removeprefix("skill/"), "SKILL.md"):
+            raise InvalidCatalog("unexpected-skill-resource")
         if pin.key.startswith("reference/"):
             _, skill, name = pin.key.split("/", 2)
             if Path(pin.path) != Path(by_key[f"skill/{skill}"].path).parent / name:
                 raise InvalidCatalog("reference-outside-pinned-skill")
+    if len({(pin.device, pin.inode) for pin in pins}) != len(pins):
+        raise InvalidCatalog("duplicate-resource-identity")
     if len({Path(pin.path) for pin in pins}) != len(pins) or sum(pin.max_file_bytes for pin in pins) > MAX_SOURCE_BYTES:
         raise InvalidCatalog("ambiguous-resource-or-byte-budget")
     return ProposalSelection(change, str(home), tuple(sorted(pins, key=lambda item: item.key)), tuple(sorted(absent)),
@@ -195,11 +214,11 @@ def verify_catalog_metadata(selection: ProposalSelection) -> None:
 
     try:
         for pin in selection.resources:
-            path = Path(pin.path)
-            if os.name == "nt" and path.anchor not in checked_volumes:
-                from ctypes import windll
-
-                if windll.kernel32.GetDriveTypeW(path.anchor) != 3:  # DRIVE_FIXED
+            path = _local_path(pin.path)
+            if is_blocked_device_path(str(path)):
+                raise InvalidCatalog("unsupported-path")
+            if path.anchor not in checked_volumes:
+                if not is_fixed_local_volume(path.anchor):
                     raise InvalidCatalog("nonlocal-volume")
                 checked_volumes.add(path.anchor)
             for parent in reversed(path.parents):
@@ -227,6 +246,8 @@ def proposal_entries(catalog: object) -> dict:
 
 def catalog_diagnostics(catalog: object) -> list[str]:
     """Check declaration shape and pins without opening or trusting resource contents."""
+    if catalog == {}:
+        return []
     try:
         entries = proposal_entries(catalog)
     except InvalidCatalog as exc:

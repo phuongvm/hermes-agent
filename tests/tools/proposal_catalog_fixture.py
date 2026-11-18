@@ -43,6 +43,8 @@ def proposal_entry(root):
         **{f"governance/{name}": root / "rules" / name for name in GOVERNANCE_PATHS},
         **{f"skill/{name}": root / "skills" / name / "SKILL.md" for name in SKILL_NAMES},
         REFERENCE: root / "skills/verification-before-claim/references/completion-gate.md",
+        "reference/openspec-workflow-governance/references/openspec-agent-workflow-guide.md":
+            root / "skills/openspec-workflow-governance/references/openspec-agent-workflow-guide.md",
     }
     rows = {}
     for key, path in {**absolute, **{k: root / v for k, v in relative.items()}}.items():
