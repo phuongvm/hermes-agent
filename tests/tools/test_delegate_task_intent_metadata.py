@@ -200,28 +200,55 @@ def test_observers_and_retained_handoff_do_not_survive_invalidation(end):
         assert dc.current_task_intent("child", "parent") is None
 
 
-@pytest.mark.parametrize("stop_at", ["before-start", "before-publication"])
-def test_native_child_stop_fences_intent_during_startup(stop_at, monkeypatch):
+@pytest.mark.parametrize("stop_via", ["child-runner", "parent-hard-interrupt"])
+@pytest.mark.parametrize("stop_at", ["before-start", "after-activation"])
+def test_native_child_stop_fences_intent_during_startup(stop_at, stop_via, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import contextmanager
-    from threading import Event
+    from contextvars import copy_context
+    from threading import Event, Lock
 
     from agent.delegation_context import current_task_intent
+    from agent.interrupt_control import InterruptControlMixin
     from tools import delegate_tool_child_run as runner
 
+    class Agent(InterruptControlMixin, SimpleNamespace):
+        pass
+
+    def make_agent(**kwargs):
+        return Agent(_active_children=[], _active_children_lock=Lock(),
+                     _hard_interrupt_requested=Event(), _interrupt_requested=False,
+                     _execution_thread_id=None, quiet_mode=True, **kwargs)
+
     entered, release = Event(), Event()
-    stop = runner._signal_child_stop
     native = runner.native_task_intent
+    observers = []
 
     @contextmanager
     def pause_after_activation(**kwargs):
         with native(**kwargs) as intent:
+            observers.append(copy_context())
             entered.set()
             assert release.wait(10)
             yield intent
 
-    child = SimpleNamespace(session_id="child", _parent_session_id="parent", model="offline", platform="cli",
-                  _persist_disabled=False, _interrupt_requested=False)
+    if stop_via == "parent-hard-interrupt":
+        parent = make_agent(session_id="parent")
+        child = make_agent(session_id="child", _parent_session_id="parent", model="offline", platform="cli",
+                           _persist_disabled=False, _delegate_depth=1)
+        parent._active_children.append(child)
+
+        def stop():
+            parent.hard_interrupt("Stop requested")
+            assert child._hard_interrupt_requested.is_set()
+    else:
+        parent = SimpleNamespace(session_id="parent")
+        child = SimpleNamespace(session_id="child", _parent_session_id="parent", model="offline", platform="cli",
+                                _persist_disabled=False, _interrupt_requested=False)
+
+        def stop():
+            runner._signal_child_stop(child)
+
     hook_records = []
 
     def converse(user_message, **kwargs):
@@ -229,9 +256,9 @@ def test_native_child_stop_fences_intent_during_startup(stop_at, monkeypatch):
         return {"final_response": "offline"}
 
     child.run_conversation = converse
-    run = _ChildRun(child, SimpleNamespace(session_id="parent"), 0, "Write proposal.md.", None, None)
+    run = _ChildRun(child, parent, 0, "Write proposal.md.", None, None)
     if stop_at == "before-start":
-        stop(child)
+        stop()
         result, error, deferred = run.await_child()
     else:
         monkeypatch.setattr(runner, "native_task_intent", pause_after_activation)
@@ -239,7 +266,9 @@ def test_native_child_stop_fences_intent_during_startup(stop_at, monkeypatch):
             worker = pool.submit(run.await_child)
             try:
                 assert entered.wait(10)
-                stop(child)
+                assert observers[0].run(current_task_intent, "child", "parent") is not None
+                stop()
+                assert observers[0].run(current_task_intent, "child", "parent") is None
             finally:
                 release.set()
             result, error, deferred = worker.result(timeout=10)
