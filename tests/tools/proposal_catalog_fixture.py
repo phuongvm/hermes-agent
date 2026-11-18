@@ -59,5 +59,15 @@ def proposal_entry(root):
     return {"planning_home": str(root), "operations": 64, "seconds": 600, "resources": rows}
 
 
+def resource_pin(root, relative, *, absolute=False):
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = b"Extra fixture document."
+    path.write_bytes(data)
+    info = path.stat()
+    return {"path": str(path) if absolute else relative, "device": info.st_dev, "inode": info.st_ino,
+            "size": len(data), "max_file_bytes": 512, "sha256": sha256(data).hexdigest()}
+
+
 def profile_config(entry):
     return {"prerequisite_catalog": {"openspec-propose": {CHANGE: entry}}}

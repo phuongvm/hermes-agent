@@ -281,7 +281,8 @@ def test_native_child_stop_fences_intent_during_startup(stop_at, stop_via, monke
     "stale-missing-file", "stale-size", "corrupt-child-config",
     "wrong-parent", "forged-model-selection", "internal-event", "unauthorized-event", "closed-turn",
     "different-child-workspace", "unknown-child-workspace", "one-sided-optional",
-    "one-sided-reference", "stale-file-identity",
+    "one-sided-reference", "stale-file-identity", "conflicting-optional",
+    "same-optional", "child-only-optional",
 ])
 def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path, monkeypatch, captured_hook):
     from contextvars import copy_context
@@ -293,20 +294,21 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     )
     from gateway.platforms.event import MessageEvent
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from tests.tools.proposal_catalog_fixture import CHANGE, CONTEXT, GOAL, profile_config, proposal_entry
+    from tests.tools.proposal_catalog_fixture import CHANGE, CONTEXT, GOAL, profile_config, proposal_entry, resource_pin
 
     root = tmp_path / "planning"
     parent_entry = proposal_entry(root)
     child_entry = deepcopy(parent_entry)
     child_entry.update(operations=18, seconds=120)
-    if case == "missing-required":
-        del child_entry["resources"]["governance/AGENTS.md"]
-    elif case == "missing-reference":
-        del child_entry["resources"]["reference/verification-before-claim/references/completion-gate.md"]
-    elif case == "different-project":
-        child_entry["planning_home"] = str(tmp_path / "other-planning")
-    elif case == "different-digest":
-        child_entry["resources"]["governance/AGENTS.md"]["sha256"] = "0" * 64
+    child_rows = child_entry["resources"]
+    changes = {
+        "missing-required": lambda: child_rows.pop("governance/AGENTS.md"),
+        "missing-reference": lambda: child_rows.pop("reference/verification-before-claim/references/completion-gate.md"),
+        "different-project": lambda: child_entry.update(planning_home=str(tmp_path / "other-planning")),
+        "different-digest": lambda: child_rows["governance/AGENTS.md"].update(sha256="0" * 64),
+    }
+    if modify := changes.get(case):
+        modify()
 
     if case in {"one-sided-optional", "one-sided-reference"}:
         relative = "REQUIREMENTS.md" if case == "one-sided-optional" else "skills/codebase-design/references/extra.md"
@@ -320,6 +322,12 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
         parent_entry["resources"][key] = {"path": relative if case == "one-sided-optional" else str(extra),
                                          "device": stat.st_dev, "inode": stat.st_ino, "size": len(content),
                                          "max_file_bytes": 512, "sha256": sha256(content).hexdigest()}
+
+    if case in {"conflicting-optional", "same-optional", "child-only-optional"}:
+        pin = resource_pin(root, "docs/REQUIREMENTS.md")
+        if case != "child-only-optional":
+            parent_entry["resources"]["project/requirements"] = pin
+        child_rows["project/requirements"] = {**pin, "sha256": "0" * 64} if case == "conflicting-optional" else pin
 
     governance = root / "rules" / "AGENTS.md"
     if case == "stale-file-identity":
@@ -398,14 +406,17 @@ def test_native_proposal_fixture_selects_only_live_common_catalog(case, tmp_path
     record = captured_hook[0]["task_intent"]
     assert record is not None and record.goal_text == GOAL
     selection = record.proposal_selection
-    if case not in {"complete", "one-sided-optional"}:
+    if case not in {"complete", "one-sided-optional", "same-optional", "child-only-optional"}:
         assert selection is None
         return
     assert selection is not None
     assert (selection.change, selection.planning_home, selection.operations, selection.seconds) == (
         CHANGE, str(root), 18, 120,
     )
-    assert set(selection.absent_optional) == {"project/requirements", "project/architecture"}
+    absent = {"project/architecture"}
+    if case != "same-optional":
+        absent.add("project/requirements")
+    assert set(selection.absent_optional) == absent
     pins = {pin.key: pin for pin in selection.resources}
     expected = {key: row for key, row in parent_entry["resources"].items() if row is not None}
     if case == "one-sided-optional":

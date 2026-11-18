@@ -155,6 +155,15 @@ def _parse_managed_env(path: Path) -> dict[str, str]:
     return load_env_file(path)
 
 
+def _merge_catalog(base, override, *, depth: int = 0):
+    """Merge declarations, without inventing a pin from two layers."""
+    # Catalog → workflow → change → resources → pin (an indivisible declaration).
+    if depth == 4 or not isinstance(base, dict) or not isinstance(override, dict) or not override:
+        return override
+    return {**base, **{key: _merge_catalog(base.get(key), value, depth=depth + 1)
+                       for key, value in override.items()}}
+
+
 def apply_managed_overlay(config: dict, *, strict: bool = False) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
@@ -177,6 +186,10 @@ def apply_managed_overlay(config: dict, *, strict: bool = False) -> dict:
         if isinstance(managed_expanded.get("model"), str):
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
+        if strict and "prerequisite_catalog" in managed_expanded:
+            key = "prerequisite_catalog"
+            catalog = _merge_catalog(config.get(key), managed_expanded.pop(key))
+            return {**_deep_merge(config, managed_expanded), key: catalog}
         return _deep_merge(config, managed_expanded)
     except Exception:
         if strict:

@@ -1658,8 +1658,7 @@ DEFAULT_CONFIG = {
     },
     # Permanently allowed dangerous command patterns (added via "always" approval).
     "command_allowlist": [],
-    # User-defined quick commands that bypass the agent loop (type: exec only).
-    "quick_commands": {},
+    "quick_commands": {},  # User-defined quick commands (type: exec only).
     "prerequisite_catalog": {},  # Operator-managed; empty means no selection.
     # Per-platform system-prompt hint overrides, keyed by platform name (whatsapp, slack, telegram,
     # ...). Value: {"append": text} keeps the built-in hint and appends; {"replace": text}

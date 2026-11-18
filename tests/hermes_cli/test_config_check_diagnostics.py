@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import hermes_cli.config as config_mod
 import hermes_cli.plugins as plugins_mod
 from hermes_cli.config import DEFAULT_CONFIG, _cmd_config_check, _warn_invalid_platform_toolsets
@@ -19,6 +21,27 @@ def _check(home: Path, monkeypatch, capsys) -> str:
     monkeypatch.setenv("HERMES_HOME", str(home))
     _cmd_config_check(None)
     return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("layered", [False, True], ids=["managed-only", "layered"])
+def test_config_check_diagnoses_effective_prerequisite_catalog(tmp_path, monkeypatch, capsys, layered):
+    from json import dumps
+
+    from tests.tools.proposal_catalog_fixture import CHANGE, profile_config, proposal_entry
+
+    home = tmp_path / "user"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    config = profile_config(proposal_entry(tmp_path / "planning")) if layered else {}
+    overlay = {"openspec-propose": {CHANGE: None}} if layered else {"must-not-echo": {}}
+    (home / "config.yaml").write_text(dumps(config), encoding="utf-8")
+    (managed / "config.yaml").write_text(dumps({"prerequisite_catalog": overlay}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    output = _check(home, monkeypatch, capsys)
+    expected = "invalid-entry" if layered else "invalid-workflow-map"
+    assert f"prerequisite_catalog: {expected}" in output
+    assert "must-not-echo" not in output
 
 
 def test_config_check_and_migrate_agree_on_stale_platform_toolsets(tmp_path, monkeypatch, capsys):

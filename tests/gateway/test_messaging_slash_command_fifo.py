@@ -212,9 +212,10 @@ async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_p
                                what='proposal admission committed with ticket')
         assert _rows(rig).count('C') == 1
         admission_id, ticket = next(iter(rig.authority.proposal_commands.items()))
-        if case == "db-only":
+        async def db_only():
             rig.authority.proposal_commands.clear()
-        elif case == "redelivered":
+
+        async def redelivered():
             # Observe the real write's result, not just the number of rows after replay.
             replayed = asyncio.Event()
             replay_rows = []
@@ -234,19 +235,27 @@ async def test_proposal_skill_keeps_one_time_binding_across_authority_fifo(tmp_p
             assert replay_rows == [(admission_id, False)]
             assert rig.authority.proposal_commands[admission_id] is ticket
             assert ticket.expires == original_expiry
-        elif case == "expired":
+
+        async def expired():
             monkeypatch.setattr(workflow, "time", SimpleNamespace(monotonic=lambda: ticket.expires))
-        elif case == "mismatch":
+
+        async def mismatch():
             from dataclasses import replace
 
             rig.authority.proposal_commands[admission_id] = replace(ticket, session_id="another-session")
-        elif case == "cancelled":
+
+        async def cancelled():
             profile = rig.authority.profile_id
             ref = SessionRef(profile, rig.runner.session_store.peek_session_id(rig.key))
             actor = SessionActor('test-owner', profile, frozenset({'session:submit', 'session:control'}), 'test')
             receipt = await rig.authority.cancel_queued(actor, ref, admission_id)
             assert (receipt.status, receipt.outcome) == ('terminal', 'cancelled')
             assert not rig.authority.proposal_commands
+
+        scenarios = {"db-only": db_only, "redelivered": redelivered, "expired": expired,
+                     "mismatch": mismatch, "cancelled": cancelled}
+        if scenario := scenarios.get(case):
+            await scenario()
         rig.finish.set()
         if case == "cancelled":
             await asyncio.gather(*(live.task for live in rig.authority.sessions.values() if live.task is not None))

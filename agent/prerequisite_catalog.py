@@ -47,7 +47,7 @@ REQUIRED_REFERENCES = frozenset({
     "reference/openspec-workflow-governance/references/openspec-agent-workflow-guide.md",
 })
 PROJECT_DOCUMENTS = {"project/agent-share": "openspec/workspace/sessions/agent_share.md"}
-OPTIONAL_DOCUMENTS = {"project/requirements": "REQUIREMENTS.md", "project/architecture": "ARCHITECTURE.md"}
+OPTIONAL_DOCUMENTS = frozenset({"project/requirements", "project/architecture"})
 _REQUIRED = frozenset({
     *(f"governance/{p}" for p in GOVERNANCE), *(f"skill/{s}" for s in REQUIRED_SKILLS),
     *REQUIRED_REFERENCES, *SNAPSHOTS, *PROJECT_DOCUMENTS, "project/exploration", "project/receipt",
@@ -83,6 +83,10 @@ class ProposalSelection:
 
     def intersect(self, child: ProposalSelection) -> ProposalSelection | None:
         if (self.change, self.planning_home) != (child.change, child.planning_home):
+            return None
+        parent_optional = {pin.key: pin for pin in self.resources if pin.key in OPTIONAL_DOCUMENTS}
+        child_optional = {pin.key: pin for pin in child.resources if pin.key in OPTIONAL_DOCUMENTS}
+        if any(parent_optional[key] != child_optional[key] for key in parent_optional.keys() & child_optional.keys()):
             return None
         shared = frozenset(self.resources).intersection(child.resources)
         if not ({item.key for item in shared} >= _REQUIRED):
@@ -144,7 +148,9 @@ def _resource(key: str, row: Any, home: Path, change: str) -> ResourcePin:
     if not isinstance(row, dict) or set(row) != {"path", "device", "inode", "size", "max_file_bytes", "sha256"}:
         raise InvalidCatalog("invalid-resource")
     absolute = _local_path(row["path"], home if key.startswith(("project/", "baseline/", "snapshot/")) else None)
-    expected = PROJECT_DOCUMENTS.get(key, OPTIONAL_DOCUMENTS.get(key))
+    expected = PROJECT_DOCUMENTS.get(key)
+    if key in OPTIONAL_DOCUMENTS and (absolute == home or absolute.suffix.lower() not in {".md", ".txt"}):
+        raise InvalidCatalog("unexpected-project-resource")
     if key.startswith("baseline/"):
         expected = f"openspec/specs/{key.removeprefix('baseline/')}/spec.md"
     if key in SNAPSHOTS:
@@ -176,7 +182,7 @@ def freeze_proposal_catalog(change: str, entry: Any) -> ProposalSelection:
         raise InvalidCatalog("invalid-entry")
     home = _local_path(entry.get("planning_home"))
     rows = entry.get("resources")
-    if not isinstance(rows, dict) or not (_REQUIRED | OPTIONAL_DOCUMENTS.keys()) <= rows.keys() or len(rows) > MAX_RESOURCES:
+    if not isinstance(rows, dict) or not (_REQUIRED | OPTIONAL_DOCUMENTS) <= rows.keys() or len(rows) > MAX_RESOURCES:
         raise InvalidCatalog("incomplete-resource-set")
     pins = []
     absent = []

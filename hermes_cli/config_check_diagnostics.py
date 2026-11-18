@@ -25,10 +25,7 @@ def config_check_diagnostics(config: dict[str, Any], get_env_value: Callable[[st
     _validate_voice(config, voice_issues)
     diagnostics += [f"{issue.message}. {issue.hint}." for issue in voice_issues]
 
-    if "prerequisite_catalog" in config:
-        from agent.prerequisite_catalog import catalog_diagnostics
-
-        diagnostics += [f"prerequisite_catalog: {reason}" for reason in catalog_diagnostics(config["prerequisite_catalog"])]
+    diagnostics += _effective_catalog_diagnostics()
 
     disabled = _get_disabled_plugins()
     for name, manifest in _platform_plugin_manifests(source="bundled"):
@@ -42,3 +39,17 @@ def config_check_diagnostics(config: dict[str, Any], get_env_value: Callable[[st
                 f"Run `hermes plugins enable {key}` if you want it active."
             )
     return diagnostics
+
+
+def _effective_catalog_diagnostics() -> list[str]:
+    from agent.prerequisite_catalog import catalog_diagnostics
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_yaml import YAMLError
+
+    try:
+        effective = load_user_config_effective(fail_closed=True, strict_managed=True)
+    except (ConfigBackendUnavailable, OSError, TypeError, ValueError, YAMLError):
+        return ["prerequisite_catalog: profile-config-unavailable"]
+    return [f"prerequisite_catalog: {reason}"
+            for reason in catalog_diagnostics(effective.get("prerequisite_catalog", {}))]

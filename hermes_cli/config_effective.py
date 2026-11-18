@@ -52,6 +52,16 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
+def _read_current_user_config(config_path: Path) -> dict[str, Any]:
+    try:
+        current = read_config_doc(config_path)
+    except FileNotFoundError:
+        return {}
+    if current is not None and not isinstance(current, dict):
+        raise TypeError("config.yaml root is not a mapping")
+    return current or {}
+
+
 def load_user_config_effective(
     config_path: Optional[Path] = None, *, fail_closed: bool = False, strict_managed: bool = False,
 ) -> dict[str, Any]:
@@ -78,13 +88,7 @@ def load_user_config_effective(
     if config_path is None:
         config_path = _config.get_config_path()
     if strict_managed:
-        try:
-            current = read_config_doc(config_path)
-        except FileNotFoundError:
-            current = None
-        if current is not None and not isinstance(current, dict):
-            raise TypeError("config.yaml root is not a mapping")
-        return _effective(current or {}, strict_managed=True)
+        return _effective(_read_current_user_config(config_path), strict_managed=True)
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
         user_sig, cache_sig = _config._load_config_cache_sig(config_path)
