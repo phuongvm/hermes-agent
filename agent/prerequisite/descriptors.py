@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from agent.delegation_context import TaskIntent, current_task_intent
-from agent.file_safety import local_drive_spelling
 
 from .catalog import ARTIFACTS, BASELINES, InvalidCatalog, ProposalSelection, ResourcePin, _local_path, verify_catalog_metadata
 
@@ -19,7 +18,7 @@ class ReadDescriptor:
 def _file(selection: ProposalSelection, args: dict) -> ReadDescriptor | None:
     if args.keys() - {"path", "offset", "limit"} or type(args.get("path")) is not str:
         return None
-    path = _local_path(local_drive_spelling(args["path"]))
+    path = _local_path(args["path"])
     offset, limit = args.get("offset", 1), args.get("limit", 2000)
     if type(offset) is not int or type(limit) is not int or not 1 <= offset <= 1048577 or not 1 <= limit <= 2000:
         return None

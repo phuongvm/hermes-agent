@@ -80,6 +80,26 @@ def test_manifest_and_active_assignment_are_required(assignment):
         assert resolve_operation(intent, "actor", "read_file", args) is None
 
 
+@pytest.mark.platforms("windows")
+def test_unsupported_windows_path_spellings_stop_before_metadata_check(assignment, monkeypatch):
+    from agent.prerequisite import descriptors
+
+    intent, root = assignment
+    path = root / "rules/AGENTS.md"
+    assert descriptors.resolve_operation(intent, "actor", "read_file", {"path": str(path)}) is not None
+
+    def unexpected_metadata_check(_selection):
+        pytest.fail("Unsupported operand reached catalog metadata validation")
+
+    monkeypatch.setattr(descriptors, "verify_catalog_metadata", unexpected_metadata_check)
+    aliases = (
+        "\\\\?\\" + str(path),
+        "\\\\localhost\\" + path.drive[0] + "$\\" + "\\".join(path.parts[1:]),
+    )
+    for spelling in aliases:
+        assert descriptors.resolve_operation(intent, "actor", "read_file", {"path": spelling}) is None
+
+
 def test_stale_or_oversize_resource_has_no_descriptor(assignment):
     from agent.prerequisite.descriptors import resolve_operation
 
