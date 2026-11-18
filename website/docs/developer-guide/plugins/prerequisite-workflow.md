@@ -4,6 +4,10 @@ The authenticated Gateway command `/openspec-propose <change-id>` can select an 
 
 Selection is not authorization to read. The Gateway binds the selection to the admitted turn. Its FIFO handoff is process-local, one-use, and expires after 120 seconds. DB-only recovery and in-band follow-ups do not inherit it. A native child intersects the parent declaration with its own served-profile catalog for the same planning home and change. Its host-selected local working directory must match that planning home, including path casing after syntax normalization. An unknown workspace, a differently cased path, or a separate worktree does not implicitly alias it. Required pins must agree exactly, and the lower operation and time limits apply.
 
+## Operation descriptors
+
+For an active native assignment, the matcher accepts only exact catalog resources and validated parameters: `read_file` with a pinned absolute path and bounded pagination; `skill_view` with a pinned skill and, when requested, an explicitly pinned reference; or one of `openspec_status`, `openspec_instructions`, `openspec_spec_show`, and `openspec_spec_list` scoped to the declared planning home and change or baseline. Generic wrappers, terminal commands, code execution, network tools, and broad search do not match. A match is metadata only. It neither reserves an attempt nor opens a resource; downstream dispatch must still check adapter support, current authority, and content integrity.
+
 ## Saved configuration
 
 The following fragment is intentionally incomplete, with placeholder paths and identity values. Do not install it as-is. No profile or plugin is enabled by this example.
