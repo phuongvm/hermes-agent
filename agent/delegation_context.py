@@ -73,10 +73,19 @@ def revoke_task_intent(record: TaskIntent | None) -> None:
                 _ACTIVE.pop(segment, None)
 
 
+def stop_child_task_intent(child) -> None:
+    """Retire this worker's provenance even if it has not started yet."""
+    if child is None:
+        return
+    with _ACTIVE_LOCK:
+        child._delegate_intent_stopped = True
+        revoke_task_intent(getattr(child, "_delegate_running_intent", None))
+
+
 @contextmanager
 def native_task_intent(
     *, actor_session_id: str, parent_session_id: str, goal: str, context: str | None,
-    resumed: bool = False, handoff: _ResumeIntent | None = None,
+    resumed: bool = False, handoff: _ResumeIntent | None = None, owner=None,
 ) -> Iterator[TaskIntent | None]:
     """Bind separate native producer inputs, never deserialize a model envelope.
 
@@ -100,6 +109,11 @@ def native_task_intent(
             record = handoff.take(actor_session_id, parent_session_id)
             if _LATEST.get(actor_session_id) is not record or actor_session_id in _ACTIVE:
                 record = None
+        if owner is not None:
+            if getattr(owner, "_delegate_intent_stopped", False) is True:
+                revoke_task_intent(record)
+                record = None
+            owner._delegate_running_intent = record
         if record is not None:
             _SEGMENT[record] = actor_session_id
             _LATEST[actor_session_id] = record

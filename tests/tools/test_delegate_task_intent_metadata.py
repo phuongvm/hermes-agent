@@ -200,6 +200,53 @@ def test_observers_and_retained_handoff_do_not_survive_invalidation(end):
         assert dc.current_task_intent("child", "parent") is None
 
 
+@pytest.mark.parametrize("stop_at", ["before-start", "before-publication"])
+def test_native_child_stop_fences_intent_during_startup(stop_at, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    from threading import Event
+
+    from agent.delegation_context import current_task_intent
+    from tools import delegate_tool_child_run as runner
+
+    entered, release = Event(), Event()
+    stop = runner._signal_child_stop
+    native = runner.native_task_intent
+
+    @contextmanager
+    def pause_after_activation(**kwargs):
+        with native(**kwargs) as intent:
+            entered.set()
+            assert release.wait(10)
+            yield intent
+
+    child = SimpleNamespace(session_id="child", _parent_session_id="parent", model="offline", platform="cli",
+                  _persist_disabled=False, _interrupt_requested=False)
+    hook_records = []
+
+    def converse(user_message, **kwargs):
+        hook_records.append(current_task_intent("child", "parent"))
+        return {"final_response": "offline"}
+
+    child.run_conversation = converse
+    run = _ChildRun(child, SimpleNamespace(session_id="parent"), 0, "Write proposal.md.", None, None)
+    if stop_at == "before-start":
+        stop(child)
+        result, error, deferred = run.await_child()
+    else:
+        monkeypatch.setattr(runner, "native_task_intent", pause_after_activation)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            worker = pool.submit(run.await_child)
+            try:
+                assert entered.wait(10)
+                stop(child)
+            finally:
+                release.set()
+            result, error, deferred = worker.result(timeout=10)
+    assert result == {"final_response": "offline"} and error is None and not deferred
+    assert hook_records == [None]
+
+
 def test_direct_prompt_cannot_supply_task_metadata(captured_hook):
     captured = captured_hook
     agent = SimpleNamespace(session_id="direct", model="offline", _persist_disabled=False,

@@ -13,7 +13,7 @@ from tools.delegation_redaction import redact_child_result, redact_child_text
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 from agent.compression_marker import elide
-from agent.delegation_context import _ResumeIntent, native_task_intent, revoke_task_intent
+from agent.delegation_context import _ResumeIntent, native_task_intent, revoke_task_intent, stop_child_task_intent
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -176,7 +176,7 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
 def _signal_child_stop(child: Any, *reason: str, tool_reason: str = "parent delegation ended") -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly. ``tool_reason`` is the
     fixed cause the child's tools see (a pending approval wait reports it instead of a user deny)."""
-    revoke_task_intent(getattr(child, "_delegate_running_intent", None))
+    stop_child_task_intent(child)
     with _quiet(None):
         if (child is not None and not request_hard_interrupt(child, *reason, tool_reason=tool_reason)
                 and hasattr(child, "_interrupt_requested")):
@@ -1083,9 +1083,8 @@ class _ChildRun:
                 actor_session_id=getattr(child, "session_id", ""),
                 parent_session_id=getattr(self.parent_agent, "session_id", ""),
                 goal=self.goal, context=getattr(child, "_delegate_context", None), resumed=bool(resume),
-                handoff=getattr(child, "_delegate_intent_handoff", None),
-            ) as intent:
-                child._delegate_running_intent = intent
+                handoff=getattr(child, "_delegate_intent_handoff", None), owner=child,
+            ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,
                 )

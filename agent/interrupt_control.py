@@ -8,6 +8,7 @@ import logging
 import threading
 from typing import Optional
 
+from agent.delegation_context import stop_child_task_intent
 from agent.interrupt_compat import request_hard_interrupt
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
@@ -202,6 +203,8 @@ class InterruptControlMixin:
             # The turn record and the log must agree on WHO asked for the stop (#112647).
             logger.info("Interrupt requested (%s): %s", "hard" if hard_cancel else "soft", tool_interrupt_reason)
             _hard_event = getattr(self, "_hard_interrupt_requested", None) if hard_cancel else None
+            if hard_cancel and (getattr(self, "_delegate_depth", 0) or "_delegate_running_intent" in vars(self)):
+                stop_child_task_intent(self)
             if _hard_event is not None:
                 _hard_event.set()
 

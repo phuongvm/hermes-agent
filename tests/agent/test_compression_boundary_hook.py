@@ -12,8 +12,7 @@ this from a real user-initiated /new.
 """
 
 import os
-import tempfile
-from pathlib import Path
+from contextlib import closing
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,7 +36,6 @@ class TestCompressionBoundaryHook:
             return agent
 
     def test_on_session_start_called_with_compression_boundary(self, tmp_path):
-        from contextlib import closing
         from hermes_state import SessionDB
 
         with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
@@ -104,12 +102,11 @@ class TestCompressionBoundaryHook:
                 f"Expected old_session_id={original_sid!r}, got {call.kwargs!r}"
             assert len(comp_calls) == 1
 
-    def test_automatic_notification_follows_core_persistence(self):
+    def test_automatic_notification_follows_core_persistence(self, tmp_path):
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.return_value = [
@@ -144,11 +141,10 @@ class TestCompressionBoundaryHook:
 
             assert events == ["persist", "compression"]
 
-    def test_failure_before_persistence_does_not_notify(self):
+    def test_failure_before_persistence_does_not_notify(self, tmp_path):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.side_effect = RuntimeError("synthetic compression failure")
@@ -163,11 +159,10 @@ class TestCompressionBoundaryHook:
 
             compressor.on_session_start.assert_not_called()
 
-    def test_no_progress_does_not_notify(self):
+    def test_no_progress_does_not_notify(self, tmp_path):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.side_effect = lambda messages, **_kwargs: messages
@@ -221,12 +216,11 @@ class TestCompressionBoundaryHook:
             f"got {comp_calls!r}"
         )
 
-    def test_hook_failure_does_not_break_compression(self):
+    def test_hook_failure_does_not_break_compression(self, tmp_path):
         """If the context engine raises from on_session_start, compression still completes."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
             agent = self._make_agent(db)
 
             compressor = MagicMock()
@@ -289,12 +283,11 @@ class TestSessionCompressEvent:
         compressor._last_compress_aborted = False
         return compressor
 
-    def test_event_emitted_on_compression(self):
+    def test_event_emitted_on_compression(self, tmp_path):
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
             agent = self._make_agent(
                 db, event_callback=lambda et, ctx: events.append((et, ctx))
             )
