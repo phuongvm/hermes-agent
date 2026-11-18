@@ -33,7 +33,8 @@ class _ScriptedModel:
     """Stands in for AIAgent: records how each child was built and what each turn saw, and persists each turn
     into the child's dedicated SessionDB handle the way a real child's transcript lands there."""
 
-    def __init__(self):
+    def __init__(self, *, first_complete=True):
+        self.first_complete = first_complete
         self.builds, self.turns = [], []
 
     def __call__(self, **kw):
@@ -47,13 +48,15 @@ class _ScriptedModel:
         db = kw["session_db"]
 
         def run_conversation(user_message, conversation_history=None, **_):
-            self.turns.append({"session_id": child.session_id, "message": user_message,
+            from agent.delegation_context import current_task_intent
+            intent = current_task_intent(child.session_id, child._parent_session_id)
+            self.turns.append({"intent": intent, "session_id": child.session_id, "message": user_message,
                                "history": conversation_history, "home": str(get_hermes_home())})
             db.create_session(child.session_id, "subagent", parent_session_id=kw.get("parent_session_id"))
             reply = f"done: {user_message}"
             db.append_message(child.session_id, "user", user_message)
             db.append_message(child.session_id, "assistant", reply)
-            return {"final_response": reply, "completed": True, "api_calls": 1}
+            return {"final_response": reply, "completed": self.first_complete or len(self.turns) > 1, "api_calls": 1}
 
         child.run_conversation.side_effect = run_conversation
         self.builds.append({**kw, "home": str(get_hermes_home())})
@@ -122,6 +125,22 @@ def test_continue_runs_the_finished_child_on_its_transcript_route_and_toolsets()
     assert "done: now add tests for it" in json.dumps(done)
     stored = parent._session_db.get_messages_as_conversation(turn["session_id"])
     assert [m["content"] for m in stored][-2:] == ["now add tests for it", "done: now add tests for it"]
+
+
+@pytest.mark.parametrize("first_complete", [False, True], ids=["unfinished", "completed"])
+def test_continue_only_retains_an_unfinished_native_assignment(first_complete):
+    from tools.delegate_tool import delegate_task
+
+    model, parent = _ScriptedModel(first_complete=first_complete), _parent()
+    with patch("run_agent.AIAgent", side_effect=model):
+        sid, _ = _spawn(parent, "Write proposal.md.")
+        out = json.loads(delegate_task(action="continue", subagent_id=sid, message="Continue.",
+                                       background=True, parent_agent=parent))
+        assert out.get("status") == "dispatched", out
+        _completion(out["delegation_id"])
+    first, second = model.turns
+    assert first["intent"] is not None
+    assert second["intent"] is (None if first_complete else first["intent"])
 
 
 def test_an_inherited_route_refuses_once_the_parent_switched_provider():

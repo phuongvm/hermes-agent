@@ -191,6 +191,8 @@ def _start(
             return None, err
         db.reopen_session(session_id)  # its close() ended it; the continued child's close() ends it again
         children[0][2]._delegate_continue_history = history
+        if record is not None and record.get("state") == "resumable":
+            children[0][2]._delegate_intent_handoff = spec.get("_intent_handoff")
         children[0][2]._delegate_run_origin = run_origin  # a parent's own continue ends automatic resumes of it
         from tools.delegate_tool_resumable import hold_claim, last_workspace
         children[0][2]._delegate_continue_workspace = last_workspace(parent_agent, sid)

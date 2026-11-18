@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from hashlib import sha256
+from threading import RLock
+from weakref import WeakValueDictionary
 from uuid import uuid4
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -20,7 +22,7 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TaskIntent:
     """Host provenance for a native assignment; carries no tool authorization."""
 
@@ -36,11 +38,44 @@ class TaskIntent:
 _TASK_INTENT: ContextVar[TaskIntent | None] = ContextVar("hermes_task_intent", default=None)
 
 
+# The scope token is per activation, including resumes. A copied ContextVar
+# cannot become live again when the same assignment enters a later turn.
+_ACTIVE_LOCK = RLock()
+_ACTIVE: dict[str, tuple[TaskIntent, object]] = {}
+_LATEST: WeakValueDictionary[str, TaskIntent] = WeakValueDictionary()
+_SCOPE: ContextVar[object | None] = ContextVar("hermes_assignment_scope", default=None)
+
+
+class _ResumeIntent:
+    """One-use in-process handoff. Never serialize or rebuild from history."""
+
+    def __init__(self, record: TaskIntent):
+        self.record: TaskIntent | None = record
+
+    def take(self, actor: str, parent: str) -> TaskIntent | None:
+        with _ACTIVE_LOCK:
+            record, self.record = self.record, None
+            if record and record.actor_session_id == actor and record.parent_session_id == parent:
+                return record
+            return None
+
+
+def revoke_task_intent(record: TaskIntent | None) -> None:
+    """Invalidate a running worker without revoking a replacement actor's assignment."""
+    if type(record) is TaskIntent:
+        with _ACTIVE_LOCK:
+            active = _ACTIVE.get(record.actor_session_id)
+            if _LATEST.get(record.actor_session_id) is record:
+                del _LATEST[record.actor_session_id]
+            if active and active[0] is record:
+                del _ACTIVE[record.actor_session_id]
+
+
 @contextmanager
 def native_task_intent(
     *, actor_session_id: str, parent_session_id: str, goal: str, context: str | None,
-    resumed: bool = False,
-) -> Iterator[None]:
+    resumed: bool = False, handoff: _ResumeIntent | None = None,
+) -> Iterator[TaskIntent | None]:
     """Bind separate native producer inputs, never deserialize a model envelope.
 
     Unknown resumed state receives no fresh provenance. Lifecycle retention is
@@ -57,10 +92,25 @@ def native_task_intent(
             pass  # Invalid text retains legacy handling, never partial provenance.
         else:
             record = TaskIntent(1, uuid4().hex, actor_session_id, parent_session_id, goal, goal_hash, context_hash)
+    scope = object()
+    with _ACTIVE_LOCK:
+        if valid and resumed and type(handoff) is _ResumeIntent:
+            record = handoff.take(actor_session_id, parent_session_id)
+            if _LATEST.get(actor_session_id) is not record or actor_session_id in _ACTIVE:
+                record = None
+        if record is not None:
+            _LATEST[actor_session_id] = record
+            _ACTIVE[actor_session_id] = (record, scope)
     token = _TASK_INTENT.set(record)
+    scope_token = _SCOPE.set(scope)
     try:
-        yield
+        yield record
     finally:
+        if record is not None:
+            with _ACTIVE_LOCK:
+                if _ACTIVE.get(actor_session_id) == (record, scope):
+                    del _ACTIVE[actor_session_id]
+        _SCOPE.reset(scope_token)
         _TASK_INTENT.reset(token)
 
 
@@ -82,7 +132,9 @@ def current_task_intent(actor_session_id: str, parent_session_id: str) -> TaskIn
         goal_hash = sha256(record.goal_text.encode("utf-8")).hexdigest()
     except UnicodeEncodeError:
         return None
-    return record if record.goal_hash == goal_hash else None
+    with _ACTIVE_LOCK:
+        active = _ACTIVE.get(actor_session_id)
+        return record if record.goal_hash == goal_hash and active == (record, _SCOPE.get()) else None
 
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"

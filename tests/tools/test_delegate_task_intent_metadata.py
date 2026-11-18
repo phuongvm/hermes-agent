@@ -146,6 +146,16 @@ def test_malformed_record_does_not_skip_other_pre_llm_callbacks(captured_hook, m
     assert captured_hook[0]["task_intent"] is None
 
 
+def test_finished_native_scope_invalidates_all_context_copies():
+    from contextvars import copy_context
+    from agent.delegation_context import current_task_intent, native_task_intent
+
+    with native_task_intent(actor_session_id="child", parent_session_id="parent", goal="Inspect.", context=None):
+        observer = copy_context()
+        assert observer.run(current_task_intent, "child", "parent") is not None
+    assert observer.run(current_task_intent, "child", "parent") is None
+
+
 def test_nested_assignments_restore_parent_and_unknown_resume_cannot_mint():
     from agent.delegation_context import current_task_intent, native_task_intent
 
