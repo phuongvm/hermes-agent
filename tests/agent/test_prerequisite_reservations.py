@@ -108,26 +108,72 @@ def test_revoke_during_metadata_check_prevents_begin(scenario, monkeypatch):
             assert pending.result(timeout=10) == "closed"
 
 
-@pytest.mark.parametrize("end", ["cancel", "failure", "denial", "changed-arguments", "deadline", "output", "revoke"])
+def test_full_budget_refuses_new_ids_without_resolving(scenario, monkeypatch):
+    ledger, args, _ = scenario
+    with dc.native_task_intent(**SCOPE) as intent:
+        assert ledger.start_preparation(intent, "actor", 1, 60)
+        assert ledger.reserve_read(intent, "actor", "last", "read_file", args) == "reserved"
+
+        def unexpected_resolution(*_args):
+            pytest.fail("A new ID at zero capacity must not inspect descriptors")
+
+        with monkeypatch.context() as scope:
+            scope.setattr(ledger, "resolve_operation", unexpected_resolution)
+            assert ledger.reserve_read(intent, "actor", "new", "read_file", args) == "exhausted"
+            assert ledger.reserve_read(intent, "actor", "last", "read_file", args) == "replay"
+        assert ledger.begin_read(intent, "actor", "last", "read_file", args) == "started"
+        assert ledger.begin_read(intent, "actor", "last", "read_file", args) == "replay"
+
+
+@pytest.mark.parametrize("settle", ["failure", "cancel", "denial"])
+def test_settled_count_exhaustion_cannot_reopen(scenario, monkeypatch, settle):
+    ledger, args, _ = scenario
+    invocations = []
+
+    def fail():
+        invocations.append("called")
+        raise RuntimeError("fixture read failed")
+
+    with dc.native_task_intent(**SCOPE) as intent:
+        assert ledger.start_preparation(intent, "actor", 1, 60)
+        assert ledger.reserve_read(intent, "actor", "last", "read_file", args) == "reserved"
+        if settle == "failure":
+            assert ledger.begin_read(intent, "actor", "last", "read_file", args) == "started"
+            with pytest.raises(RuntimeError, match="fixture read failed"):
+                fail()
+        else:
+            ledger.discard_read(intent, "actor", "last")
+        assert not ledger.begin_output(intent, "actor")
+
+        def unexpected_resolution(*_args):
+            pytest.fail("Settled exhaustion must not inspect descriptors")
+
+        monkeypatch.setattr(ledger, "resolve_operation", unexpected_resolution)
+        for call_id, expected in (("last", "replay"), ("fresh", "exhausted")):
+            assert ledger.reserve_read(intent, "actor", call_id, "read_file", args) == expected
+            if ledger.begin_read(intent, "actor", call_id, "read_file", args) == "started":
+                fail()
+        assert invocations == (["called"] if settle == "failure" else [])
+
+
+@pytest.mark.parametrize("end", ["changed-arguments", "deadline", "output", "revoke"])
 def test_consumed_attempts_never_reopen(scenario, end):
     ledger, args, now = scenario
     with dc.native_task_intent(**SCOPE) as intent:
         assert ledger.start_preparation(intent, "actor", 1, 5)
         assert ledger.reserve_read(intent, "actor", "read", "read_file", args) == "reserved"
-        def discard():
-            ledger.discard_read(intent, "actor", "read")
 
         def expire():
             now[0] += 5
 
-        prepare = {"cancel": discard, "denial": discard, "deadline": expire,
+        prepare = {"deadline": expire,
                    "output": lambda: ledger.begin_output(intent, "actor"),
                    "revoke": lambda: dc.revoke_task_intent(intent)}
         if end in prepare:
             prepare[end]()
         candidate_args = {**args, "limit": 2} if end == "changed-arguments" else args
-        expected = {"failure": "started", "changed-arguments": "mismatch", "deadline": "exhausted",
-                    "output": "output", "revoke": "closed"}.get(end, "replay")
+        expected = {"changed-arguments": "mismatch", "deadline": "exhausted",
+                    "output": "output", "revoke": "closed"}[end]
         assert ledger.begin_read(intent, "actor", "read", "read_file", candidate_args) == expected
         assert ledger.begin_read(intent, "actor", "read", "read_file", args) != "started"
         assert not ledger.start_preparation(intent, "actor", 128, 900)
@@ -147,11 +193,26 @@ def test_continuation_preserves_consumption_but_not_pending_dispatch(scenario):
         assert resumed is intent
         assert not ledger.start_preparation(intent, "actor", 128, 900)
         assert observer.run(ledger.begin_read, intent, "actor", "old", "read_file", args) == "inactive"
-        assert ledger.begin_read(intent, "actor", "old", "read_file", args) == "inactive"
+        assert ledger.begin_read(intent, "actor", "old", "read_file", args) == "replay"
         assert ledger.reserve_read(intent, "actor", "old", "read_file", args) == "replay"
         assert ledger.reserve_read(intent, "actor", "new", "read_file", args) == "reserved"
         assert ledger.begin_read(intent, "actor", "new", "read_file", args) == "started"
         assert ledger.reserve_read(intent, "actor", "extra", "read_file", args) == "exhausted"
+
+
+def test_continuation_settles_full_budget_with_only_stale_tickets(scenario, monkeypatch):
+    ledger, args, _ = scenario
+    with dc.native_task_intent(**SCOPE) as intent:
+        assert ledger.start_preparation(intent, "actor", 1, 60)
+        assert ledger.reserve_read(intent, "actor", "last", "read_file", args) == "reserved"
+        assert intent is not None
+        handoff = dc._ResumeIntent(intent)
+    with dc.native_task_intent(**SCOPE, resumed=True, handoff=handoff) as resumed:
+        assert resumed is intent
+        monkeypatch.setattr(ledger, "resolve_operation", lambda *_: pytest.fail("No ticket can start after resume"))
+        assert not ledger.begin_output(intent, "actor")
+        assert ledger.begin_read(intent, "actor", "last", "read_file", args) == "replay"
+        assert ledger.reserve_read(intent, "actor", "new", "read_file", args) == "exhausted"
 
 
 def test_continued_assignment_cannot_start_first_budget(scenario):

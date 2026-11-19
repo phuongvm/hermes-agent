@@ -24,6 +24,7 @@ class _Preparation:
     deadline: float
     output_matches: Callable[[str, dict], bool] | None = None
     phase: str = "preparing"
+    deadline_expired: bool = False
     seen: set[str] = field(default_factory=set)
     pending: dict[str, _PendingRead] = field(default_factory=dict)
 
@@ -31,9 +32,25 @@ class _Preparation:
         self.phase = phase
         self.pending.clear()
 
-    def check_deadline(self) -> str:
-        if self.phase == "preparing" and _monotonic() >= self.deadline:
+    def at_capacity(self) -> bool:
+        return len(self.seen) >= self.limit
+
+    def settle_count(self) -> None:
+        # A full budget may still have valid tickets waiting to start.
+        if self.at_capacity() and not self.pending:
             self.retire("exhausted")
+
+    def refresh(self, actor: str, scope: object) -> str:
+        if self.phase != "preparing":
+            return self.phase
+        if _monotonic() >= self.deadline:
+            self.deadline_expired = True
+            self.retire("exhausted")
+        else:
+            stale = [key for key, ticket in self.pending.items() if ticket.scope is not scope or ticket.actor != actor]
+            for key in stale:
+                del self.pending[key]
+            self.settle_count()
         return self.phase
 
 
@@ -61,7 +78,7 @@ def start_preparation(
         return True
 
 
-def _check(intent: TaskIntent, scope: object | None, closed: bool) -> tuple[_Preparation | None, str]:
+def _check(intent: TaskIntent, actor: str, scope: object | None, closed: bool) -> tuple[_Preparation | None, str]:
     preparation = _preparations.get(intent)
     if closed:
         if preparation is not None:
@@ -71,7 +88,7 @@ def _check(intent: TaskIntent, scope: object | None, closed: bool) -> tuple[_Pre
         return None, "inactive"
     if preparation is None:
         return None, "unavailable"
-    return preparation, preparation.check_deadline()
+    return preparation, preparation.refresh(actor, scope)
 
 
 def _valid_call(intent: TaskIntent | None, call_id: str) -> bool:
@@ -83,18 +100,18 @@ def reserve_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: 
     if not _valid_call(intent, call_id):
         return "unavailable"
     with locked_task_intent_scope(intent, actor) as (scope, _fresh, closed):
-        preparation, state = _check(intent, scope, closed)
+        preparation, state = _check(intent, actor, scope, closed)
         if preparation is None:
             return state
         if call_id in preparation.seen:
             return "replay"
         if state != "preparing":
             return state
+        if preparation.at_capacity():
+            return "exhausted"
     descriptor = resolve_operation(intent, actor, tool, args)
-    if descriptor is None:
-        return "unavailable"
     with locked_task_intent_scope(intent, actor) as (current, _fresh, closed):
-        preparation, state = _check(intent, current, closed)
+        preparation, state = _check(intent, actor, current, closed)
         if preparation is None:
             return state
         if current is not scope or current is None:
@@ -103,8 +120,10 @@ def reserve_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: 
             return "replay"
         if state != "preparing":
             return state
-        if len(preparation.seen) >= preparation.limit:
+        if preparation.at_capacity():
             return "exhausted"
+        if descriptor is None:
+            return "unavailable"
         preparation.seen.add(call_id)
         preparation.pending[call_id] = _PendingRead(actor, current, descriptor)
         return "reserved"
@@ -118,9 +137,9 @@ def begin_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: di
     if not _valid_call(intent, call_id):
         return "unavailable"
     with locked_task_intent_scope(intent, actor) as (scope, _fresh, closed):
-        preparation, state = _check(intent, scope, closed)
+        preparation, state = _check(intent, actor, scope, closed)
         if preparation is None or state != "preparing":
-            return state
+            return _begin_disposition(preparation, state, call_id)
         pending = preparation.pending.get(call_id)
         if pending is None:
             return "replay" if call_id in preparation.seen else "unavailable"
@@ -128,14 +147,22 @@ def begin_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: di
             return "inactive"
     descriptor = resolve_operation(intent, actor, tool, args)
     with locked_task_intent_scope(intent, actor) as (current, _fresh, closed):
-        preparation, state = _check(intent, current, closed)
+        preparation, state = _check(intent, actor, current, closed)
         if preparation is None or state != "preparing":
-            return state
+            return _begin_disposition(preparation, state, call_id)
         if current is not scope:
             return "inactive"
         if preparation.pending.pop(call_id, None) is not pending:
             return "replay"
+        preparation.settle_count()
         return "started" if descriptor == pending.descriptor else "mismatch"
+
+
+def _begin_disposition(preparation: _Preparation | None, state: str, call_id: str) -> str:
+    if (preparation is not None and state == "exhausted" and not preparation.deadline_expired
+            and call_id in preparation.seen):
+        return "replay"
+    return state
 
 
 def discard_read(intent: TaskIntent, actor: str, call_id: str) -> None:
@@ -143,11 +170,12 @@ def discard_read(intent: TaskIntent, actor: str, call_id: str) -> None:
     if not _valid_call(intent, call_id):
         return
     with locked_task_intent_scope(intent, actor) as (scope, _fresh, closed):
-        preparation, state = _check(intent, scope, closed)
+        preparation, state = _check(intent, actor, scope, closed)
         if preparation is not None and state == "preparing":
             pending = preparation.pending.get(call_id)
             if pending is not None and pending.scope is scope and pending.actor == actor:
                 del preparation.pending[call_id]
+                preparation.settle_count()
 
 
 def begin_output(intent: TaskIntent, actor: str) -> bool:
@@ -155,7 +183,7 @@ def begin_output(intent: TaskIntent, actor: str) -> bool:
     if type(intent) is not TaskIntent:
         return False
     with locked_task_intent_scope(intent, actor) as (scope, _fresh, closed):
-        preparation, state = _check(intent, scope, closed)
+        preparation, state = _check(intent, actor, scope, closed)
         if preparation is None or state != "preparing":
             return False
         preparation.retire("output")
@@ -168,7 +196,7 @@ def note_output_dispatch(actor: str, parent: str, tool: str, args: dict) -> None
     if intent is None:
         return
     with locked_task_intent_scope(intent, actor) as (scope, _fresh, closed):
-        preparation, state = _check(intent, scope, closed)
+        preparation, state = _check(intent, actor, scope, closed)
         if preparation is None or state != "preparing" or preparation.output_matches is None:
             return
         matches = preparation.output_matches
@@ -179,6 +207,6 @@ def note_output_dispatch(actor: str, parent: str, tool: str, args: dict) -> None
         retire_as = "closed"
     if retire_as is not None:
         with locked_task_intent_scope(intent, actor) as (current, _fresh, closed):
-            preparation, state = _check(intent, current, closed)
+            preparation, state = _check(intent, actor, current, closed)
             if current is scope and preparation is not None and state == "preparing":
                 preparation.retire(retire_as)
