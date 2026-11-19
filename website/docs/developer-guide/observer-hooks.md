@@ -188,13 +188,20 @@ Tool hooks describe individual tool calls:
 
 | Status | Meaning |
 | --- | --- |
-| `ok` | Tool completed normally. |
+| `ok` | No error was identified in the tool response; this can include a background-start acknowledgement. |
 | `error` | Tool ran and returned or raised an error outcome. |
 | `blocked` | A `pre_tool_call` hook blocked execution. |
 | `cancelled` | Execution was cancelled before normal completion. |
 
 `post_tool_call` is emitted for blocked and cancelled paths so telemetry
 plugins can close spans cleanly.
+
+For `terminal`, the host may also emit `terminal_foreground_completed=True`
+when a foreground execution reports an explicit zero exit code and the
+completion evidence matches the current session, turn, and tool call. This
+optional hook field is not part of the tool result JSON. Background starts,
+yielded calls, and unconfirmed results do not carry it. Its presence does not
+prove human approval or semantic effects; its absence is not proof of failure.
 
 ### Human Input Lifecycle
 

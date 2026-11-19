@@ -16,6 +16,22 @@ from typing import Any, Optional
 logger = logging.getLogger("tools.terminal_tool")
 
 
+class _CompletedForeground(str):
+    """A foreground result with in-process evidence, not an extra JSON field."""
+
+    __slots__ = ("call",)
+    call: tuple[str, str, str]
+
+    def __new__(cls, text: str, call: tuple[str, str, str]):
+        result = super().__new__(cls, text)
+        result.call = call
+        return result
+
+
+def confirms_foreground_completion(result: Any, call: tuple[str, str, str]) -> bool:
+    return type(result) is _CompletedForeground and all(call) and result.call == call
+
+
 @contextmanager
 def _quiet(label: str):
     """Best-effort block: swallow any exception, logging it at DEBUG."""
@@ -287,4 +303,15 @@ def finalize_foreground_result(
     for key, value in optional_fields:
         if value is not None:
             result_dict[key] = value
-    return json.dumps(result_dict, ensure_ascii=False)
+    text = json.dumps(result_dict, ensure_ascii=False)
+    raw_returncode = result.get("returncode")
+    if type(raw_returncode) is int and raw_returncode == 0 and not (
+        sudo_auth_failed or result.get("error") or result.get("hermes_timed_out")
+        or result.get("cwd_fallback") or result.get("environment_recreated")
+    ):
+        from tools.approval_context import current_approval_call
+
+        call = current_approval_call()
+        if all(call):
+            return _CompletedForeground(text, call)
+    return text

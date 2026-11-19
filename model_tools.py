@@ -714,11 +714,17 @@ def _emit_post_tool_call_hook(
             return
         if status is None:
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
+        completion = {}
+        if function_name == "terminal" and status == "ok" and not (error_type or error_message):
+            from tools.terminal_tool_result import confirms_foreground_completion
+
+            if confirms_foreground_completion(result, (session_id or "", turn_id or "", tool_call_id or "")):
+                completion["terminal_foreground_completed"] = True
         invoke_hook(
             "post_tool_call", tool_name=function_name, args=function_args, result=result,
             **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id).hook_kwargs(),
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
+            middleware_trace=list(middleware_trace or []), **completion,
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)

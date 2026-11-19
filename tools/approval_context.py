@@ -132,6 +132,11 @@ def set_current_observability_context(*, turn_id: str = "", tool_call_id: str = 
             _approval_session_id.set(session_id or ""))
 
 
+def current_approval_call() -> tuple[str, str, str]:
+    """Return the host-bound session, turn and tool call identity."""
+    return _approval_session_id.get(), _approval_turn_id.get(), _approval_tool_call_id.get()
+
+
 def reset_current_observability_context(tokens: _Tokens) -> None:
     """Restore prior approval hook correlation IDs."""
     turn_token, tool_token, session_token = tokens
