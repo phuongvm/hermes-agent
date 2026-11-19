@@ -756,7 +756,15 @@ def _dispatch_authorized_once(
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use, \
             bound_form_asker(getattr(agent, "clarify_callback", None)):
         try:
-            return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+            def dispatch():
+                parent = getattr(agent, "_parent_session_id", None)
+                if type(parent) is str and parent:
+                    from agent.prerequisite.reservations import note_output_dispatch
+
+                    note_output_dispatch(getattr(agent, "session_id", ""), parent, ref.name, ref.args)
+                return execute(ref.args)
+
+            return _run_with_activity_heartbeat(agent, ref.name, dispatch)
         finally:
             state.data_use = frozenset(data_use)
 

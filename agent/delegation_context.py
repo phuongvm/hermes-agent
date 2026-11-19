@@ -51,6 +51,7 @@ _LATEST: WeakValueDictionary[str, TaskIntent] = WeakValueDictionary()
 # compression transition moves its current physical segment.
 _SEGMENT: WeakKeyDictionary[TaskIntent, str] = WeakKeyDictionary()
 _SCOPE: ContextVar[object | None] = ContextVar("hermes_assignment_scope", default=None)
+_FRESH_SCOPE: ContextVar[bool] = ContextVar("hermes_assignment_fresh_scope", default=False)
 
 
 class _ResumeIntent:
@@ -127,6 +128,7 @@ def native_task_intent(
             _ACTIVE[actor_session_id] = (record, scope)
     token = _TASK_INTENT.set(record)
     scope_token = _SCOPE.set(scope)
+    fresh_token = _FRESH_SCOPE.set(record is not None and not resumed)
     try:
         yield record
     finally:
@@ -135,6 +137,7 @@ def native_task_intent(
                 segment = _SEGMENT.get(record)
                 if segment is not None and _ACTIVE.get(segment) == (record, scope):
                     del _ACTIVE[segment]
+        _FRESH_SCOPE.reset(fresh_token)
         _SCOPE.reset(scope_token)
         _TASK_INTENT.reset(token)
 
@@ -160,6 +163,19 @@ def current_task_intent(actor_session_id: str, parent_session_id: str) -> TaskIn
     with _ACTIVE_LOCK:
         active = _ACTIVE.get(actor_session_id)
         return record if record.goal_hash == goal_hash and active == (record, _SCOPE.get()) else None
+
+
+@contextmanager
+def locked_task_intent_scope(record: TaskIntent, actor: str) -> Iterator[tuple[object | None, bool, bool]]:
+    """Yield (active scope, fresh, closed) for accounting under the lifecycle lock.
+
+    Callers must not hold this lock across resource inspection or execution.
+    """
+    with _ACTIVE_LOCK:
+        segment = _SEGMENT.get(record)
+        closed = segment is None or _LATEST.get(segment) is not record
+        active = not closed and current_task_intent(actor, record.parent_session_id) is record
+        yield _SCOPE.get() if active else None, active and _FRESH_SCOPE.get(), closed
 
 
 def rebind_compressed_task_intent(old: str, new: str, parent: str | None) -> None:
