@@ -47,6 +47,7 @@ from agent.inline_tool_executors import (
     tool_hook_ids,
 )
 from agent.message_metadata import stamp_data_use
+from agent.prerequisite.guard import guarded_read_scope, pre_tool_block as _pre_tool_block
 from agent.session_persistence import sync_rewritten_tool_rows
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
@@ -661,23 +662,6 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
     return result
 
 
-def _pre_tool_block(agent, ref: _ToolCallRef):
-    """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
-    try:
-        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-
-        block_msg, modified_args = _dispatch_pre_tool_call_hooks(
-            ref.name,
-            ref.args,
-            **tool_hook_ids(agent, ref.task_id, ref.call_id),
-            middleware_trace=list(ref.trace),
-        )
-        return block_msg, (ref.args if modified_args is None else modified_args)
-    except Exception:
-        return None, ref.args
-
-
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -705,13 +689,17 @@ def _dispatch_authorized_once(
     # sequential, concurrent and batched call reaches its executor (inline, memory provider, context
     # engine, registry) only through here.
     from tools.hosted_tool_policy import hosted_tool_refusal
+
+    guarded_read = None
     block_message, block_error_type = hosted_tool_refusal(ref.name), "hosted_tool_refused"
     if block_message is None:
         block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
         block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)
-        block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
+        with guarded_read_scope(getattr(agent, "session_id", ""), getattr(agent, "_parent_session_id", ""),
+                                ref.call_id, ref.name) as guarded_read:
+            resolve = lambda: _pre_tool_block(agent, ref)
+            block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
     block_body = None if block_message is None else {"error": block_message}
 
@@ -734,6 +722,10 @@ def _dispatch_authorized_once(
         if guardrail_decision.allows_execution:
             guardrail_decision = None
 
+    if (block_body is None and guardrail_decision is None and guarded_read is not None
+            and guarded_read.requires_verified_reader):
+        block_body = {"error": "Prerequisite verified reader unavailable; no read dispatched."}
+        block_error_type = "prerequisite_reader_unavailable"
     if block_body is not None or guardrail_decision is not None:
         _advance_start_order()
         state.blocked = True
