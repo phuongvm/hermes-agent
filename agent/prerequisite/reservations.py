@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import Event
 from time import monotonic as _monotonic
 from weakref import WeakKeyDictionary
 
@@ -16,6 +17,7 @@ class _PendingRead:
     actor: str
     scope: object
     descriptor: ReadDescriptor
+    invalidated: Event | None = None
 
 
 @dataclass(slots=True)
@@ -47,7 +49,11 @@ class _Preparation:
             self.deadline_expired = True
             self.retire("exhausted")
         else:
-            stale = [key for key, ticket in self.pending.items() if ticket.scope is not scope or ticket.actor != actor]
+            stale = [
+                key for key, ticket in self.pending.items()
+                if ticket.scope is not scope or ticket.actor != actor
+                or (ticket.invalidated is not None and ticket.invalidated.is_set())
+            ]
             for key in stale:
                 del self.pending[key]
             self.settle_count()
@@ -95,7 +101,10 @@ def _valid_call(intent: TaskIntent | None, call_id: str) -> bool:
     return type(intent) is TaskIntent and type(call_id) is str and 0 < len(call_id) <= 256
 
 
-def reserve_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: dict) -> str:
+def reserve_read(
+    intent: TaskIntent, actor: str, call_id: str, tool: str, args: dict,
+    *, invalidated: Event | None = None,
+) -> str:
     """Consume one attempt for a matching descriptor; never refund it."""
     if not _valid_call(intent, call_id):
         return "unavailable"
@@ -124,8 +133,10 @@ def reserve_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: 
             return "exhausted"
         if descriptor is None:
             return "unavailable"
+        if invalidated is not None and invalidated.is_set():
+            return "inactive"
         preparation.seen.add(call_id)
-        preparation.pending[call_id] = _PendingRead(actor, current, descriptor)
+        preparation.pending[call_id] = _PendingRead(actor, current, descriptor, invalidated)
         return "reserved"
 
 
@@ -155,6 +166,8 @@ def begin_read(intent: TaskIntent, actor: str, call_id: str, tool: str, args: di
         if preparation.pending.pop(call_id, None) is not pending:
             return "replay"
         preparation.settle_count()
+        if pending.invalidated is not None and pending.invalidated.is_set():
+            return "replay"
         return "started" if descriptor == pending.descriptor else "mismatch"
 
 

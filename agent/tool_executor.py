@@ -697,7 +697,7 @@ def _dispatch_authorized_once(
     if block_message is None:
         block_error_type = "plugin_block"
         with guarded_read_scope(getattr(agent, "session_id", ""), getattr(agent, "_parent_session_id", ""),
-                                ref.call_id, ref.name) as guarded_read:
+                                ref.call_id, ref.name, ref.args) as guarded_read:
             resolve = lambda: _pre_tool_block(agent, ref)
             block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args

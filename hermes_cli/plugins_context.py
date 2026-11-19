@@ -768,6 +768,12 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
                 _facade().logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
+    def reserve_prerequisite_read(self, *, session_id: str, assignment_id: str, tool_call_id: str, tool_name: str) -> str:
+        """Account for a matching read in the current pre-tool call; never authorize dispatch."""
+        from agent.prerequisite.guard import reserve_progress_read
+
+        return reserve_progress_read(session_id, assignment_id, tool_call_id, tool_name)
+
     def register_pre_verify_no_edits(self, callback: Callable) -> PluginRegistration:
         """Opt in to bounded stop checks for native assignments with no recorded edits."""
         return self.register_hook(_facade().PRE_VERIFY_NO_EDITS, callback)

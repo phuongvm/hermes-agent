@@ -8,6 +8,12 @@ Selection is not authorization to read. The Gateway binds the selection to the a
 
 For an active native assignment, the matcher accepts only exact catalog resources and validated parameters: `read_file` with a pinned absolute path and bounded pagination; `skill_view` with a pinned skill and, when requested, an explicitly pinned reference; or one of `openspec_status`, `openspec_instructions`, `openspec_spec_show`, and `openspec_spec_list` scoped to the declared planning home and change or baseline. Generic wrappers, terminal commands, code execution, network tools, and broad search do not match. A match is metadata only. It neither reserves an attempt nor opens a resource; downstream dispatch must still check adapter support, current authority, and content integrity.
 
+## Progress supervision hook
+
+An in-process plugin can feature-detect `ctx.reserve_prerequisite_read` when it registers its `pre_tool_call` callback. Call it with `session_id`, `assignment_id`, `tool_call_id`, and `tool_name` from the active assignment and hook. The host checks these against the current executor call and matches its own original arguments; the plugin does not supply read arguments, a path override, or an approval decision. A call outside that scope returns `unavailable`.
+
+Only `reserved` means a new accounting attempt was recorded. A progress supervisor may decline its own local progress veto in that case. It must retain its veto when the host lacks the method or returns any other disposition. This is not authorization: other controls and native approval still apply, and no ordinary reader may handle a reserved operation in place of a verified reader. Until such a reader is available, the host refuses dispatch and emits `status="blocked"`, `error_type="prerequisite_reader_unavailable"` to `post_tool_call`. This outcome counts as an observation, not a tool execution failure or output progress. Replays, vetoes and cleanup failures never refund a consumed attempt.
+
 ## Saved configuration
 
 The following fragment is intentionally incomplete, with placeholder paths and identity values. Do not install it as-is. No profile or plugin is enabled by this example.
