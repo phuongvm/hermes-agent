@@ -690,49 +690,57 @@ def _dispatch_authorized_once(
     # engine, registry) only through here.
     from tools.hosted_tool_policy import hosted_tool_refusal
 
-    guarded_read = None
     block_message, block_error_type = hosted_tool_refusal(ref.name), "hosted_tool_refused"
     if block_message is None:
         block_message, block_error_type = scope_block, "tool_scope_block"
-    if block_message is None:
-        block_error_type = "plugin_block"
-        with guarded_read_scope(getattr(agent, "session_id", ""), getattr(agent, "_parent_session_id", ""),
-                                ref.call_id, ref.name, ref.args) as guarded_read:
+    with guarded_read_scope(getattr(agent, "session_id", ""), getattr(agent, "_parent_session_id", ""),
+                            ref.call_id, ref.name, ref.args) as guarded_read:
+        if block_message is None:
+            block_error_type = "plugin_block"
             resolve = lambda: _pre_tool_block(agent, ref)
-            block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
-        state.args = ref.args
-    block_body = None if block_message is None else {"error": block_message}
+            run_pre = lambda: resolve() if authorization_gate is None else authorization_gate.run(resolve)
+            if guarded_read is None:
+                block_message, ref.args = run_pre()
+            else:
+                with guarded_read.pre_tool_window():
+                    block_message, ref.args = run_pre()
+            state.args = ref.args
+        block_body = None if block_message is None else {"error": block_message}
 
-    # Checked once, after plugin modify hooks (which may replace arguments) and
-    # before guardrails or real dispatch: a copied compression marker in an
-    # effect-capable argument must never reach the tool.
-    if block_body is None:
-        pruned_paths = _context_pruned_argument_paths(ref.name, ref.args)
-        if pruned_paths:
-            block_body = {
-                "error": _PRUNED_TOOL_ARGUMENTS_ERROR,
-                "message": _PRUNED_TOOL_ARGUMENTS_MESSAGE,
-                "argument_paths": pruned_paths,
-            }
-            block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
+        # Checked once, after plugin modify hooks (which may replace arguments) and
+        # before guardrails or real dispatch: a copied compression marker in an
+        # effect-capable argument must never reach the tool.
+        if block_body is None:
+            pruned_paths = _context_pruned_argument_paths(ref.name, ref.args)
+            if pruned_paths:
+                block_body = {
+                    "error": _PRUNED_TOOL_ARGUMENTS_ERROR,
+                    "message": _PRUNED_TOOL_ARGUMENTS_MESSAGE,
+                    "argument_paths": pruned_paths,
+                }
+                block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
 
-    guardrail_decision = None
-    if block_body is None:
-        guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
-        if guardrail_decision.allows_execution:
-            guardrail_decision = None
+        guardrail_decision = None
+        if block_body is None:
+            guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
+            if guardrail_decision.allows_execution:
+                guardrail_decision = None
 
-    if (block_body is None and guardrail_decision is None and guarded_read is not None
-            and guarded_read.requires_verified_reader):
-        block_body = {"error": "Prerequisite verified reader unavailable; no read dispatched."}
-        block_error_type = "prerequisite_reader_unavailable"
-    if block_body is not None or guardrail_decision is not None:
-        _advance_start_order()
-        state.blocked = True
-        return _blocked_tool_result(
-            agent, ref,
-            block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
-        )
+        if (block_body is None and guardrail_decision is None and guarded_read is not None
+                and guarded_read.requires_verified_reader):
+            verified_out, block_body, block_error_type = guarded_read.dispatch_or_block(
+                ref.args, task_id=ref.task_id,
+            )
+            if verified_out is not None:
+                _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
+                return verified_out
+        if block_body is not None or guardrail_decision is not None:
+            _advance_start_order()
+            state.blocked = True
+            return _blocked_tool_result(
+                agent, ref,
+                block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
+            )
 
     if ref.name == "memory":
         agent._turns_since_memory = 0

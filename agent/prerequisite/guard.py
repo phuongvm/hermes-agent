@@ -1,16 +1,17 @@
 """Host-owned handoff between progress supervision and the guarded executor."""
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from threading import Event, Lock
-from typing import Iterator
+from typing import Any, Iterator
 
 from agent.delegation_context import TaskIntent, current_task_intent
 from agent.inline_tool_executors import tool_hook_ids
-from . import reservations
+from . import reader, reservations
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class GuardedRead:
     _closed: bool = False
     _restricted: bool = False
     _owns_ticket: bool = False
+    _dispatched: bool = False
 
     @property
     def requires_verified_reader(self) -> bool:
@@ -55,11 +57,48 @@ class GuardedRead:
             self._discard_owned_ticket()
         return "inactive"
 
+    @contextmanager
+    def pre_tool_window(self) -> Iterator[None]:
+        token = _current.set(self)
+        try:
+            yield
+        finally:
+            _current.reset(token)
+
+    def dispatch_or_block(self, final_args: dict, *, task_id: str | None = None) -> tuple[str | None, dict[str, Any] | None, str]:
+        """Dispatch through a supported verified reader, or return a conservative block."""
+        if self.tool != "read_file":
+            self.close()
+            return (
+                None,
+                {"error": "Prerequisite verified reader unavailable; no read dispatched."},
+                "prerequisite_reader_unavailable",
+            )
+        with self._lock:
+            if self._closed or not self._owns_ticket:
+                self._closed = True
+                self._invalidated.set()
+                return (
+                    None,
+                    {"error": "Prerequisite read ticket unavailable or replayed; no read dispatched."},
+                    "prerequisite_replay",
+                )
+            self._dispatched = True
+            self._owns_ticket = False
+        payload, err_type = reader.dispatch_bounded_read_file(
+            self.intent, self.actor, self.call_id, final_args, task_id=task_id,
+        )
+        if err_type is not None:
+            return None, json.loads(payload), err_type
+        return payload, None, ""
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            self._invalidated.set()
+            if not self._dispatched:
+                self._invalidated.set()
             owns_ticket = self._owns_ticket
+            self._owns_ticket = False
         if owns_ticket:
             self._discard_owned_ticket()
 
@@ -79,11 +118,9 @@ def guarded_read_scope(actor: str, parent: str, call_id: str, tool: str, args: d
     call = None
     if intent is not None and intent.proposal_selection is not None:
         call = GuardedRead(intent, actor, call_id, tool, dict(args))
-    token = _current.set(call)
     try:
         yield call
     finally:
-        _current.reset(token)
         if call is not None:
             call.close()
 

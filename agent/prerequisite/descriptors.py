@@ -80,12 +80,8 @@ def _openspec(tool: str, selection: ProposalSelection, args: dict,
     return ReadDescriptor(tool, tuple(sorted(params.items())), tuple(pins[key] for key in keys))
 
 
-def resolve_operation(intent: TaskIntent | None, actor: str, tool: str, args: dict) -> ReadDescriptor | None:
-    """Match only an active native assignment's catalog, with no content reads.
-
-    The result is neither a reservation nor an authorization. Dispatch still
-    needs to verify adapter support, current authority and content integrity.
-    """
+def match_operation(intent: TaskIntent | None, actor: str, tool: str, args: dict) -> ReadDescriptor | None:
+    """Match an active assignment's frozen catalog pins and parameters without filesystem I/O."""
     if type(intent) is not TaskIntent or type(tool) is not str or type(args) is not dict:
         return None
     if tool not in _OPENSPEC_FIELDS and tool not in {"read_file", "skill_view"}:
@@ -97,12 +93,24 @@ def resolve_operation(intent: TaskIntent | None, actor: str, tool: str, args: di
         return None
     try:
         if tool == "read_file":
-            result = _file(selection, args)
-        else:
-            pins = {pin.key: pin for pin in selection.resources}
-            result = _skill(args, pins) if tool == "skill_view" else _openspec(tool, selection, args, pins)
-        if result is not None:
-            verify_catalog_metadata(selection)
+            return _file(selection, args)
+        pins = {pin.key: pin for pin in selection.resources}
+        return _skill(args, pins) if tool == "skill_view" else _openspec(tool, selection, args, pins)
+    except InvalidCatalog:
+        return None
+
+
+def resolve_operation(intent: TaskIntent | None, actor: str, tool: str, args: dict) -> ReadDescriptor | None:
+    """Match only an active native assignment's catalog, with no content reads.
+
+    The result is neither a reservation nor an authorization. Dispatch still
+    needs to verify adapter support, current authority and content integrity.
+    """
+    result = match_operation(intent, actor, tool, args)
+    if result is None or intent is None or intent.proposal_selection is None:
+        return None
+    try:
+        verify_catalog_metadata(intent.proposal_selection)
         return result
     except InvalidCatalog:
         return None
