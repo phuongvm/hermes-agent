@@ -1041,3 +1041,29 @@ def test_openspec_read_adapters_use_frozen_buffers_without_cli_or_rescan_and_cap
         )
         assert err_bad == "prerequisite_unavailable_snapshot"
         assert json.loads(raw_bad)["disposition"] == "unavailable_snapshot"
+
+
+def test_skill_view_policy_module_error_fails_closed(tmp_path, monkeypatch):
+    import sys
+    import tools
+    from agent.prerequisite import adapters
+
+    home = tmp_path / "home"
+    planning = tmp_path / "planning"
+    home.mkdir()
+    entry = proposal_entry(planning)
+    selection = catalog.freeze_proposal_catalog(CHANGE, entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: selection)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delattr(tools, "skills_tool", raising=False)
+    monkeypatch.setitem(sys.modules, "tools.skills_tool", None)
+
+    with dc.native_task_intent(**SCOPE) as intent:
+        assert reservations.start_preparation(intent, "actor", 2, 60)
+        args = {"name": "openspec-propose"}
+        assert reservations.reserve_read(intent, "actor", "sk-mod-err", "skill_view", args) == "reserved"
+        raw, err = adapters.dispatch_bounded_prerequisite(
+            intent, "actor", "sk-mod-err", "skill_view", args, task_id="t-w1"
+        )
+        assert err == "prerequisite_unsupported_backend"
+        assert json.loads(raw)["disposition"] == "unsupported_backend"

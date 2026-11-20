@@ -110,8 +110,11 @@ def _check_skill_policy(skill_name: str, frontmatter: dict[str, Any]) -> None:
             raise reader.BoundedReadError("unsupported_platform", "Skill is unsupported on active platform.")
     except reader.BoundedReadError:
         raise
-    except (ImportError, OSError, ValueError):
-        return
+    except (ImportError, OSError, ValueError) as exc:
+        raise reader.BoundedReadError(
+            "unsupported_backend",
+            "Skill policy verification modules are unavailable.",
+        ) from exc
 
 
 def _serialize_capped_payload(payload: dict[str, Any], *, trim_path: tuple[str, ...] | None = None) -> str:

@@ -1250,3 +1250,281 @@ def test_race_continuation_termination_missing_manifest_replacement_and_inflight
             parsed_inf = json.loads(raw_inf)
             assert parsed_inf["disposition"] == "revoked_in_flight"
             assert parsed_inf["in_flight"] is True
+
+
+def _extract_git_tree(repo: Path, rev: str, dest: Path) -> Path:
+    import io
+    import tarfile
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "archive", "--format=tar", rev],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:") as tar:
+        tar.extractall(dest, filter="data")
+    return dest
+
+
+@pytest.mark.parametrize(
+    "old_nerve_rev",
+    [
+        "69307ca83763b8acac441cf20e31e965793fe4c9",  # Task 3.2 Nerve baseline (pre-guard-chain / pre-receipts)
+        "323431b824c225eefd3d013f1d718d60e7b5b08e",  # Pre-change Nerve main baseline (pre-task-intent)
+    ],
+)
+def test_cross_version_new_host_with_old_nerve_plugins(tmp_path, monkeypatch, old_nerve_rev):
+    """Task 4.2 compatibility: new Hermes host + old Nerve plugin preserves legacy guard with zero crash."""
+    nerve_repo = _resolve_nerve_worktree()
+    old_nerve_dir = _extract_git_tree(nerve_repo, old_nerve_rev, tmp_path / f"old-nerve-{old_nerve_rev[:7]}")
+
+    real_socketpair = socket.socketpair
+    real_connect = socket.socket.connect
+
+    def _safe_socketpair(*args: Any, **kwargs: Any):
+        token = _IN_LOCAL_SOCKETPAIR.set(True)
+        try:
+            return real_socketpair(*args, **kwargs)
+        finally:
+            _IN_LOCAL_SOCKETPAIR.reset(token)
+
+    def _forbid_connect(sock_self: socket.socket, address: Any):
+        if _IN_LOCAL_SOCKETPAIR.get():
+            return real_connect(sock_self, address)
+        raise RuntimeError("External network sockets are forbidden in compatibility tests")
+
+    monkeypatch.setattr(socket, "socketpair", _safe_socketpair)
+    monkeypatch.setattr(socket.socket, "connect", _forbid_connect)
+    monkeypatch.setattr(
+        socket, "create_connection", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("No external sockets"))
+    )
+    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda _: None)
+
+    parent_home = tmp_path / "parent_home"
+    child_home = tmp_path / "child_home"
+    planning = tmp_path / "planning"
+    parent_home.mkdir()
+    child_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(child_home))
+    monkeypatch.setenv("HERMES_NERVE_NERVOUS_EVENTS", str(tmp_path / "nervous.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_OUTCOMES", str(tmp_path / "outcomes.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_POLICY_MEMORY", str(tmp_path / "policy.jsonl"))
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_TASK_ID", "HERMES_NERVE_REMOTE_CONTROL_FILE"):
+        monkeypatch.delenv(key, raising=False)
+
+    parent_entry = _build_realistic_proposal_closure(planning)
+    child_entry = deepcopy(parent_entry)
+    cfg = {
+        **profile_config(parent_entry),
+        "model": {"context_length": 128000},
+        "auxiliary": {"background_review": {"enabled": False}},
+    }
+    (parent_home / "config.yaml").write_text(json.dumps(cfg), encoding="utf-8")
+    (child_home / "config.yaml").write_text(json.dumps(cfg), encoding="utf-8")
+
+    pkg_name = f"compat_old_nerve_{old_nerve_rev[:7]}"
+    spec = importlib.util.spec_from_file_location(
+        pkg_name,
+        old_nerve_dir / "__init__.py",
+        submodule_search_locations=[str(old_nerve_dir)],
+    )
+    assert spec is not None and spec.loader is not None
+    old_plugin = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, pkg_name, old_plugin)
+    spec.loader.exec_module(old_plugin)
+
+    old_system = old_plugin.nervous.NervousSystem(
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("No remote Jev calls"))
+    )
+    monkeypatch.setattr(old_plugin.nervous, "_default", old_system)
+    monkeypatch.setattr(old_plugin.gate, "pre_tool_call", lambda **_kw: None)
+    monkeypatch.setattr(old_plugin.work_hooks, "pre_tool_call", lambda **_kw: None)
+
+    manager = plugins.PluginManager(str(child_home))
+    manifest = plugins.PluginManifest(name="nerve", source="user")
+    real_ctx = plugins.PluginContext(manifest, manager)
+    settings = {
+        "nerve_profile": "operator",
+        "gate_mode": "off",
+        "nervous_mode": "correct_next",
+        "nervous_turn_admission": False,
+        "nervous_local_learning": False,
+        "nervous_policy_memory_enabled": False,
+        "nervous_call_threshold": 1.0,
+        "work_supervision_db": str(tmp_path / "work.db"),
+        "remote_data_dir": str(tmp_path / "remote"),
+    }
+
+    class _NewHostCtx:
+        def __init__(self, inner: plugins.PluginContext):
+            self._inner = inner
+            self.reserve_prerequisite_read = inner.reserve_prerequisite_read
+            self.register_pre_verify_no_edits = inner.register_pre_verify_no_edits
+
+        def get_config(self, key: str, default: Any = None) -> Any:
+            return settings.get(key, default)
+
+        def register_tool(self, **_kw: Any) -> None:
+            return
+
+        def register_hook(self, name: str, callback: Any) -> None:
+            self._inner.register_hook(name, callback)
+
+        def register_context_engine(self, _engine: Any) -> None:
+            return
+
+    old_plugin.register(_NewHostCtx(real_ctx))
+    manager._discovered = True
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+
+    env_ns = SimpleNamespace(
+        tmp_path=tmp_path,
+        planning=planning,
+        parent_home=parent_home,
+        child_home=child_home,
+        parent_entry=parent_entry,
+        child_entry=child_entry,
+        last_child=None,
+    )
+    scratch = _make_unpinned_files(tmp_path, f"compat-{old_nerve_rev[:7]}", 12)
+    target_out = planning / "openspec" / "changes" / CHANGE / "proposal.md"
+    turns: list[Any] = [
+        {"tool_calls": [{"id": f"c-{i}", "name": "read_file", "args": {"path": str(scratch[i])}} for i in range(12)]},
+        # Old Nerve plugin does not call ctx.reserve_prerequisite_read -> retains legacy progress-stall veto!
+        {"tool_calls": [{"id": "c-13", "name": "read_file", "args": {"path": str(planning / "rules/AGENTS.md")}}]},
+        {"tool_calls": [{"id": "c-write", "name": "write_file", "args": {"path": str(target_out), "content": "# Proposal\n"}}]},
+        {"content": "Completed under old Nerve plugin."},
+    ]
+
+    try:
+        res, msgs, db = _run_child_agent_turns(
+            env_ns,
+            monkeypatch,
+            turns,
+            goal="Write proposal.md for example-topic.",
+            child_session_id=f"compat-{old_nerve_rev[:7]}",
+            enabled_toolsets=["file"],
+        )
+        db.close()
+        assert res.get("completed") is True
+        by_id = _tool_messages(msgs)
+        assert "progress guard" in json.dumps(by_id["c-13"]).lower()
+        assert target_out.read_text(encoding="utf-8") == "# Proposal\n"
+    finally:
+        old_system.configure(enabled=False)
+        for mod_key in [k for k in sys.modules if k == pkg_name or k.startswith(f"{pkg_name}.")]:
+            sys.modules.pop(mod_key, None)
+
+
+def test_cross_version_new_nerve_with_old_hermes_host(tmp_path, monkeypatch):
+    """Task 4.2 compatibility: old Hermes host (pre-f691bc08 surface) + new Nerve plugin falls back conservatively."""
+    hermes_repo = Path(__file__).resolve().parents[2]
+    old_plugins_ctx_src = subprocess.run(
+        ["git", "-C", str(hermes_repo), "show", "f691bc084b7d66ae72cc49904174e04ff468177e:hermes_cli/plugins_context.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    ).stdout
+    assert "reserve_prerequisite_read" not in old_plugins_ctx_src
+    assert "register_pre_verify_no_edits" not in old_plugins_ctx_src
+
+    nerve_root = _resolve_nerve_worktree()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_NERVE_NERVOUS_EVENTS", str(tmp_path / "nervous.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_OUTCOMES", str(tmp_path / "outcomes.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_POLICY_MEMORY", str(tmp_path / "policy.jsonl"))
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_TASK_ID", "HERMES_NERVE_REMOTE_CONTROL_FILE"):
+        monkeypatch.delenv(key, raising=False)
+
+    pkg_name = "compat_new_nerve_on_old_host"
+    spec = importlib.util.spec_from_file_location(
+        pkg_name,
+        nerve_root / "__init__.py",
+        submodule_search_locations=[str(nerve_root)],
+    )
+    assert spec is not None and spec.loader is not None
+    new_plugin = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, pkg_name, new_plugin)
+    spec.loader.exec_module(new_plugin)
+
+    new_system = new_plugin.nervous.NervousSystem(
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("No remote Jev calls"))
+    )
+    monkeypatch.setattr(new_plugin.nervous, "_default", new_system)
+    monkeypatch.setattr(new_plugin.gate, "pre_tool_call", lambda **_kw: None)
+    monkeypatch.setattr(new_plugin.work_hooks, "pre_tool_call", lambda **_kw: None)
+
+    hooks: dict[str, list[Any]] = {}
+    settings = {
+        "nerve_profile": "operator",
+        "gate_mode": "off",
+        "nervous_mode": "correct_next",
+        "nervous_turn_admission": False,
+        "nervous_local_learning": False,
+        "nervous_policy_memory_enabled": False,
+        "nervous_call_threshold": 1.0,
+        "prerequisite_max_operations": 32,
+        "prerequisite_max_seconds": 300,
+        "work_supervision_db": str(tmp_path / "work.db"),
+        "remote_data_dir": str(tmp_path / "remote"),
+    }
+
+    # Exact pre-f691bc08 PluginContext surface: no reserve_prerequisite_read, no register_pre_verify_no_edits!
+    class _OldHermesPluginCtx:
+        def get_config(self, key: str, default: Any = None) -> Any:
+            return settings.get(key, default)
+
+        def register_tool(self, **_kw: Any) -> None:
+            return
+
+        def register_hook(self, name: str, callback: Any, **_kw: Any) -> None:
+            hooks.setdefault(name, []).append(callback)
+
+        def register_context_engine(self, _engine: Any) -> None:
+            return
+
+    try:
+        new_plugin.register(_OldHermesPluginCtx())
+        assert "pre_llm_call" in hooks and "pre_tool_call" in hooks and "pre_verify" in hooks
+
+        # Old host invokes pre_llm_call WITHOUT task_intent or parent_session_id -> conservative fallback!
+        for cb in hooks["pre_llm_call"]:
+            cb(user_message="Write proposal.md for example-topic.", session_id="old-sess", turn_id="old-turn")
+        st = new_system.status(turn_id="old-turn")
+        assert st["task_intent_disposition"] == "missing"
+
+        # 12 read observations trigger local-progress-stall; action 13 retains conservative block with zero crash!
+        for idx in range(12):
+            for cb in hooks["post_tool_call"]:
+                cb(
+                    tool_name="read_file",
+                    args={"path": f"note-{idx}.md"},
+                    result="ok",
+                    status="ok",
+                    turn_id="old-turn",
+                    session_id="old-sess",
+                    tool_call_id=f"old-obs-{idx}",
+                )
+        verdicts = [
+            cb(tool_name="read_file", args={"path": "rules/AGENTS.md"}, turn_id="old-turn", session_id="old-sess", tool_call_id="old-13")
+            for cb in hooks["pre_tool_call"]
+        ]
+        blocks = [v for v in verdicts if isinstance(v, dict) and v.get("action") == "block"]
+        assert len(blocks) == 1 and "progress guard" in blocks[0]["message"].lower()
+
+        # Old host invokes pre_verify WITHOUT pre_verify_no_edits -> premature completion still blocked!
+        verify_out = [
+            cb(session_id="old-sess", final_response="Done without writing.", changed_paths=[])
+            for cb in hooks["pre_verify"]
+        ]
+        cont = [v for v in verify_out if isinstance(v, dict) and v.get("action") == "continue"]
+        assert len(cont) == 1
+    finally:
+        new_system.configure(enabled=False)
+        for mod_key in [k for k in sys.modules if k == pkg_name or k.startswith(f"{pkg_name}.")]:
+            sys.modules.pop(mod_key, None)
