@@ -205,6 +205,45 @@ def _header_lookup(source: Any) -> Callable[[str], Optional[str]]:
     return lambda _k: None
 
 
+def _is_router_route(agent: Any) -> bool:
+    if agent is None or isinstance(agent, dict):
+        return False
+    provider = getattr(agent, "provider", "")
+    requested = getattr(agent, "requested_provider", provider)
+    if provider not in ("custom", "ai-router", "custom:ai-router") or requested not in ("ai-router", "custom:ai-router"):
+        return False
+    config = getattr(agent, "config", None)
+    if not isinstance(config, dict):
+        from hermes_cli.config import load_config
+        config = load_config()
+    configured = config.get("providers", {}).get("ai-router", {}).get("base_url", "")
+    actual = getattr(agent, "base_url", "")
+    return bool(configured and actual and configured.rstrip("/") == actual.rstrip("/"))
+
+
+def _qualify_bare_cx_body_model(
+    body_model: str, *, header_model_id: Optional[str], agent: Any = None,
+) -> str:
+    """Correlate an unprefixed OpenAI ``response.model`` with its authorized ``cx/<model>`` route.
+
+    Suffix-strict: ``header_model_id`` must already be validated and equal ``f"cx/{body_model}"``
+    verbatim (``cx/gpt-5.6-sol-review`` never authorizes ``gpt-5.6-sol`` or another model). Without
+    a header, only an exact ``cx/<model>`` allowlist entry on the configured ``ai-router`` endpoint
+    qualifies; prefixes never grant bare aliases.
+    """
+    stripped = body_model.strip()
+    if not stripped or "/" in stripped:
+        return body_model
+    if any(marker in stripped.lower() for marker in get_tier3_forbidden_markers(agent)):
+        return body_model
+    qualified = f"cx/{stripped}"
+    if header_model_id:
+        return qualified if header_model_id.strip() == qualified else body_model
+    if _is_router_route(agent) and qualified in get_tier1_allowlist(agent):
+        return qualified
+    return body_model
+
+
 def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Optional[str],
                                  require_header: bool = False, agent: Any = None) -> Optional[str]:
     """Return the model provenance that answered (or ``None``) — raising ``TierFloorViolationError`` when
@@ -229,10 +268,16 @@ def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Opt
     if header_model_id and not is_tier1_model_id(header_model_id, source=agent):
         raise TierFloorViolationError(model_id=header_model_id, profile_model=profile_model, reason="header rejected")
 
-    if body_model and not is_tier1_model_id(str(body_model), source=agent):
-        raise TierFloorViolationError(model_id=str(body_model), profile_model=profile_model, reason="body model rejected")
+    canonical_body: Optional[str] = None
+    if body_model:
+        raw_body = str(body_model)
+        canonical_body = _qualify_bare_cx_body_model(
+            raw_body, header_model_id=header_model_id, agent=agent
+        )
+        if not is_tier1_model_id(canonical_body, source=agent):
+            raise TierFloorViolationError(model_id=raw_body, profile_model=profile_model, reason="body model rejected")
 
-    return header_model_id or str(body_model)
+    return header_model_id or canonical_body
 
 
 def check_stream_chunk_tier_floor(agent: Any, chunk: Any) -> None:
@@ -257,17 +302,7 @@ class Tier1StreamGuard:
                 self._validate(header)
 
     def _is_router_route(self) -> bool:
-        provider = getattr(self.agent, "provider", "")
-        requested = getattr(self.agent, "requested_provider", provider)
-        if provider not in ("custom", "ai-router", "custom:ai-router") or requested not in ("ai-router", "custom:ai-router"):
-            return False
-        config = getattr(self.agent, "config", None)
-        if not isinstance(config, dict):
-            from hermes_cli.config import load_config
-            config = load_config()
-        configured = config.get("providers", {}).get("ai-router", {}).get("base_url", "")
-        actual = getattr(self.agent, "base_url", "")
-        return bool(configured and actual and configured.rstrip("/") == actual.rstrip("/"))
+        return _is_router_route(self.agent)
 
     def _validate(self, model: str) -> None:
         canonical = model

@@ -602,6 +602,65 @@ class _WireCallIds:
         queue = self._queue.get(base)
         return queue.pop(0) if queue else base
 
+    def discard_wire_id(self, wire_id: str) -> None:
+        for queue in self._queue.values():
+            if wire_id in queue:
+                queue.remove(wire_id)
+                break
+
+
+def _synthetic_tool_error_output(call_id: str, tool_name: Optional[str] = None) -> dict[str, Any]:
+    """Structured error ``function_call_output`` stub for an orphaned ``function_call`` so
+    Responses endpoints never 400 with ``No tool output found for function call``."""
+    payload: dict[str, Any] = {
+        "error": f"Tool output unavailable for call_id '{call_id}' (interrupted, compacted, or missing).",
+        "status": "error",
+        "synthetic": True,
+    }
+    if _nonblank(tool_name):
+        payload["tool"] = str(tool_name).strip()
+    return {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": json.dumps(payload, ensure_ascii=False),
+    }
+
+
+def _ensure_paired_function_calls(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Enforce the Responses wire invariant that every ``function_call`` has a matching
+    ``function_call_output`` for its ``call_id`` (including after compaction pruning)."""
+    if not items:
+        return items
+    output_ids = {
+        it["call_id"]
+        for it in items
+        if isinstance(it, dict) and it.get("type") == "function_call_output" and _nonblank(it.get("call_id"))
+    }
+    missing_ids = {
+        it["call_id"]
+        for it in items
+        if isinstance(it, dict)
+        and it.get("type") == "function_call"
+        and _nonblank(it.get("call_id"))
+        and it["call_id"] not in output_ids
+    }
+    if not missing_ids:
+        return items
+    repaired: list[dict[str, Any]] = []
+    pending_stubs: list[dict[str, Any]] = []
+    for it in items:
+        itype = it.get("type") if isinstance(it, dict) else None
+        if pending_stubs and itype not in {"function_call", "function_call_output"}:
+            repaired.extend(pending_stubs)
+            pending_stubs.clear()
+        repaired.append(it)
+        if itype == "function_call" and it.get("call_id") in missing_ids:
+            missing_ids.discard(it["call_id"])
+            pending_stubs.append(_synthetic_tool_error_output(it["call_id"], it.get("name")))
+    if pending_stubs:
+        repaired.extend(pending_stubs)
+    return repaired
+
 
 def _replay_tool_call_items(
     msg: dict[str, Any], *, start_index: int, wire_ids: Optional[_WireCallIds] = None,
@@ -700,18 +759,31 @@ def _chat_messages_to_responses_input(
     # (#51512). It accepts only typed parts, so string text goes out as ``input_text``/``output_text``
     # there; other Responses routes keep the string shorthand they have always received.
     typed_text_only = current_issuer_kind == "codex_backend"
+    open_calls: list[tuple[str, Optional[str], dict[str, Any]]] = []
     def emit(new_items: list[dict[str, Any]], msg: dict[str, Any]) -> None:
         items.extend(new_items)
         item_sources.extend([msg] * len(new_items))
+    def flush_open_calls() -> None:
+        if not open_calls:
+            return
+        for orphan_id, orphan_name, orphan_src in open_calls:
+            wire_ids.discard_wire_id(orphan_id)
+            emit([_synthetic_tool_error_output(orphan_id, orphan_name)], orphan_src)
+        open_calls.clear()
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
         if role == "tool":
-            emit(_tool_output_items(msg, wire_ids=wire_ids), msg)
+            out_items = _tool_output_items(msg, wire_ids=wire_ids)
+            if out_items and open_calls:
+                matched_ids = {o["call_id"] for o in out_items if _nonblank(o.get("call_id"))}
+                open_calls[:] = [entry for entry in open_calls if entry[0] not in matched_ids]
+            emit(out_items, msg)
             continue
         if role not in {"user", "assistant"}:
             continue
+        flush_open_calls()
         content = msg.get("content", "")
         content_parts = _chat_content_to_responses_parts(content, role=role)  # [] unless a list
         text_type = _text_type_for(role)
@@ -745,6 +817,9 @@ def _chat_messages_to_responses_input(
             follower = " " if fallback == "" else fallback
             emit([_role_message_item("assistant", wire_content(follower), msg.get("phase"))], msg)
         emit(tool_items, msg)
+        for ti in tool_items:
+            open_calls.append((ti["call_id"], ti.get("name"), msg))
+    flush_open_calls()
     # The server renders nothing placed before a compaction item, so pre-checkpoint history is
     # dead weight and plaintext asks / merged summaries silently vanish. Keep the newest checkpoint
     # first, retain pre-checkpoint USER and SUMMARY messages within a token budget, leave the tail.
@@ -760,9 +835,9 @@ def _chat_messages_to_responses_input(
     # provenance-tagged content directly instead of trying to recover it from whatever shape the conversion
     # produced (#90976).
     if not native_compaction_eligible:
-        return items
+        return _ensure_paired_function_calls(items)
     from agent.native_compaction import prune_pre_checkpoint_items
-    return prune_pre_checkpoint_items(items, item_sources=item_sources)
+    return _ensure_paired_function_calls(prune_pre_checkpoint_items(items, item_sources=item_sources))
 
 
 class ResponsesRouteFlags(NamedTuple):

@@ -47,9 +47,38 @@ def _clean_error_text(error: Any, max_chars: int = 200) -> str:
     return line[: max_chars - 3] + "..." if len(line) > max_chars else line
 
 
+TYPED_ROOT_CAUSE_REASONS = frozenset({"tier_floor_violation", "invalid_params"})
+
+
+def _extract_root_cause_text(error: Any, max_chars: int = 200) -> str:
+    """Prefer trailing ``Provider said:`` / ``Details:`` lines over generic prose when present."""
+    from tools.delegation_redaction import redact_child_text
+
+    lines = [
+        ln.strip()
+        for ln in redact_child_text(str(error or ""), force=False).strip().splitlines()
+        if ln.strip()
+    ]
+    for prefix in ("Provider said:", "Details:"):
+        for ln in reversed(lines):
+            if ln.startswith(prefix):
+                detail = ln[len(prefix) :].strip()
+                if detail:
+                    return detail[: max_chars - 3] + "..." if len(detail) > max_chars else detail
+    return _clean_error_text(error, max_chars)
+
+
 def describe_subagent_failure(failure_reason: Any, error: Any, max_chars: int = 200) -> str:
     """Plain-language reason for a failed child: the classified ``failure_reason`` gloss when there is one,
-    else the child's own error text reduced to one clean line."""
+    else the child's own error text reduced to one clean line. Typed policy/parameter reasons
+    (``tier_floor_violation``, ``invalid_params``) retain both their typed code and root-cause summary."""
+    reason_code = str(failure_reason or "").strip()
+    if reason_code in TYPED_ROOT_CAUSE_REASONS:
+        detail = _extract_root_cause_text(error, max_chars)
+        if not detail:
+            return reason_code
+        combined = detail if reason_code in detail.lower() else f"{reason_code}: {detail}"
+        return combined[: max_chars - 3] + "..." if len(combined) > max_chars else combined
     # One gloss table for every surface (agent/turn_failure_copy.py); the child is the subject.
     from agent.turn_failure_copy import failure_cause_gloss
 

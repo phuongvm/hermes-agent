@@ -568,6 +568,23 @@ class _SchemaOutcome:
     errors: list[str]
     retries: int
 
+def _is_failed_child_turn_result(result: dict[str, Any]) -> bool:
+    """True when ``result`` represents a failed turn or Hermes failed-turn boundary notice
+    (``FAILED_TURN_NOTICE`` / ``PARTIAL_FAILED_TURN_NOTICE`` / ``display_kind == "failed_turn"``)
+    rather than an assistant answer eligible for output-contract validation."""
+    if result.get("failed") or result.get("error"):
+        return True
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, untyped_failed_turn_display_kind
+
+    if untyped_failed_turn_display_kind("assistant", result.get("final_response")) is not None:
+        return True
+    msgs = result.get("messages")
+    if isinstance(msgs, list) and msgs and isinstance(msgs[-1], dict):
+        if msgs[-1].get("display_kind") == FAILED_TURN_DISPLAY_KIND:
+            return True
+    return False
+
+
 def _validate_child_output_schema(
     child: Any, result: dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
 ) -> _SchemaOutcome:
@@ -576,6 +593,8 @@ def _validate_child_output_schema(
     _output_schema = getattr(child, "_delegate_output_schema", None)
     if not isinstance(_output_schema, dict):
         return _SchemaOutcome(_output_schema, None, [], 0)
+    if _is_failed_child_turn_result(result):
+        return _SchemaOutcome(_output_schema, False, [], 0)
     from tools.delegation_output_schema import append_output_contract, build_retry_message, validate_output
     _first_text = result.get("final_response") or ""
     _schema_valid, _schema_errors = validate_output(_first_text, _output_schema)
@@ -677,9 +696,9 @@ def _build_result_entry(
             status = exit_reason = "timeout"
             interrupt_note = (f"Subagent stopped making progress — no activity for {stale_after:g}s "
                               "(heartbeat stale threshold); it was stopped.")
-    elif result.get("failed") or result.get("error"):
+    elif _is_failed_child_turn_result(result):
         # The loop returns the error text as final_response, which would otherwise read as "completed". Never report a
-        # provider rejection as "max_iterations" — that is only truthful for real budget exhaustion.
+        # provider rejection or FAILED_TURN_NOTICE boundary as "completed" or "max_iterations".
         status, exit_reason = "failed", "error"
     else:
         # exit_reason ("completed" vs "max_iterations") tells the parent HOW the task ended; completed=False with no
@@ -723,10 +742,27 @@ def _build_result_entry(
     if _route is not None:
         entry["route"] = _route
     if status == "failed":
-        entry["error"] = result.get("error", "Subagent did not produce a response.")
+        from agent.turn_finalizer import classify_typed_root_cause
+        _failure_reason = result.get("failure_reason")
+        _typed_cause = None
+        for _cand in (
+            result.get("raw_error"),
+            getattr(child, "_last_api_error", None),
+            result.get("error"),
+            result.get("final_response"),
+        ):
+            _typed_cause = classify_typed_root_cause(_cand, agent=child)
+            if _typed_cause is not None:
+                break
+        if _typed_cause is not None:
+            _failure_reason, _typed_summary, _ = _typed_cause
+            entry["error"] = _typed_summary
+            if "didn't answer after all retries" in (entry.get("summary") or ""):
+                entry["summary"] = _typed_summary
+        else:
+            entry["error"] = result.get("error") or summary.strip() or "Subagent did not produce a response."
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
         # lets the parent tell a quota wall from a task error without parsing prose.
-        _failure_reason = result.get("failure_reason")
         if isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
         # When the limit resets (and the plan window it hit): what a resume is scheduled from.
@@ -746,7 +782,7 @@ def _build_result_entry(
             entry["schema_retries"] = schema.retries
         if not schema.valid and schema.errors:
             entry["schema_errors"] = schema.errors
-        if schema.valid is False and usable_summary:
+        if schema.valid is False and status == "completed" and usable_summary:
             entry["schema_note"] = (
                 "Final answer does not satisfy the declared output_schema"
                 + (" (after 1 retry)" if schema.retries else "")
@@ -936,10 +972,12 @@ class _ChildRun:
     ) -> dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
         the steer text that won the race with the failure, report the worktree."""
+        _extra = {"failure_reason": entry["failure_reason"]} if entry.get("failure_reason") else {}
         _safe_progress(
             self.child_progress_cb, "subagent.complete", preview=redact_child_text(preview, force=False), status=status or entry["status"],
             duration_seconds=entry["duration_seconds"],
             summary=redact_child_text(summary, force=False) if summary is not None else None,
+            **_extra,
         )
         _append_missed_steer(entry, late_steer)
         return self.attach_worktree(entry)
@@ -1113,8 +1151,14 @@ class _ChildRun:
             )
             if diagnostic_path:
                 logger.warning("Subagent %d 0-API-call timeout — diagnostic written to %s", task_index, diagnostic_path)
+        _typed_exc_reason: Optional[str] = None
         if not is_timeout:
-            _err = str(exc)
+            from agent.turn_finalizer import classify_typed_root_cause
+            _typed_exc = classify_typed_root_cause(exc, agent=child)
+            if _typed_exc is not None:
+                _typed_exc_reason, _err, _ = _typed_exc
+            else:
+                _err = str(exc)
         elif slice_timeout is not None and execution_deadline and time.monotonic() >= execution_deadline:
             _err = f"Subagent timed out after {duration}s exceeding slice timeout bound ({slice_timeout:g}s)."
         elif stale_after is not None:
@@ -1148,7 +1192,9 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
-        _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
+        if _typed_exc_reason:
+            _error_entry["failure_reason"] = _typed_exc_reason
+        _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else _err)
         close_deferred = is_timeout and not future.done()
         if close_deferred:
             self.deferred_future = future

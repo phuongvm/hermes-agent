@@ -1047,3 +1047,145 @@ def test_role_message_phase_is_kept_only_for_assistant_values_the_api_accepts():
     ])
 
     assert [item.get("phase") for item in wire] == ["final_answer", None, None, None]
+
+
+def test_chat_messages_to_responses_input_synthesizes_stub_for_orphaned_function_calls():
+    import json
+
+    # 1. Orphaned function_call in Turn 1 + reused call_id ('terminal:0') in Turn 2 with real output,
+    #    plus parallel call with one missing output and one blank tool_call_id.
+    messages = [
+        {"role": "user", "content": "run first"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "terminal:0", "function": {"name": "terminal", "arguments": '{"command":"first"}'}},
+            ],
+        },
+        {"role": "user", "content": "retry second"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "terminal:0", "function": {"name": "terminal", "arguments": '{"command":"second"}'}},
+                {"call_id": "call_parallel_missing", "function": {"name": "read_file", "arguments": '{"path":"a.py"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "terminal:0", "content": "second result"},
+        {"role": "tool", "tool_call_id": "", "content": "unpairable noise"},
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+    normalized = _preflight_codex_input_items(items)
+    assert normalized == items
+
+    calls = [it for it in items if it.get("type") == "function_call"]
+    outputs = [it for it in items if it.get("type") == "function_call_output"]
+    call_ids = [c["call_id"] for c in calls]
+    output_by_id = {o["call_id"]: o for o in outputs}
+
+    assert set(call_ids) == set(output_by_id.keys())
+    assert len(calls) == 3 and len(outputs) == 3
+
+    # Turn 1's orphaned 'terminal:0' got a structured error stub BEFORE 'retry second' user message.
+    stub_first = json.loads(output_by_id["terminal:0"]["output"])
+    assert stub_first["status"] == "error" and stub_first["synthetic"] is True
+    idx_stub_first = next(
+        idx for idx, it in enumerate(items)
+        if it.get("type") == "function_call_output" and it.get("call_id") == "terminal:0"
+    )
+    idx_retry_user = next(
+        idx for idx, it in enumerate(items)
+        if it.get("role") == "user" and it.get("content") == "retry second"
+    )
+    assert idx_stub_first < idx_retry_user
+
+    # Turn 2's reused 'terminal:0_dup1' kept its real output instead of pairing with Turn 1's orphan.
+    assert output_by_id["terminal:0_dup1"]["output"] == "second result"
+
+    # Parallel missing call also received a structured error stub.
+    stub_parallel = json.loads(output_by_id["call_parallel_missing"]["output"])
+    assert stub_parallel["status"] == "error" and stub_parallel["synthetic"] is True
+
+    # 2. Compaction-eligible path: orphaned post-checkpoint function_call still pairs cleanly.
+    compacted_messages = [
+        {
+            "role": "assistant",
+            "content": "checkpointed",
+            "codex_reasoning_items": [
+                {"type": "compaction", "encrypted_content": "cp_blob", "_issuer_kind": "codex_backend"}
+            ],
+        },
+        {"role": "user", "content": "after checkpoint"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "call_post_cp_orphan", "function": {"name": "terminal", "arguments": "{}"}},
+            ],
+        },
+    ]
+    cp_items = _chat_messages_to_responses_input(
+        compacted_messages, current_issuer_kind="codex_backend", native_compaction_eligible=True
+    )
+    cp_calls = [it["call_id"] for it in cp_items if it.get("type") == "function_call"]
+    cp_outputs = {it["call_id"]: it for it in cp_items if it.get("type") == "function_call_output"}
+    assert cp_calls == ["call_post_cp_orphan"]
+    assert set(cp_calls) == set(cp_outputs.keys())
+    assert json.loads(cp_outputs["call_post_cp_orphan"]["output"])["synthetic"] is True
+
+
+def test_failed_turn_notice_skips_subagent_output_contract_retry_and_marks_failed():
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
+    from tools.delegate_tool_child_run import _build_result_entry, _validate_child_output_schema
+
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+    retry_calls = []
+
+    child = SimpleNamespace(
+        _delegate_output_schema=schema,
+        _delegate_role="leaf",
+        model="gpt-5.6-sol-review",
+        session_id="sess-child-notice",
+        session_prompt_tokens=5,
+        session_completion_tokens=0,
+        session_estimated_cost_usd=0.0,
+        session_cost_status="known",
+        run_conversation=lambda *a, **kw: retry_calls.append((a, kw)) or {"final_response": '{"ok": true}'},
+    )
+
+    # Case A: explicit failed turn with error copy must NOT trigger schema retry.
+    failed_result = {
+        "final_response": "⚠️ No reply: the model provider didn't answer after all retries.",
+        "error": "⚠️ No reply: the model provider didn't answer after all retries.",
+        "failed": True,
+        "completed": False,
+        "api_calls": 1,
+        "messages": [
+            {"role": "user", "content": "audit"},
+            {"role": "assistant", "content": FAILED_TURN_NOTICE, "display_kind": FAILED_TURN_DISPLAY_KIND},
+        ],
+    }
+    outcome_a = _validate_child_output_schema(child, failed_result, 0, "task-0", None)
+    assert retry_calls == []
+    assert outcome_a.retries == 0
+    assert outcome_a.valid is False
+
+    # Case B: FAILED_TURN_NOTICE surfaced as final_response must be treated as turn failure, never retried for JSON.
+    notice_result = {
+        "final_response": FAILED_TURN_NOTICE,
+        "completed": False,
+        "api_calls": 1,
+        "messages": [
+            {"role": "user", "content": "audit"},
+            {"role": "assistant", "content": FAILED_TURN_NOTICE},
+        ],
+    }
+    outcome_b = _validate_child_output_schema(child, notice_result, 0, "task-0", None)
+    assert retry_calls == []
+    assert outcome_b.retries == 0
+    entry_b = _build_result_entry(child, notice_result, 0, 1.5, outcome_b)
+    assert entry_b["status"] == "failed"
+    assert entry_b["exit_reason"] == "error"
+    assert "schema_note" not in entry_b

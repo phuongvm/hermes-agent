@@ -417,3 +417,80 @@ def test_finalize_turn_starts_the_title_upgrade_the_prologue_held_back():
     _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=1)
     assert ran.wait(timeout=5), "deferred title upgrade never started"
     assert agent._deferred_title_upgrade is None
+
+
+def test_exhausted_retries_preserves_tier_floor_and_invalid_params_without_breaking_no_reply_copy(monkeypatch):
+    from agent.tier_floor_policy import TierFloorViolationError
+    from agent.turn_iteration_prep import apply_retry_restarts
+    from agent.turn_retry_state import TurnRetryState
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    no_reply_copy = "⚠️ No reply: the model provider didn't answer after all retries. Send /retry, or switch models with /model."
+
+    def _make_explaining_agent():
+        ag = _LimitAgent(completion_explainer=True)
+        ag.diagnostics = []
+        ag._emit_diagnostic_status = lambda msg: ag.diagnostics.append(str(msg))
+        ag._format_turn_completion_explanation = lambda reason, *_a, **_kw: (
+            no_reply_copy if reason == "all_retries_exhausted_no_response" else "iteration-limit explanation"
+        )
+        return ag
+
+    # 1. TierFloorViolationError must NOT collapse into server_error / generic No reply.
+    tier_agent = _make_explaining_agent()
+    tier_agent._last_api_error = TierFloorViolationError(
+        model_id="gpt-5.6-sol", profile_model="cb-agent-reviewer", reason="body model rejected"
+    )
+    verdict = apply_retry_restarts(
+        tier_agent,
+        _retry=TurnRetryState(),
+        response=None,
+        interrupted=False,
+        messages=[{"role": "user", "content": "review"}],
+        conversation_history=[],
+        user_message="review",
+        api_kwargs={},
+        current_turn_user_idx=0,
+        final_response=None,
+        retry_count=3,
+        max_retries=3,
+        api_call_count=3,
+        restart_count=0,
+        length_continue_retries=0,
+        _preflight_compression_blocked=False,
+        _turn_exit_reason="unknown",
+    )
+    assert verdict.action == "break"
+    assert any("TIER_1_FRONTIER_REASONING" in d and "gpt-5.6-sol" in d for d in tier_agent.diagnostics)
+    assert not any("didn't answer after all retries" in d for d in tier_agent.diagnostics)
+
+    tier_result = _finalize(tier_agent, final_response=None, exit_reason=verdict._turn_exit_reason, api_call_count=3)
+    assert tier_result["failed"] is True
+    assert tier_result["failure_reason"] == "tier_floor_violation"
+    assert "gpt-5.6-sol" in tier_result["error"]
+    assert "TIER_1_FRONTIER_REASONING" in tier_result["final_response"]
+    assert "didn't answer after all retries" not in tier_result["error"]
+    assert "didn't answer after all retries" not in tier_result["final_response"]
+
+    # 2. invalid_params must preserve typed failure_reason='invalid_params' and root cause.
+    params_agent = _make_explaining_agent()
+    bad_params_exc = RuntimeError("invalid_params: unknown field 'foo'")
+    bad_params_exc.code = "invalid_params"
+    params_agent._last_api_error = bad_params_exc
+    params_result = _finalize(
+        params_agent, final_response=None, exit_reason="all_retries_exhausted_no_response", api_call_count=1
+    )
+    assert params_result["failed"] is True
+    assert params_result["failure_reason"] == "invalid_params"
+    assert params_result["failure_retryable"] is False
+    assert "unknown field 'foo'" in params_result["error"]
+
+    # 3. Genuine no-reply transport exhaustion keeps its exact server_error + No reply copy.
+    quiet_agent = _make_explaining_agent()
+    quiet_result = _finalize(
+        quiet_agent, final_response=None, exit_reason="all_retries_exhausted_no_response", api_call_count=3
+    )
+    assert quiet_result["failed"] is True
+    assert quiet_result["failure_reason"] == "server_error"
+    assert quiet_result["final_response"] == no_reply_copy
+    assert quiet_result["error"] == no_reply_copy

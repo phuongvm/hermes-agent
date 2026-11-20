@@ -375,3 +375,76 @@ def test_dynamic_tier_floor_configuration(monkeypatch):
     assert not tfp.is_tier1_model_id(custom_prefixed)
     prefix_source = {"tier_floor": {"extra_prefixes": ["internal-llm/"]}}
     assert tfp.is_tier1_model_id(custom_prefixed, source=prefix_source)
+
+
+def test_guard_correlates_allowed_cx_header_with_exact_unprefixed_body():
+    """OpenAI routes behind ai-router stamp x-model-id='cx/<slug>' while response.model is bare '<slug>'."""
+    from types import SimpleNamespace
+
+    specialist_cfg = {
+        "providers": {"ai-router": {"base_url": "http://router.local/v1"}},
+        "tier_floor": {
+            "allowlist": ["cb-agent-reviewer"],
+            "extra_allowlist": ["cx/gpt-5.6-sol-review", "cx/gpt-6-astra[1m]"],
+            "prefixes": ["cb-"],
+        },
+    }
+    agent = SimpleNamespace(
+        model="cb-agent-reviewer",
+        provider="ai-router",
+        base_url="http://router.local/v1",
+        config=specialist_cfg,
+    )
+    resp = SimpleNamespace(
+        headers={"x-model-id": "cx/gpt-5.6-sol-review"},
+        model="gpt-5.6-sol-review",
+    )
+    assert (
+        tfp.enforce_tier1_response_guard(resp, profile_model="cb-agent-reviewer", agent=agent)
+        == "cx/gpt-5.6-sol-review"
+    )
+    assert (
+        tfp.enforce_tier1_response_guard(
+            {"X-Model-Id": "cx/gpt-5.6-sol-review", "model": "gpt-5.6-sol-review"},
+            profile_model="cb-agent-reviewer",
+            agent=specialist_cfg,
+        )
+        == "cx/gpt-5.6-sol-review"
+    )
+
+    # Suffix-dropped body ('gpt-5.6-sol' vs 'cx/gpt-5.6-sol-review') MUST still fail.
+    with pytest.raises(tfp.TierFloorViolationError) as suffix_exc:
+        tfp.enforce_tier1_response_guard(
+            SimpleNamespace(headers={"x-model-id": "cx/gpt-5.6-sol-review"}, model="gpt-5.6-sol"),
+            profile_model="cb-agent-reviewer",
+            agent=agent,
+        )
+    assert suffix_exc.value.model_id == "gpt-5.6-sol"
+
+    # Disagreement between allowed cx/ header and different bare body MUST still fail.
+    with pytest.raises(tfp.TierFloorViolationError) as mismatch_exc:
+        tfp.enforce_tier1_response_guard(
+            SimpleNamespace(headers={"x-model-id": "cx/gpt-6-astra[1m]"}, model="gpt-5.6-sol-review"),
+            profile_model="cb-agent-reviewer",
+            agent=agent,
+        )
+    assert mismatch_exc.value.model_id == "gpt-5.6-sol-review"
+
+    # Bare body with no matching allowed cx/ header or router allowlist entry MUST still fail.
+    with pytest.raises(tfp.TierFloorViolationError):
+        tfp.enforce_tier1_response_guard(
+            SimpleNamespace(headers={}, model="gpt-5.6-sol-review"),
+            profile_model="cb-agent-reviewer",
+        )
+    non_router_agent = SimpleNamespace(
+        model="cb-agent-reviewer",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        config=specialist_cfg,
+    )
+    with pytest.raises(tfp.TierFloorViolationError):
+        tfp.enforce_tier1_response_guard(
+            SimpleNamespace(headers={}, model="gpt-5.6-sol-review"),
+            profile_model="cb-agent-reviewer",
+            agent=non_router_agent,
+        )

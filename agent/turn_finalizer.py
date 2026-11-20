@@ -38,6 +38,135 @@ _SESSION_TOKEN_KEYS = (
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
 
 
+def _unwrap_error_detail_line(text: str) -> str:
+    lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    for prefix in ("Provider said:", "Details:"):
+        for ln in reversed(lines):
+            if ln.startswith(prefix):
+                rest = ln[len(prefix) :].strip()
+                if rest:
+                    return rest
+    return lines[-1] if lines[0].startswith("Traceback") else lines[0]
+
+
+def classify_typed_root_cause(
+    candidate: Any, *, agent: Any = None,
+) -> Optional[tuple[str, str, bool]]:
+    """Return ``(failure_reason, root_cause_summary, retryable)`` for typed policy/parameter
+    errors (``tier_floor_violation``, ``invalid_params``) that generic retry exhaustion or
+    broad status codes must never collapse into ``server_error`` / "No reply"."""
+    if candidate is None:
+        return None
+    from agent.tier_floor_policy import TierFloorViolationError
+
+    if isinstance(candidate, TierFloorViolationError):
+        return ("tier_floor_violation", str(candidate).strip(), True)
+
+    if isinstance(candidate, BaseException):
+        code = getattr(candidate, "code", None) or getattr(candidate, "reason", None)
+        data = getattr(candidate, "data", None)
+        if not code and isinstance(data, dict):
+            code = data.get("reason") or data.get("code")
+        body = getattr(candidate, "body", None)
+        if not code and isinstance(body, dict):
+            err_obj = body.get("error") if isinstance(body.get("error"), dict) else {}
+            code = err_obj.get("code") or body.get("code")
+        summarizer = getattr(agent, "_summarize_api_error", None) if agent is not None else None
+        raw_summary = ""
+        if callable(summarizer) and isinstance(candidate, Exception):
+            with suppress(Exception):
+                raw_summary = str(summarizer(candidate) or "").strip()
+        if not raw_summary:
+            raw_summary = _unwrap_error_detail_line(str(candidate))
+        if str(code or "").strip() == "invalid_params":
+            summary = (
+                raw_summary
+                if "invalid_params" in raw_summary.lower()
+                else (f"invalid_params: {raw_summary}" if raw_summary else "invalid_params")
+            )
+            return ("invalid_params", summary, False)
+        text = raw_summary or str(candidate).strip()
+    elif isinstance(candidate, str):
+        text = candidate.strip()
+    else:
+        return None
+
+    if not text:
+        return None
+    detail = _unwrap_error_detail_line(text)
+    lower = detail.lower()
+    if (
+        "tier_1_frontier_reasoning floor violated" in lower
+        or "tier 1 floor wait budget exhausted" in lower
+    ):
+        return ("tier_floor_violation", detail, True)
+    if lower == "invalid_params" or lower.startswith("invalid_params:") or "invalid_params:" in lower:
+        return ("invalid_params", detail, False)
+    return None
+
+
+def resolve_typed_turn_failure(agent: Any) -> Optional[tuple[str, str, bool]]:
+    """Inspect per-turn error state on ``agent`` for a typed root-cause failure."""
+    override = getattr(agent, "_exhausted_failure_override", None)
+    if isinstance(override, tuple) and len(override) == 3:
+        return override
+    last_exc = getattr(agent, "_last_api_error", None)
+    if last_exc is not None:
+        classified = classify_typed_root_cause(last_exc, agent=agent)
+        if classified is not None:
+            return classified
+    for _kind, msg in reversed(getattr(agent, "_retry_status_buffer", None) or ()):
+        msg_str = str(msg or "")
+        if "failed:" in msg_str:
+            tail = msg_str.split("failed:", 1)[1].strip()
+            classified = classify_typed_root_cause(tail, agent=agent)
+            if classified is not None:
+                return classified
+    return None
+
+
+def _settle_exit_verdict(
+    agent: Any, *, interrupted: bool, failed: bool, _turn_exit_reason: Any,
+) -> tuple[bool, Optional[tuple[str, str, bool]], Any]:
+    """Resolve typed root-cause failure and loop exit verdict; return ``(failed, typed, exit_failure)``."""
+    if interrupted:
+        return failed, None, None
+    typed = resolve_typed_turn_failure(agent)
+    exit_failure = exit_reason_failure(_turn_exit_reason)
+    if typed is not None or (exit_failure is not None and exit_failure.fails_turn):
+        failed = True
+    return failed, typed, exit_failure
+
+
+def _stamp_result_failure(
+    result: dict, agent: Any, *, failed: bool, final_response: Any, _turn_exit_reason: Any,
+    _typed_failure: Optional[tuple[str, str, bool]], _exit_failure: Any,
+) -> None:
+    """Stamp ``error``, ``raw_error``, and ``failure_reason`` onto ``result``."""
+    if failed and str(_turn_exit_reason) == "session_persistence_failed":
+        from hermes_constants import profile_cli_selector
+
+        # Never rebind final_response here: the memory sync and the background-review gate
+        # below must still see an empty response on a persistence-failed turn.
+        result["error"] = final_response or (
+            "session storage could not be written — check the state database "
+            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
+        )
+        _cause = getattr(agent, "_last_persistence_error_cause", None)
+        result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
+    elif _typed_failure is not None:
+        _typed_reason, _typed_summary, _typed_retryable = _typed_failure
+        result["error"] = _typed_summary
+        result["raw_error"] = _typed_summary
+        stamp_failure(result, _typed_reason, _typed_retryable)
+    elif _exit_failure is not None:
+        if failed:
+            result["error"] = final_response or str(_turn_exit_reason)
+        stamp_failure(result, _exit_failure.reason, _exit_failure.retryable)
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -703,9 +832,9 @@ def finalize_turn(
     # ``turn_exit_reason`` collapsed to code="unknown", retryable=True on every surface.
     # Advisory verdicts (``fails_turn=False``) only add the code: ``failed``/``completed`` keep
     # the loop's values so cron, kanban and transcript persistence behave as before.
-    _exit_failure = None if interrupted else exit_reason_failure(_turn_exit_reason)
-    if _exit_failure is not None and _exit_failure.fails_turn:
-        failed = True
+    failed, _typed_failure, _exit_failure = _settle_exit_verdict(
+        agent, interrupted=interrupted, failed=failed, _turn_exit_reason=_turn_exit_reason,
+    )
 
     # Sibling producers (``turn_recovery``, ``codex_runtime``) return ``completed=False`` for an
     # interrupted turn; the gateway stream gate and the API run status rely on that contract.
@@ -773,8 +902,12 @@ def finalize_turn(
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
     if not interrupted:
-        final_response = _explain_abnormal_exit(
-            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
+        final_response = (
+            _typed_failure[1]
+            if _typed_failure is not None and (final_response or "").strip() in ("", "(empty)")
+            else _explain_abnormal_exit(
+                agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
+            )
         )
 
     # Skill trigger: decided ONCE, from the tool iterations THIS turn used, before post_llm_call so
@@ -851,24 +984,11 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
-    # Persistence failures already set failed=True; also stamp `error` so the gateway
-    # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
-    # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        from hermes_constants import profile_cli_selector
-
-        # Never rebind final_response here: the memory sync and the background-review gate
-        # below must still see an empty response on a persistence-failed turn.
-        result["error"] = final_response or (
-            "session storage could not be written — check the state database "
-            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
-        )
-        _cause = getattr(agent, "_last_persistence_error_cause", None)
-        result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
-    elif _exit_failure is not None:
-        if failed:
-            result["error"] = final_response or str(_turn_exit_reason)
-        stamp_failure(result, _exit_failure.reason, _exit_failure.retryable)
+    _stamp_result_failure(
+        result, agent, failed=failed, final_response=final_response,
+        _turn_exit_reason=_turn_exit_reason, _typed_failure=_typed_failure,
+        _exit_failure=_exit_failure,
+    )
     # Cleanup failures are surfaced, but the response is returned either way (#8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
@@ -880,6 +1000,8 @@ def finalize_turn(
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
     agent._reused_response_text = None
+    agent._last_api_error = None
+    agent._exhausted_failure_override = None
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
     agent.clear_interrupt()

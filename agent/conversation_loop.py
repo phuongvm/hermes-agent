@@ -1591,6 +1591,7 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
             _run_phase(build_api_request, agent, s)
             if _run_phase(perform_api_call, agent, s).action == "break":
                 return None
+            agent._last_api_error = None
             _rc = _run_phase(check_api_response, agent, s)
             if _rc.action == "return":
                 return _rc.result
@@ -1600,6 +1601,7 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
         except Exception as api_error:
+            agent._last_api_error = api_error
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":
                 return _ae.result
@@ -1738,6 +1740,8 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    agent._last_api_error = None
+    agent._exhausted_failure_override = None
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

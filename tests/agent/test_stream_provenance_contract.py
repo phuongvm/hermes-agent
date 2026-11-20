@@ -156,3 +156,9 @@ def test_non_specialist_stream_retains_existing_behavior(agent):
     agent.model = "ordinary-model"
     guard = policy.Tier1StreamGuard(agent, SimpleNamespace(headers={}))
     guard.accept(SimpleNamespace(model=None))
+
+
+def test_check_stream_chunk_tier_floor_correlates_router_cx_and_rejects_suffix_drop(agent):
+    policy.check_stream_chunk_tier_floor(agent, SimpleNamespace(model="gpt-5.6-sol-review"))
+    with pytest.raises(policy.TierFloorViolationError):
+        policy.check_stream_chunk_tier_floor(agent, SimpleNamespace(model="gpt-5.6-sol"))
