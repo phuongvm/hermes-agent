@@ -52,20 +52,11 @@ TYPED_ROOT_CAUSE_REASONS = frozenset({"tier_floor_violation", "invalid_params"})
 
 def _extract_root_cause_text(error: Any, max_chars: int = 200) -> str:
     """Prefer trailing ``Provider said:`` / ``Details:`` lines over generic prose when present."""
+    from agent.turn_finalizer import unwrap_error_detail_line
     from tools.delegation_redaction import redact_child_text
 
-    lines = [
-        ln.strip()
-        for ln in redact_child_text(str(error or ""), force=False).strip().splitlines()
-        if ln.strip()
-    ]
-    for prefix in ("Provider said:", "Details:"):
-        for ln in reversed(lines):
-            if ln.startswith(prefix):
-                detail = ln[len(prefix) :].strip()
-                if detail:
-                    return detail[: max_chars - 3] + "..." if len(detail) > max_chars else detail
-    return _clean_error_text(error, max_chars)
+    detail = unwrap_error_detail_line(redact_child_text(str(error or ""), force=False))
+    return detail[: max_chars - 3] + "..." if len(detail) > max_chars else detail
 
 
 def describe_subagent_failure(failure_reason: Any, error: Any, max_chars: int = 200) -> str:

@@ -38,7 +38,8 @@ _SESSION_TOKEN_KEYS = (
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
 
 
-def _unwrap_error_detail_line(text: str) -> str:
+def unwrap_error_detail_line(text: str) -> str:
+    """Extract a trailing ``Provider said:`` / ``Details:`` payload when present, else the primary line."""
     lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
     if not lines:
         return ""
@@ -79,7 +80,7 @@ def classify_typed_root_cause(
             with suppress(Exception):
                 raw_summary = str(summarizer(candidate) or "").strip()
         if not raw_summary:
-            raw_summary = _unwrap_error_detail_line(str(candidate))
+            raw_summary = unwrap_error_detail_line(str(candidate))
         if str(code or "").strip() == "invalid_params":
             summary = (
                 raw_summary
@@ -95,14 +96,14 @@ def classify_typed_root_cause(
 
     if not text:
         return None
-    detail = _unwrap_error_detail_line(text)
+    detail = unwrap_error_detail_line(text)
     lower = detail.lower()
     if (
         "tier_1_frontier_reasoning floor violated" in lower
         or "tier 1 floor wait budget exhausted" in lower
     ):
         return ("tier_floor_violation", detail, True)
-    if lower == "invalid_params" or lower.startswith("invalid_params:") or "invalid_params:" in lower:
+    if lower == "invalid_params" or lower.startswith("invalid_params:"):
         return ("invalid_params", detail, False)
     return None
 
@@ -130,13 +131,18 @@ def resolve_typed_turn_failure(agent: Any) -> Optional[tuple[str, str, bool]]:
 def _settle_exit_verdict(
     agent: Any, *, interrupted: bool, failed: bool, _turn_exit_reason: Any,
 ) -> tuple[bool, Optional[tuple[str, str, bool]], Any]:
-    """Resolve typed root-cause failure and loop exit verdict; return ``(failed, typed, exit_failure)``."""
+    """Resolve typed root-cause failure and loop exit verdict; return ``(failed, typed, exit_failure)``.
+
+    ``resolve_typed_turn_failure`` runs ONLY when the turn is already failing (``failed`` or
+    ``exit_failure.fails_turn``), so stale retry state from an earlier recovered attempt never
+    flips a completed or advisory turn into ``failed=True``.
+    """
     if interrupted:
         return failed, None, None
-    typed = resolve_typed_turn_failure(agent)
     exit_failure = exit_reason_failure(_turn_exit_reason)
-    if typed is not None or (exit_failure is not None and exit_failure.fails_turn):
+    if exit_failure is not None and exit_failure.fails_turn:
         failed = True
+    typed = resolve_typed_turn_failure(agent) if failed else None
     return failed, typed, exit_failure
 
 

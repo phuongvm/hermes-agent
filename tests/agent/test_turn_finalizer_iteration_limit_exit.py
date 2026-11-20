@@ -494,3 +494,42 @@ def test_exhausted_retries_preserves_tier_floor_and_invalid_params_without_break
     assert quiet_result["failure_reason"] == "server_error"
     assert quiet_result["final_response"] == no_reply_copy
     assert quiet_result["error"] == no_reply_copy
+
+
+def test_stale_typed_error_state_does_not_flip_completed_or_advisory_turn_to_failed(monkeypatch):
+    from agent.tier_floor_policy import TierFloorViolationError
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    # 1. Stale _last_api_error on a succeeded turn must NOT mark the turn failed.
+    ok_agent = _LimitAgent()
+    ok_agent._last_api_error = TierFloorViolationError(
+        model_id="gpt-5.6-sol", profile_model="cb-agent-reviewer", reason="body model rejected"
+    )
+    ok_result = _finalize(ok_agent, final_response="done", exit_reason="text_response(1)", api_call_count=1)
+    assert ok_result["failed"] is False
+    assert ok_result["completed"] is True
+    assert ok_result["final_response"] == "done"
+    assert "failure_reason" not in ok_result
+    assert "error" not in ok_result
+
+    # 2. Stale _retry_status_buffer on a succeeded turn must NOT mark the turn failed.
+    buf_agent = _LimitAgent()
+    buf_agent._retry_status_buffer = [
+        ("status", "retry 1/3 failed: TIER_1_FRONTIER_REASONING floor violated by gpt-5.6-sol")
+    ]
+    buf_result = _finalize(buf_agent, final_response="done", exit_reason="text_response(1)", api_call_count=1)
+    assert buf_result["failed"] is False
+    assert buf_result["completed"] is True
+    assert buf_result["final_response"] == "done"
+    assert "failure_reason" not in buf_result
+    assert "error" not in buf_result
+
+    # 3. Advisory non-failing exit (fails_turn=False) keeps failed=False and its own advisory code.
+    adv_agent = _LimitAgent()
+    adv_agent._last_api_error = TierFloorViolationError(
+        model_id="gpt-5.6-sol", profile_model="cb-agent-reviewer", reason="body model rejected"
+    )
+    adv_result = _finalize(adv_agent, final_response=None, exit_reason="empty_response_exhausted", api_call_count=3)
+    assert adv_result["failed"] is False
+    assert adv_result["failure_reason"] == "empty_response"
