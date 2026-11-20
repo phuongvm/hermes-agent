@@ -706,3 +706,338 @@ def test_tenant_sandbox_and_remote_backend_rejected_without_fallback(env_fixture
         assert m_tenant.opens == 0
         assert m_tenant.bytes_read == 0
         assert json.loads(raw_t)["disposition"] == "unsupported_backend"
+
+    # 3. Missing host backend verification module (#31 advisory #1) -> fails closed unsupported_backend.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def block_backend_import(name, *a, **kw):
+        if name in {"tools.file_tools_paths", "tools.environments"}:
+            raise ImportError("missing host backend module")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", block_backend_import)
+    with dc.native_task_intent(**SCOPE) as intent3:
+        assert reservations.start_preparation(intent3, "actor", 4, 60)
+        assert reservations.reserve_read(intent3, "actor", "imp-err", "read_file", args) == "reserved"
+        with reader.measure_physical_reads() as m_imp:
+            raw_imp, err_imp = reader.dispatch_bounded_read_file(intent3, "actor", "imp-err", args, task_id="t-imp")
+        assert err_imp == "prerequisite_unsupported_backend"
+        assert m_imp.opens == 0
+        assert m_imp.bytes_read == 0
+        assert json.loads(raw_imp)["disposition"] == "unsupported_backend"
+
+
+def _dummy_agent(monkeypatch) -> SimpleNamespace:
+    monkeypatch.setattr(executor, "_begin_tool_execution", lambda *_: None)
+    monkeypatch.setattr(executor, "_emit_terminal_post_tool_call", lambda *_a, **_kw: None)
+    return SimpleNamespace(
+        session_id="actor",
+        _parent_session_id="parent",
+        _current_turn_id="turn",
+        tool_progress_callback=None,
+        _tool_guardrails=SimpleNamespace(before_call=lambda *_: SimpleNamespace(allows_execution=True)),
+    )
+
+
+def test_skill_view_adapter_uses_frozen_buffers_blocks_inline_shell_and_undeclared_files(tmp_path, monkeypatch):
+    from agent.prerequisite import adapters
+    from hermes_cli import plugins
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Enable inline_shell and extreme output limits in config to prove neither escapes the adapter.
+    (home / "config.yaml").write_text(
+        "file_read_max_chars: 10000000\ntool_output:\n  max_bytes: 10000000\nskills:\n  inline_shell: true\n  template_vars: true\n",
+        encoding="utf-8",
+    )
+
+    planning = tmp_path / "planning"
+    entry = proposal_entry(planning)
+    secret_tok = "sk-skillSecretToken1234567890abcdef"
+    skill_md = planning / "skills" / "verification-before-claim" / "SKILL.md"
+    ref_md = planning / "skills" / "verification-before-claim" / "references" / "completion-gate.md"
+    # Drop an UNDECLARED file in references/ to prove zero directory scan/listing.
+    undeclared_md = planning / "skills" / "verification-before-claim" / "references" / "undeclared-secret.md"
+    undeclared_md.write_text("UNDECLARED_FILE_MUST_NOT_BE_SCANNED\n", encoding="utf-8")
+
+    skill_body = (
+        "---\n"
+        "name: verification-before-claim\n"
+        "description: Verify before claiming completion\n"
+        "tags: [verification, governance]\n"
+        "---\n"
+        "Dir=${HERMES_SKILL_DIR} Session=${HERMES_SESSION_ID}\n"
+        "ShellProbe=!`echo SHELL_MUST_NEVER_RUN`\n"
+        f"CREDENTIAL={secret_tok}\n"
+    ).encode()
+    ref_body = f"# Completion Gate\nGate reference body {secret_tok}\n".encode()
+    skill_md.write_bytes(skill_body)
+    ref_md.write_bytes(ref_body)
+    entry["resources"]["skill/verification-before-claim"] = _pin_for_file(
+        "skill/verification-before-claim", skill_md, max_file_bytes=2048
+    )
+    entry["resources"]["reference/verification-before-claim/references/completion-gate.md"] = _pin_for_file(
+        "reference/verification-before-claim/references/completion-gate.md", ref_md, max_file_bytes=1024
+    )
+    selection = catalog.freeze_proposal_catalog(CHANGE, entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: selection)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *_a, **_kw: pytest.fail("No subprocess may spawn during skill_view adapter")
+    )
+
+    manager = plugins.PluginManager(str(home))
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+    agent = _dummy_agent(monkeypatch)
+
+    def attach_reserve():
+        def _hook(**kw):
+            assert guard.reserve_progress_read(
+                "actor", intent.assignment_id, kw["tool_call_id"], kw["tool_name"]
+            ) == "reserved"
+
+        manager._hooks["pre_tool_call"] = [_hook]
+
+    with dc.native_task_intent(**SCOPE) as intent:
+        assert reservations.start_preparation(intent, "actor", 8, 60)
+        attach_reserve()
+
+        # 1. View SKILL.md -> reads SKILL.md once, expands template vars, does NOT execute !`...`,
+        #    redacts secret, and lists ONLY catalog-declared references (ignoring undeclared-secret.md).
+        args_main = {"name": "verification-before-claim"}
+        with reader.measure_physical_reads() as m1:
+            state1 = executor._ManagedToolResult(None, dict(args_main), [], False, False)
+            ref1 = executor._ToolCallRef("skill_view", dict(args_main), "t-sk", "sk-1", [])
+            out1 = executor._dispatch_authorized_once(
+                agent, state1, ref1,
+                execute=lambda _a: pytest.fail("Legacy skill_view forbidden"),
+                scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
+            )
+        assert not state1.blocked
+        assert m1.bytes_read == len(skill_body)
+        parsed1 = json.loads(out1)
+        assert parsed1["success"] is True
+        assert parsed1["name"] == "verification-before-claim"
+        assert "Session=actor" in parsed1["content"]
+        assert "!`echo SHELL_MUST_NEVER_RUN`" in parsed1["content"]
+        assert "SHELL_MUST_NEVER_RUN\n" not in parsed1["content"]
+        assert secret_tok not in parsed1["content"]
+        assert parsed1["linked_files"] == {"references": ["references/completion-gate.md"]}
+        assert "undeclared-secret.md" not in out1
+        snap1 = reservations.accounting_snapshot("actor", "parent", intent.assignment_id)
+        assert snap1["source_bytes_reserved"] == 2048
+
+        # 2. View declared reference -> SKILL.md served from assignment cache (0 rescan bytes!),
+        #    only completion-gate.md opened & read, reserving +1024 bytes.
+        args_ref = {"name": "verification-before-claim", "file_path": "references/completion-gate.md"}
+        with reader.measure_physical_reads() as m2:
+            state2 = executor._ManagedToolResult(None, dict(args_ref), [], False, False)
+            ref2 = executor._ToolCallRef("skill_view", dict(args_ref), "t-sk", "sk-2", [])
+            out2 = executor._dispatch_authorized_once(
+                agent, state2, ref2,
+                execute=lambda _a: pytest.fail("Legacy skill_view forbidden"),
+                scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
+            )
+        assert not state2.blocked
+        assert m2.bytes_read == len(ref_body)
+        parsed2 = json.loads(out2)
+        assert parsed2["success"] is True
+        assert parsed2["file"] == "references/completion-gate.md"
+        assert "Gate reference body" in parsed2["content"]
+        assert secret_tok not in parsed2["content"]
+        snap2 = reservations.accounting_snapshot("actor", "parent", intent.assignment_id)
+        assert snap2["operations_reserved"] == 2
+        assert snap2["source_bytes_reserved"] == 2048 + 1024
+
+    # 3. Skill declaring external `deps: [ffmpeg]` is rejected fail-closed as undeclared_dependency.
+    deps_md = planning / "skills" / "codebase-design" / "SKILL.md"
+    deps_bytes = b"---\nname: codebase-design\ndeps: [ffmpeg]\n---\nNeeds external tool.\n"
+    deps_md.write_bytes(deps_bytes)
+    entry["resources"]["skill/codebase-design"] = _pin_for_file(
+        "skill/codebase-design", deps_md, max_file_bytes=512
+    )
+    sel_deps = catalog.freeze_proposal_catalog(CHANGE, entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: sel_deps)
+    with dc.native_task_intent(**SCOPE) as intent_deps:
+        assert reservations.start_preparation(intent_deps, "actor", 4, 60)
+        assert reservations.reserve_read(
+            intent_deps, "actor", "sk-deps", "skill_view", {"name": "codebase-design"}
+        ) == "reserved"
+        raw_deps, err_deps = adapters.dispatch_bounded_prerequisite(
+            intent_deps, "actor", "sk-deps", "skill_view", {"name": "codebase-design"}, task_id="t-sk"
+        )
+        assert err_deps == "prerequisite_undeclared_dependency"
+        assert json.loads(raw_deps)["disposition"] == "undeclared_dependency"
+
+
+def test_openspec_read_adapters_use_frozen_buffers_without_cli_or_rescan_and_cap_output(tmp_path, monkeypatch):
+    from agent.prerequisite import adapters
+    from hermes_cli import plugins
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENSPEC_BIN", str(tmp_path / "fake-openspec-cli"))
+    (home / "config.yaml").write_text("file_read_max_chars: 10000000\n", encoding="utf-8")
+
+    planning = tmp_path / "planning"
+    entry = proposal_entry(planning)
+    secret_tok = "sk-openspecSecretToken1234567890abcdef"
+
+    # Populate realistic JSON snapshots and OpenSpec markdown baselines.
+    status_path = planning / f"openspec/workspace/prerequisites/{CHANGE}/status.json"
+    status_bytes = json.dumps({
+        "changeName": CHANGE,
+        "schemaName": "spec-driven",
+        "artifacts": [{"id": "proposal", "status": "ready"}],
+        "note": f"token={secret_tok}",
+    }).encode()
+    status_path.write_bytes(status_bytes)
+    entry["resources"]["snapshot/status"] = {
+        **_pin_for_file("snapshot/status", status_path, max_file_bytes=1024),
+        "path": f"openspec/workspace/prerequisites/{CHANGE}/status.json",
+    }
+
+    instr_path = planning / f"openspec/workspace/prerequisites/{CHANGE}/instructions/proposal.json"
+    big_guidance = ("Guidance line " + ("X" * 200) + "\n") * 1600  # ~344 KiB > 256 KiB output cap
+    instr_bytes = json.dumps({
+        "artifactId": "proposal",
+        "instruction": big_guidance,
+        "secret": secret_tok,
+    }).encode()
+    instr_path.write_bytes(instr_bytes)
+    entry["resources"]["snapshot/instructions/proposal"] = {
+        **_pin_for_file("snapshot/instructions/proposal", instr_path, max_file_bytes=catalog.MAX_FILE_BYTES),
+        "path": f"openspec/workspace/prerequisites/{CHANGE}/instructions/proposal.json",
+    }
+
+    spec1_rel = "openspec/specs/nerve-crew-dod-and-role-handoff/spec.md"
+    spec1_path = planning / spec1_rel
+    spec1_bytes = (
+        "# Nerve Crew DoD Specification\n\n"
+        "## Purpose\nEnsure verified handoffs.\n\n"
+        "## Requirements\n\n"
+        "### Requirement: Evidence gate\nEvery handoff SHALL carry raw proof.\n\n"
+        "#### Scenario: Proof attached\n"
+        "- **WHEN** coder finishes\n"
+        f"- **THEN** proof is verified without leaking {secret_tok}\n"
+    ).encode()
+    spec1_path.write_bytes(spec1_bytes)
+    entry["resources"]["baseline/nerve-crew-dod-and-role-handoff"] = {
+        **_pin_for_file("baseline/nerve-crew-dod-and-role-handoff", spec1_path, max_file_bytes=2048),
+        "path": spec1_rel,
+    }
+
+    spec2_rel = "openspec/specs/nerve-reflex-resilience/spec.md"
+    spec2_path = planning / spec2_rel
+    spec2_bytes = spec2_path.read_bytes()
+
+    # Drop an UNDECLARED baseline spec directory on disk to prove openspec_spec_list never scans disk!
+    undeclared_spec = planning / "openspec/specs/undeclared-rogue-spec/spec.md"
+    undeclared_spec.parent.mkdir(parents=True, exist_ok=True)
+    undeclared_spec.write_text("# Rogue Spec\n", encoding="utf-8")
+
+    selection = catalog.freeze_proposal_catalog(CHANGE, entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: selection)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *_a, **_kw: pytest.fail("No OpenSpec CLI subprocess may spawn")
+    )
+
+    manager = plugins.PluginManager(str(home))
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+    agent = _dummy_agent(monkeypatch)
+
+    with dc.native_task_intent(**SCOPE) as intent:
+        assert reservations.start_preparation(intent, "actor", 10, 60)
+        manager._hooks["pre_tool_call"] = [
+            lambda **kw: (
+                None
+                if guard.reserve_progress_read("actor", intent.assignment_id, kw["tool_call_id"], kw["tool_name"])
+                == "reserved"
+                else {"action": "block", "message": "not reserved"}
+            )
+        ]
+
+        def run_tool(tool_name: str, tool_args: dict[str, Any], cid: str) -> tuple[str, Any]:
+            st = executor._ManagedToolResult(None, dict(tool_args), [], False, False)
+            rf = executor._ToolCallRef(tool_name, dict(tool_args), "t-os", cid, [])
+            with reader.measure_physical_reads() as m:
+                out = executor._dispatch_authorized_once(
+                    agent, st, rf,
+                    execute=lambda _a: pytest.fail(f"Legacy {tool_name} handler forbidden"),
+                    scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
+                )
+            assert not st.blocked
+            return out, m
+
+        # 1. openspec_status
+        out_status, m_status = run_tool("openspec_status", {"workdir": str(planning), "change": CHANGE}, "os-1")
+        assert m_status.bytes_read == len(status_bytes)
+        p_status = json.loads(out_status)
+        assert p_status["ok"] is True
+        assert p_status["stdout"]["changeName"] == CHANGE
+        assert secret_tok not in out_status
+
+        # 2. openspec_instructions (exceeds 256 KiB source -> output strictly capped <= MAX_OUTPUT_BYTES!)
+        out_instr, m_instr = run_tool(
+            "openspec_instructions",
+            {"workdir": str(planning), "change": CHANGE, "artifact": "proposal"},
+            "os-2",
+        )
+        assert m_instr.bytes_read == len(instr_bytes)
+        assert len(out_instr.encode()) <= catalog.MAX_OUTPUT_BYTES
+        p_instr = json.loads(out_instr)
+        assert p_instr["ok"] is True
+        assert p_instr["truncated"] is True
+        assert secret_tok not in out_instr
+
+        # 3. openspec_spec_list -> reads BOTH pinned baselines, ignores undeclared-rogue-spec!
+        out_list, m_list = run_tool("openspec_spec_list", {"workdir": str(planning)}, "os-3")
+        assert m_list.bytes_read == len(spec1_bytes) + len(spec2_bytes)
+        p_list = json.loads(out_list)
+        assert p_list["ok"] is True
+        assert p_list["specs"] == ["nerve-crew-dod-and-role-handoff", "nerve-reflex-resilience"]
+        assert "undeclared-rogue-spec" not in out_list
+
+        # 4. openspec_spec_show -> reuses cached buffer from openspec_spec_list (0 physical bytes read!),
+        #    still consumes an operation slot, and parses Requirements & Scenarios cleanly!
+        out_show, m_show = run_tool(
+            "openspec_spec_show",
+            {"workdir": str(planning), "spec": "nerve-crew-dod-and-role-handoff"},
+            "os-4",
+        )
+        assert m_show.bytes_read == 0
+        assert m_show.opens == 0
+        p_show = json.loads(out_show)
+        assert p_show["ok"] is True
+        assert p_show["title"] == "Nerve Crew DoD"
+        assert p_show["purpose"] == "Ensure verified handoffs."
+        assert len(p_show["requirements"]) == 1
+        assert p_show["requirements"][0]["name"] == "Evidence gate"
+        assert len(p_show["requirements"][0]["scenarios"]) == 1
+        assert secret_tok not in out_show
+
+        snap = reservations.accounting_snapshot("actor", "parent", intent.assignment_id)
+        assert snap["operations_reserved"] == 4
+
+    # 5. Snapshot reporting ok=False cannot trigger _template_instruction_fallback or CLI probe!
+    bad_instr = planning / f"openspec/workspace/prerequisites/{CHANGE}/instructions/tasks.json"
+    bad_bytes = json.dumps({"ok": False, "error": "No changes found"}).encode()
+    bad_instr.write_bytes(bad_bytes)
+    entry["resources"]["snapshot/instructions/tasks"] = {
+        **_pin_for_file("snapshot/instructions/tasks", bad_instr, max_file_bytes=512),
+        "path": f"openspec/workspace/prerequisites/{CHANGE}/instructions/tasks.json",
+    }
+    sel_bad = catalog.freeze_proposal_catalog(CHANGE, entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: sel_bad)
+    with dc.native_task_intent(**SCOPE) as intent_bad:
+        assert reservations.start_preparation(intent_bad, "actor", 2, 60)
+        bad_args = {"workdir": str(planning), "change": CHANGE, "artifact": "tasks"}
+        assert reservations.reserve_read(intent_bad, "actor", "os-bad", "openspec_instructions", bad_args) == "reserved"
+        raw_bad, err_bad = adapters.dispatch_bounded_prerequisite(
+            intent_bad, "actor", "os-bad", "openspec_instructions", bad_args, task_id="t-os"
+        )
+        assert err_bad == "prerequisite_unavailable_snapshot"
+        assert json.loads(raw_bad)["disposition"] == "unavailable_snapshot"

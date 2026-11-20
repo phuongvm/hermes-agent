@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 from agent.delegation_context import TaskIntent, current_task_intent
 from agent.inline_tool_executors import tool_hook_ids
-from . import reader, reservations
+from . import adapters, reservations
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class GuardedRead:
 
     def dispatch_or_block(self, final_args: dict, *, task_id: str | None = None) -> tuple[str | None, dict[str, Any] | None, str]:
         """Dispatch through a supported verified reader, or return a conservative block."""
-        if self.tool != "read_file":
+        if self.tool not in adapters.SUPPORTED_PREREQUISITE_TOOLS:
             self.close()
             return (
                 None,
@@ -85,8 +85,8 @@ class GuardedRead:
                 )
             self._dispatched = True
             self._owns_ticket = False
-        payload, err_type = reader.dispatch_bounded_read_file(
-            self.intent, self.actor, self.call_id, final_args, task_id=task_id,
+        payload, err_type = adapters.dispatch_bounded_prerequisite(
+            self.intent, self.actor, self.call_id, self.tool, final_args, task_id=task_id,
         )
         if err_type is not None:
             return None, json.loads(payload), err_type

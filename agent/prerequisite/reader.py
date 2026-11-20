@@ -203,7 +203,7 @@ def _bounded_stream_capture(
     ):
         buf.clear()
         raise BoundedReadError("resource_changed_during_capture", "Resource size or mtime changed during capture.")
-    if b"\x00" in buf[:1000]:
+    if b"\x00" in buf:
         buf.clear()
         raise BoundedReadError("unsupported_binary_resource", "Binary content is ineligible for prerequisite capture.")
     if sha256(buf).hexdigest() != pin.sha256:
@@ -444,8 +444,11 @@ def _ensure_local_host_backend(task_id: str | None) -> None:
     try:
         from tools import file_tools_paths
         from tools.environments import sandbox_scope
-    except ImportError:
-        return
+    except ImportError as exc:
+        raise BoundedReadError(
+            "unsupported_backend",
+            "Host backend verification modules are unavailable.",
+        ) from exc
     if (
         sandbox_scope.hosted_scope() is not None
         or file_tools_paths._terminal_env_type_for_task(task_id or "default") != "local"
