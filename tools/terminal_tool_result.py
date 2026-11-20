@@ -306,7 +306,8 @@ def finalize_foreground_result(
     text = json.dumps(result_dict, ensure_ascii=False)
     raw_returncode = result.get("returncode")
     if type(raw_returncode) is int and raw_returncode == 0 and not (
-        sudo_auth_failed or result.get("error") or result.get("hermes_timed_out")
+        sudo_auth_failed or result.get("error") or result.get("stdin_error")
+        or result.get("hermes_timed_out") or result.get("hermes_interrupted")
         or result.get("cwd_fallback") or result.get("environment_recreated")
     ):
         from tools.approval_context import current_approval_call

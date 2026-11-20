@@ -637,7 +637,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         rendered = output.render()
         result = self._finalize_wait_result(output, rendered, proc.returncode)
         if stdin_errors := getattr(proc, "_hermes_stdin_errors", None):
-            result["stdin_error"] = err = str(stdin_errors[0])
+            result["stdin_error"] = err = str(stdin_errors[0]) or type(stdin_errors[0]).__name__
             result["output"] = rendered + f"\n[stdin write failed: {err}]"
         return result
 
