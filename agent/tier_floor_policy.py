@@ -44,7 +44,7 @@ DEFAULT_TIER_1_ALLOWLIST: tuple[str, ...] = SPECIALIST_COMBO_IDS + (
     "cb-gemini-argon", "cb-claude-opus", "cb-gpt-sol-review", "cb-gemini-pro", "cb-opus-5.5", "cb-gpt-astra",
 )
 DEFAULT_TIER_1_PROVIDER_MODEL_PREFIXES: tuple[str, ...] = (
-    "ag/gemini-3-pro", "ag/claude-opus", "cc/claude-opus", "cc/claude-sonnet-4", "cx/gpt-5",
+    "ag/gemini-3-pro", "ag/claude-opus", "cc/claude-opus", "cc/claude-sonnet-4", "cx/gpt-5", "cx/gpt-6",
 )
 DEFAULT_TIER_3_FORBIDDEN_MARKERS: tuple[str, ...] = ("nemotron", "crouton", "cb-always-on", "cb-nous-free", ":free")
 

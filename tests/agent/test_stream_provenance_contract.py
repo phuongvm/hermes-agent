@@ -162,3 +162,21 @@ def test_check_stream_chunk_tier_floor_correlates_router_cx_and_rejects_suffix_d
     policy.check_stream_chunk_tier_floor(agent, SimpleNamespace(model="gpt-5.6-sol-review"))
     with pytest.raises(policy.TierFloorViolationError):
         policy.check_stream_chunk_tier_floor(agent, SimpleNamespace(model="gpt-5.6-sol"))
+
+
+def test_default_tier1_prefixes_allow_cx_gpt6_and_still_reject_forbidden_markers():
+    leader_agent = SimpleNamespace(
+        model="cb-agent-leader",
+        provider="custom",
+        requested_provider="ai-router",
+        base_url="http://router.test/v1",
+        config={"providers": {"ai-router": {"base_url": "http://router.test/v1"}}},
+    )
+    for model_id in ("cx/gpt-6.2-sol", "cx/gpt-6.2-astra"):
+        guard = policy.Tier1StreamGuard(leader_agent, SimpleNamespace(headers={}))
+        guard.accept(SimpleNamespace(model=model_id))
+        assert guard.model_id == model_id
+    for bad_id in ("cx/gpt-6-nemotron", "cx/gpt-6:free"):
+        guard = policy.Tier1StreamGuard(leader_agent, SimpleNamespace(headers={}))
+        with pytest.raises(policy.TierFloorViolationError):
+            guard.accept(SimpleNamespace(model=bad_id))
