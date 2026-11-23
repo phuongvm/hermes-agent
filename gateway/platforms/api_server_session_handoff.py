@@ -609,182 +609,158 @@ def _is_adoptable_host_owned_local_row(
     return True
 
 
-def _inspect_session_eligibility(
-    authority: Any,
-    session_id: str,
-    request_id: str,
-) -> _SessionEligibility:
-    """Validate target session eligibility against `authority.db` without mutating rows.
-
-    Returns `_SessionEligibility`. Raises `HandoffError` on refusal.
-    """
-    db = getattr(authority, "db", None)
-    if db is None:
-        return _SessionEligibility(owner_id=session_id)
-
-    from gateway.owner_identity import host_owner_subject
-    from gateway.session_history_mount import is_history_mount
-    from hermes_state_local import API_BINDING_PREFIX, POLICY_PREFIX, local_lineage_owner
-    from hermes_state_local_migration import LEGACY_PREFIX
-    from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
+def _load_live_session_row(
+    conn: sqlite3.Connection,
+    lookup_id: str,
+    *,
+    requested_id: str,
+) -> dict[str, Any]:
     from hermes_state_mutation_retirement import retired_in
 
-    logical_fn = getattr(authority, "logical_owner", None)
-    logical_root = logical_fn(session_id) if callable(logical_fn) else session_id
+    if retired_in(conn, lookup_id):
+        raise HandoffError(404, "not_found", f"Session not found: {requested_id}")
+    raw_row = conn.execute("SELECT * FROM sessions WHERE id=?", (lookup_id,)).fetchone()
+    if raw_row is None:
+        raise HandoffError(404, "not_found", f"Session not found: {requested_id}")
+    row = dict(raw_row)
+    if row.get("end_reason") == "deleted":
+        raise HandoffError(404, "not_found", f"Session not found: {requested_id}")
+    return row
 
-    with db._read_ctx() as conn:
-        if retired_in(conn, session_id):
-            raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-        raw_row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if raw_row is None:
-            raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-        row = dict(raw_row)
-        if row.get("end_reason") == "deleted":
-            raise HandoffError(404, "not_found", f"Session not found: {session_id}")
 
-        owner_id = local_lineage_owner(conn, logical_root or session_id)
-        if owner_id != session_id:
-            if retired_in(conn, owner_id):
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-            raw_owner = conn.execute("SELECT * FROM sessions WHERE id=?", (owner_id,)).fetchone()
-            if raw_owner is None:
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-            owner_row = dict(raw_owner)
-            if owner_row.get("end_reason") == "deleted":
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-        else:
-            owner_row = row
+def _has_bound_live_session(authority: Any, owner_id: str) -> bool:
+    from gateway.session_history_mount import is_history_mount
 
-        own_profile = db._own_profile_name() or "default"
-        if owner_row.get("profile_name") not in (None, "", own_profile):
-            raise HandoffError(404, "not_found", f"Session not found: {session_id}")
+    live_sessions = getattr(authority, "sessions", {}) or {}
+    live_entry = live_sessions.get(owner_id)
+    return live_entry is not None and not is_history_mount(live_entry)
 
-        if bool(row.get("archived")) or bool(owner_row.get("archived")):
+
+def _inspect_local_bound_meta(conn: sqlite3.Connection, target_id: str, *, session_id: str) -> bool:
+    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_local_migration import LEGACY_PREFIX
+
+    policy_meta = conn.execute(
+        "SELECT value FROM state_meta WHERE key=?",
+        (POLICY_PREFIX + target_id,),
+    ).fetchone()
+    legacy_meta = conn.execute(
+        "SELECT 1 FROM state_meta WHERE key=?",
+        (LEGACY_PREFIX + target_id,),
+    ).fetchone()
+    _ensure_local_policy_source_eligible(policy_meta, session_id)
+    return policy_meta is not None or legacy_meta is not None
+
+
+def _inspect_api_server_eligibility(
+    conn: sqlite3.Connection,
+    owner_id: str,
+    owner_row: Mapping[str, Any],
+    *,
+    session_id: str,
+    request_id: str,
+    has_bound_live: bool,
+) -> _SessionEligibility:
+    from hermes_state_local import API_BINDING_PREFIX
+
+    _ensure_other_target_clear(conn, request_id, owner_id)
+    api_meta = conn.execute(
+        "SELECT value FROM state_meta WHERE key=?",
+        (API_BINDING_PREFIX + owner_id,),
+    ).fetchone()
+    if api_meta is not None:
+        try:
+            binding = json.loads(api_meta[0])
+        except (TypeError, ValueError):
+            binding = {}
+        if isinstance(binding, dict) and binding.get("storage_source") == "bot_room":
             raise HandoffError(
                 409,
                 "session_not_handoff_eligible",
-                f"Session {session_id} is archived and not eligible for operator handoff.",
+                "bot_room sessions are not eligible for operator handoff.",
             )
+        return _SessionEligibility(owner_id=owner_id)
 
-        source = str(owner_row.get("source") or row.get("source") or "").strip().lower()
-        if source not in (_ELIGIBLE_LOCAL_SOURCES | _ELIGIBLE_API_SOURCES):
-            raise HandoffError(
-                409,
-                "session_not_handoff_eligible",
-                f"Session source {source!r} is not eligible for operator handoff.",
-            )
+    if has_bound_live:
+        return _SessionEligibility(owner_id=owner_id)
+    if owner_row.get("session_key") not in (None, ""):
+        raise HandoffError(
+            409,
+            "session_not_handoff_eligible",
+            f"API session {session_id} carries a foreign route key and cannot be bound.",
+        )
+    return _SessionEligibility(owner_id=owner_id, needs_api_bind=True)
 
-        live_sessions = getattr(authority, "sessions", {}) or {}
-        live_entry = live_sessions.get(owner_id)
-        has_bound_live = live_entry is not None and not is_history_mount(live_entry)
 
-        if source not in _ELIGIBLE_LOCAL_SOURCES:
-            # source == 'api_server'
-            _ensure_other_target_clear(conn, request_id, owner_id)
-            api_meta = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?",
-                (API_BINDING_PREFIX + owner_id,),
-            ).fetchone()
-            if api_meta is not None:
-                try:
-                    binding = json.loads(api_meta[0])
-                except (TypeError, ValueError):
-                    binding = {}
-                if isinstance(binding, dict) and binding.get("storage_source") == "bot_room":
-                    raise HandoffError(
-                        409,
-                        "session_not_handoff_eligible",
-                        "bot_room sessions are not eligible for operator handoff.",
-                    )
-                return _SessionEligibility(owner_id=owner_id)
+def _load_compressed_tip_target(
+    conn: sqlite3.Connection,
+    *,
+    tip_id: str,
+    session_id: str,
+    own_profile: str,
+) -> tuple[str, dict[str, Any]]:
+    from hermes_state_local import local_lineage_owner
 
-            if has_bound_live:
-                return _SessionEligibility(owner_id=owner_id)
-            if owner_row.get("session_key") not in (None, ""):
-                raise HandoffError(
-                    409,
-                    "session_not_handoff_eligible",
-                    f"API session {session_id} carries a foreign route key and cannot be bound.",
-                )
-            return _SessionEligibility(owner_id=owner_id, needs_api_bind=True)
+    tip_row = _load_live_session_row(conn, tip_id, requested_id=session_id)
+    adopt_id = local_lineage_owner(conn, tip_id)
+    adopt_row = (
+        _load_live_session_row(conn, adopt_id, requested_id=session_id)
+        if adopt_id != tip_id
+        else tip_row
+    )
+    if tip_row.get("profile_name") not in (None, "", own_profile) or adopt_row.get(
+        "profile_name"
+    ) not in (None, "", own_profile):
+        raise HandoffError(404, "not_found", f"Session not found: {session_id}")
+    if bool(tip_row.get("archived")) or bool(adopt_row.get("archived")):
+        raise HandoffError(
+            409,
+            "session_not_handoff_eligible",
+            f"Session {session_id} is archived and not eligible for operator handoff.",
+        )
+    adopt_source = str(adopt_row.get("source") or tip_row.get("source") or "").strip().lower()
+    if adopt_source not in _ELIGIBLE_LOCAL_SOURCES:
+        raise HandoffError(
+            409,
+            "session_not_handoff_eligible",
+            f"Session source {adopt_source!r} is not eligible for operator handoff.",
+        )
+    return adopt_id, adopt_row
 
-        policy_meta = conn.execute(
-            "SELECT value FROM state_meta WHERE key=?",
-            (POLICY_PREFIX + owner_id,),
-        ).fetchone()
-        legacy_meta = conn.execute(
-            "SELECT 1 FROM state_meta WHERE key=?",
-            (LEGACY_PREFIX + owner_id,),
-        ).fetchone()
-        _ensure_local_policy_source_eligible(policy_meta, session_id)
-        if policy_meta is not None or legacy_meta is not None or has_bound_live:
-            _ensure_other_target_clear(conn, request_id, owner_id)
-            return _SessionEligibility(owner_id=owner_id)
 
-    # Unbound local row: resolve compression tip outside `_read_ctx` before evaluating adoption.
+def _resolve_unbound_local_eligibility(
+    authority: Any,
+    db: Any,
+    *,
+    session_id: str,
+    owner_id: str,
+    owner_row: dict[str, Any],
+    own_profile: str,
+    request_id: str,
+) -> _SessionEligibility:
+    from gateway.owner_identity import host_owner_subject
+    from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
+
     tip_fn = getattr(db, "get_compression_tip", None)
     tip_id = (tip_fn(session_id) if callable(tip_fn) else None) or owner_id
 
     with db._read_ctx() as conn:
-        adopt_id = owner_id
-        adopt_row = owner_row
-        if tip_id != owner_id:
-            if retired_in(conn, tip_id):
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-            raw_tip = conn.execute("SELECT * FROM sessions WHERE id=?", (tip_id,)).fetchone()
-            if raw_tip is None:
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-            tip_row = dict(raw_tip)
-            if tip_row.get("end_reason") == "deleted":
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-
-            adopt_id = local_lineage_owner(conn, tip_id)
-            if adopt_id != tip_id:
-                if retired_in(conn, adopt_id):
-                    raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-                raw_adopt = conn.execute("SELECT * FROM sessions WHERE id=?", (adopt_id,)).fetchone()
-                if raw_adopt is None:
-                    raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-                adopt_row = dict(raw_adopt)
-                if adopt_row.get("end_reason") == "deleted":
-                    raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-            else:
-                adopt_row = tip_row
-
-            if tip_row.get("profile_name") not in (None, "", own_profile) or adopt_row.get(
-                "profile_name"
-            ) not in (None, "", own_profile):
-                raise HandoffError(404, "not_found", f"Session not found: {session_id}")
-            if bool(tip_row.get("archived")) or bool(adopt_row.get("archived")):
-                raise HandoffError(
-                    409,
-                    "session_not_handoff_eligible",
-                    f"Session {session_id} is archived and not eligible for operator handoff.",
-                )
-            adopt_source = str(adopt_row.get("source") or tip_row.get("source") or "").strip().lower()
-            if adopt_source not in _ELIGIBLE_LOCAL_SOURCES:
-                raise HandoffError(
-                    409,
-                    "session_not_handoff_eligible",
-                    f"Session source {adopt_source!r} is not eligible for operator handoff.",
-                )
-
-            _ensure_other_target_clear(conn, request_id, adopt_id)
-            tip_policy_meta = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?",
-                (POLICY_PREFIX + adopt_id,),
-            ).fetchone()
-            tip_legacy_meta = conn.execute(
-                "SELECT 1 FROM state_meta WHERE key=?",
-                (LEGACY_PREFIX + adopt_id,),
-            ).fetchone()
-            _ensure_local_policy_source_eligible(tip_policy_meta, session_id)
-            tip_live_entry = live_sessions.get(adopt_id)
-            tip_bound_live = tip_live_entry is not None and not is_history_mount(tip_live_entry)
-            if tip_policy_meta is not None or tip_legacy_meta is not None or tip_bound_live:
-                return _SessionEligibility(owner_id=adopt_id)
-        else:
-            _ensure_other_target_clear(conn, request_id, adopt_id)
+        adopt_id, adopt_row = (
+            _load_compressed_tip_target(
+                conn,
+                tip_id=tip_id,
+                session_id=session_id,
+                own_profile=own_profile,
+            )
+            if tip_id != owner_id
+            else (owner_id, owner_row)
+        )
+        _ensure_other_target_clear(conn, request_id, adopt_id)
+        if tip_id != owner_id and (
+            _inspect_local_bound_meta(conn, adopt_id, session_id=session_id)
+            or _has_bound_live_session(authority, adopt_id)
+        ):
+            return _SessionEligibility(owner_id=adopt_id)
 
         if session_id != adopt_id:
             parent_hist = conn.execute(
@@ -807,6 +783,75 @@ def _inspect_session_eligibility(
         return _SessionEligibility(owner_id=adopt_id, needs_local_adopt=True)
 
 
+def _inspect_session_eligibility(
+    authority: Any,
+    session_id: str,
+    request_id: str,
+) -> _SessionEligibility:
+    """Validate target session eligibility against `authority.db` without mutating rows.
+
+    Returns `_SessionEligibility`. Raises `HandoffError` on refusal.
+    """
+    db = getattr(authority, "db", None)
+    if db is None:
+        return _SessionEligibility(owner_id=session_id)
+
+    from hermes_state_local import local_lineage_owner
+
+    logical_fn = getattr(authority, "logical_owner", None)
+    logical_root = logical_fn(session_id) if callable(logical_fn) else session_id
+
+    with db._read_ctx() as conn:
+        row = _load_live_session_row(conn, session_id, requested_id=session_id)
+        owner_id = local_lineage_owner(conn, logical_root or session_id)
+        owner_row = (
+            _load_live_session_row(conn, owner_id, requested_id=session_id)
+            if owner_id != session_id
+            else row
+        )
+        own_profile = db._own_profile_name() or "default"
+        if owner_row.get("profile_name") not in (None, "", own_profile):
+            raise HandoffError(404, "not_found", f"Session not found: {session_id}")
+        if bool(row.get("archived")) or bool(owner_row.get("archived")):
+            raise HandoffError(
+                409,
+                "session_not_handoff_eligible",
+                f"Session {session_id} is archived and not eligible for operator handoff.",
+            )
+        source = str(owner_row.get("source") or row.get("source") or "").strip().lower()
+        if source not in (_ELIGIBLE_LOCAL_SOURCES | _ELIGIBLE_API_SOURCES):
+            raise HandoffError(
+                409,
+                "session_not_handoff_eligible",
+                f"Session source {source!r} is not eligible for operator handoff.",
+            )
+
+        has_bound_live = _has_bound_live_session(authority, owner_id)
+        if source not in _ELIGIBLE_LOCAL_SOURCES:
+            return _inspect_api_server_eligibility(
+                conn,
+                owner_id,
+                owner_row,
+                session_id=session_id,
+                request_id=request_id,
+                has_bound_live=has_bound_live,
+            )
+
+        if _inspect_local_bound_meta(conn, owner_id, session_id=session_id) or has_bound_live:
+            _ensure_other_target_clear(conn, request_id, owner_id)
+            return _SessionEligibility(owner_id=owner_id)
+
+    return _resolve_unbound_local_eligibility(
+        authority,
+        db,
+        session_id=session_id,
+        owner_id=owner_id,
+        owner_row=owner_row,
+        own_profile=own_profile,
+        request_id=request_id,
+    )
+
+
 async def _adopt_host_owned_local_session(
     authority: Any,
     owner_id: str,
@@ -817,7 +862,6 @@ async def _adopt_host_owned_local_session(
     """Serialize and commit JIT host-owned local session adoption off the event loop."""
     from gateway.owner_identity import host_owner_subject
     from gateway.session_authorities import owner_scope
-    from gateway.session_history_mount import is_history_mount
     from gateway.session_local_migration import (
         adopt_legacy_session,
         bind_native_transport,
@@ -831,9 +875,7 @@ async def _adopt_host_owned_local_session(
 
     def _adopt_step() -> None:
         db = authority.db
-        live_sessions = getattr(authority, "sessions", {}) or {}
-        live_entry = live_sessions.get(owner_id)
-        if live_entry is not None and not is_history_mount(live_entry):
+        if _has_bound_live_session(authority, owner_id):
             return
         with db._read_ctx() as conn:
             if retired_in(conn, owner_id):
@@ -975,6 +1017,91 @@ async def _submit_with_replay_tracking(
     return receipt, False
 
 
+def _handoff_exception_response(
+    exc: HandoffError | RuntimeStoreError | sqlite3.Error | OSError,
+    *,
+    secrets: Iterable[str],
+) -> web.Response:
+    if isinstance(exc, HandoffError):
+        return _error_json(
+            exc.message,
+            exc.status_code,
+            code=exc.code,
+            err_type=exc.err_type,
+            secrets=secrets,
+        )
+    if isinstance(exc, RuntimeStoreError):
+        return _map_runtime_store_error(exc, secrets=secrets)
+    return _error_json(
+        f"Session store unavailable: {type(exc).__name__}",
+        503,
+        code="storage_unavailable",
+        err_type="server_error",
+        secrets=secrets,
+        headers={"Retry-After": "1"},
+    )
+
+
+async def _admit_validated_handoff(
+    authority: Any,
+    *,
+    session_id: str,
+    request_id: str,
+    env: HandoffEnvelope,
+    normalized_author: Mapping[str, Any],
+    secrets: Iterable[str],
+) -> tuple[AdmissionReceipt, bool, int]:
+    eligibility = await asyncio.to_thread(
+        _inspect_session_eligibility,
+        authority,
+        session_id,
+        request_id,
+    )
+    owner_id = eligibility.owner_id
+    rendered_text = render_envelope_prompt(env, secrets=secrets)
+    profile_id = str(getattr(authority, "profile_id", "default"))
+    actor = SessionActor(
+        "api-operator",
+        profile_id,
+        frozenset({"session:read", "session:submit", "session:operator"}),
+        f"api-handoff:{env.idempotency_key}",
+    )
+    submission = Submission(
+        request_id=request_id,
+        ref=SessionRef(profile_id, owner_id),
+        intent="queue",
+        payload={
+            "text": rendered_text,
+            "turn_author": normalized_author,
+        },
+    )
+    if eligibility.needs_api_bind:
+        from gateway.session_api import bind_api_steps, run_steps_off_loop
+
+        await run_steps_off_loop(authority, bind_api_steps(authority, owner_id))
+    elif eligibility.needs_local_adopt:
+        await _adopt_host_owned_local_session(
+            authority,
+            owner_id,
+            session_id=session_id,
+            idempotency_key=env.idempotency_key,
+        )
+    receipt, replayed = await _submit_with_replay_tracking(authority, actor, submission)
+    if env.is_terminal:
+        await asyncio.to_thread(
+            _persist_closed_correlation,
+            authority,
+            correlation_id=env.correlation_id,
+            intent=env.intent,
+            idempotency_key=env.idempotency_key,
+            session_id=owner_id,
+        )
+    queue_position = await asyncio.to_thread(
+        _compute_queue_position, authority, owner_id, receipt
+    )
+    return receipt, replayed, queue_position
+
+
 async def handle_session_handoff(
     adapter: Any,
     request: web.Request,
@@ -1051,7 +1178,7 @@ async def handle_session_handoff(
             secrets=secrets,
         )
 
-    # 4. Validate envelope schema, intent, idempotency_key, correlation_id, and turn_author
+    # 4-8. Envelope validation, correlation closure, hop ceiling, eligibility, and FIFO admission
     active_profile = _active_profile_label()
     try:
         env, normalized_author = parse_handoff_envelope(
@@ -1062,22 +1189,10 @@ async def handle_session_handoff(
             secrets=secrets,
             enforce_hop_ceiling=False,
         )
-    except HandoffError as exc:
-        return _error_json(
-            exc.message,
-            exc.status_code,
-            code=exc.code,
-            err_type=exc.err_type,
-            secrets=secrets,
-        )
+        resolved_authority = authority if authority is not None else _resolve_authority(adapter)
+        request_id = f"handoff:{env.idempotency_key}"
 
-    resolved_authority = authority if authority is not None else _resolve_authority(adapter)
-    request_id = f"handoff:{env.idempotency_key}"
-
-    # 5. Durable correlation closure check BEFORE hop ceiling (so follow-ups after a closed
-    #    chain return 409 correlation_closed even at hop_count > max_hops, while exact retries pass)
-    if resolved_authority is not None:
-        try:
+        if resolved_authority is not None:
             closed_doc, already_admitted = await asyncio.to_thread(
                 _check_correlation_and_existing_admission,
                 resolved_authority,
@@ -1085,144 +1200,38 @@ async def handle_session_handoff(
                 idempotency_key=env.idempotency_key,
                 request_id=request_id,
             )
-        except (sqlite3.Error, OSError) as exc:
+            if (
+                closed_doc is not None
+                and closed_doc.get("idempotency_key") != env.idempotency_key
+                and not already_admitted
+            ):
+                raise HandoffError(
+                    409,
+                    "correlation_closed",
+                    f"Correlation chain {env.correlation_id!r} is already closed by a terminal REPLY/FYI.",
+                )
+
+        check_hop_ceiling(env)
+        if resolved_authority is None:
             return _error_json(
-                f"Session store unavailable: {type(exc).__name__}",
+                "SessionAuthority is unavailable on this listener",
                 503,
-                code="storage_unavailable",
+                code="session_authority_unavailable",
                 err_type="server_error",
                 secrets=secrets,
                 headers={"Retry-After": "1"},
             )
-        if (
-            closed_doc is not None
-            and closed_doc.get("idempotency_key") != env.idempotency_key
-            and not already_admitted
-        ):
-            return _error_json(
-                f"Correlation chain {env.correlation_id!r} is already closed by a terminal REPLY/FYI.",
-                409,
-                code="correlation_closed",
-                secrets=secrets,
-            )
 
-    # 6. Enforce hop ceiling (`max_hops` hard-clamped <= 4; `hop_count > max_hops` -> 429)
-    try:
-        check_hop_ceiling(env)
-    except HandoffError as exc:
-        return _error_json(
-            exc.message,
-            exc.status_code,
-            code=exc.code,
-            err_type=exc.err_type,
-            secrets=secrets,
-        )
-
-    if resolved_authority is None:
-        return _error_json(
-            "SessionAuthority is unavailable on this listener",
-            503,
-            code="session_authority_unavailable",
-            err_type="server_error",
-            secrets=secrets,
-            headers={"Retry-After": "1"},
-        )
-
-    # 7. Enforce session eligibility against `authority.db` (`404` / `409`)
-    try:
-        eligibility = await asyncio.to_thread(
-            _inspect_session_eligibility,
+        receipt, replayed, queue_position = await _admit_validated_handoff(
             resolved_authority,
-            session_id,
-            request_id,
-        )
-    except HandoffError as exc:
-        return _error_json(
-            exc.message,
-            exc.status_code,
-            code=exc.code,
-            err_type=exc.err_type,
+            session_id=session_id,
+            request_id=request_id,
+            env=env,
+            normalized_author=normalized_author,
             secrets=secrets,
         )
-    except (sqlite3.Error, OSError) as exc:
-        return _error_json(
-            f"Session store unavailable: {type(exc).__name__}",
-            503,
-            code="storage_unavailable",
-            err_type="server_error",
-            secrets=secrets,
-            headers={"Retry-After": "1"},
-        )
-
-    owner_id = eligibility.owner_id
-
-    # 8. Deterministic prompt render & SessionAuthority FIFO submission
-    rendered_text = render_envelope_prompt(env, secrets=secrets)
-    profile_id = str(getattr(resolved_authority, "profile_id", "default"))
-    actor = SessionActor(
-        "api-operator",
-        profile_id,
-        frozenset({"session:read", "session:submit", "session:operator"}),
-        f"api-handoff:{env.idempotency_key}",
-    )
-    submission = Submission(
-        request_id=request_id,
-        ref=SessionRef(profile_id, owner_id),
-        intent="queue",
-        payload={
-            "text": rendered_text,
-            "turn_author": normalized_author,
-        },
-    )
-
-    try:
-        if eligibility.needs_api_bind:
-            from gateway.session_api import bind_api_steps, run_steps_off_loop
-
-            await run_steps_off_loop(
-                resolved_authority, bind_api_steps(resolved_authority, owner_id)
-            )
-        elif eligibility.needs_local_adopt:
-            await _adopt_host_owned_local_session(
-                resolved_authority,
-                owner_id,
-                session_id=session_id,
-                idempotency_key=env.idempotency_key,
-            )
-        receipt, replayed = await _submit_with_replay_tracking(
-            resolved_authority, actor, submission
-        )
-        if env.is_terminal:
-            await asyncio.to_thread(
-                _persist_closed_correlation,
-                resolved_authority,
-                correlation_id=env.correlation_id,
-                intent=env.intent,
-                idempotency_key=env.idempotency_key,
-                session_id=owner_id,
-            )
-        queue_position = await asyncio.to_thread(
-            _compute_queue_position, resolved_authority, owner_id, receipt
-        )
-    except HandoffError as exc:
-        return _error_json(
-            exc.message,
-            exc.status_code,
-            code=exc.code,
-            err_type=exc.err_type,
-            secrets=secrets,
-        )
-    except RuntimeStoreError as exc:
-        return _map_runtime_store_error(exc, secrets=secrets)
-    except (sqlite3.Error, OSError) as exc:
-        return _error_json(
-            f"Session store unavailable: {type(exc).__name__}",
-            503,
-            code="storage_unavailable",
-            err_type="server_error",
-            secrets=secrets,
-            headers={"Retry-After": "1"},
-        )
+    except (HandoffError, RuntimeStoreError, sqlite3.Error, OSError) as exc:
+        return _handoff_exception_response(exc, secrets=secrets)
 
     # HX017: never log user body, summary, or display names at INFO+
     logger.debug(
