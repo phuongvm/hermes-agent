@@ -62,9 +62,9 @@ def _int_param(params: dict, key: str, default: int) -> int:
         return default
 
 
-def _new_runtime_ids(params: dict) -> tuple[str, str]:
-    """Fresh runtime sid + resolved DB ``source`` for a session minted from ``params``."""
-    return uuid.uuid4().hex[:8], _resolve_session_source(_str_param(params, "source") or None)
+def _new_runtime_ids(params: dict, *, fallback_source: str | None = None) -> tuple[str, str]:
+    fallback = None if is_truthy_value(os.environ.get("HERMES_DESKTOP_TERMINAL")) else fallback_source
+    return uuid.uuid4().hex[:8], _resolve_session_source(_str_param(params, "source") or fallback or None)
 
 
 def _profile_build_scope(profile_home):
@@ -625,10 +625,10 @@ class _Resume:
 
     def mint(self, prompts: bool = True) -> tuple:
         """``(runtime sid, source, cwd)`` for the live record this resume registers (+ gateway prompts on)."""
-        ids = _new_runtime_ids(self.params)
+        fallback = "desktop" if str((self.found or {}).get("source") or "").strip().lower() == "desktop" else None
         if prompts:
             _enable_gateway_prompts()
-        return *ids, self.profile_resume_cwd or _default_session_cwd()
+        return *_new_runtime_ids(self.params, fallback_source=fallback), self.profile_resume_cwd or _default_session_cwd()
 
     def record(self, source: str, cwd: str, history: list, overrides: dict | None = None, **extra) -> dict:
         """``_deferred_session_record`` with this resume's common fields (lease claimed lazily on turn 1);

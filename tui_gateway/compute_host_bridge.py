@@ -314,6 +314,7 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
     _drain_queued_prompt(rid, sid, session)
+    _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
 
 
 def _submit_prompt_to_compute_host(

@@ -327,15 +327,22 @@ def _repair_missing_ws_orphan_reaps() -> None:
 _IDLE_LEASE_RELEASE_S = 600.0
 
 
-def _session_lease_is_idle(sid: str, session: dict, now: float) -> bool:
-    """A liveness-tracked (Desktop) lease on a record with no turn, build, input wait or delegation in flight,
-    untouched for ``_IDLE_LEASE_RELEASE_S``. A borrowed compute-host token (``enabled=False``) is not ours."""
+def _session_lease_is_idle(
+    sid: str, session: dict, now: float, *, min_idle_s: float | None = None
+) -> bool:
+    """A liveness-tracked (Desktop) lease on a record with no turn, queued follow-up, build,
+    input wait, local wakeup, delegation, transcript claim, or teardown in flight.
+    A borrowed compute-host token (``enabled=False``) is not ours."""
     lease = session.get("active_session_lease")
     if lease is None or not getattr(lease, "track_liveness", False) or not getattr(lease, "enabled", True):
         return False
-    if now - float(session.get("last_active") or 0.0) <= _IDLE_LEASE_RELEASE_S:
+    idle_threshold = _IDLE_LEASE_RELEASE_S if min_idle_s is None else min_idle_s
+    if idle_threshold > 0 and (now - float(session.get("last_active") or 0.0)) <= idle_threshold:
         return False
-    if session.get("running") or session.get("_compute_host_turn_id") or _session_holds_transcript_claim(session, now):
+    if any(session.get(k) for k in (
+        "_finalized", "_closing", "running", "_compute_host_turn_id",
+        "queued_prompt", "queued_prompts", "_compute_host_open_request",
+    )) or _session_holds_transcript_claim(session, now):
         return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set():
@@ -344,27 +351,36 @@ def _session_lease_is_idle(sid: str, session: dict, now: float) -> bool:
                 or _session_owns_live_wakeup_schedule(session) or _session_owns_pending_process_notification(session))
 
 
+def _release_idle_desktop_lease_if_eligible(
+    sid: str, session: dict, *, now: float | None = None, min_idle_s: float | None = None
+) -> bool:
+    """Release ``session``'s liveness-tracked lease if quiescent under ``history_lock``; True when released."""
+    sample_now = time.time() if now is None else now
+    if not _session_lease_is_idle(sid, session, sample_now, min_idle_s=min_idle_s):
+        return False
+    # Turns mark ``running`` and off-turn writers refresh ``last_active`` / hold a transcript claim under
+    # history_lock: re-evaluate the WHOLE predicate there, or a writer that passed its ownership check after
+    # the unlocked probe above loses the lease mid-write. ``_lease_idle_released`` is set under the same lock:
+    # a submit that checked the lease before this release, and every rewind, refuses to write the transcript
+    # until the lease is re-claimed.
+    with session.get("history_lock") or contextlib.nullcontext():
+        if not _session_lease_is_idle(sid, session, sample_now, min_idle_s=min_idle_s):
+            return False
+        if not _release_active_session_slot(session):
+            return False
+        session["_lease_idle_released"] = sid  # the writer identity a re-claim must present
+        return True
+
+
 def _release_idle_session_leases(now: float | None = None) -> int:
     """Release the active-session lease of every idle resident Desktop record; returns the count."""
-    now = time.time() if now is None else now
+    sample_now = time.time() if now is None else now
     with _sessions_lock:
         candidates = [(sid, s) for sid, s in _sessions.items() if s.get("active_session_lease") is not None]
-    released = 0
-    for sid, session in candidates:
-        if not _session_lease_is_idle(sid, session, now):
-            continue
-        # Turns mark ``running`` and off-turn writers refresh ``last_active`` / hold a transcript claim under
-        # history_lock: re-evaluate the WHOLE predicate there, or a writer that passed its ownership check after
-        # the unlocked probe above loses the lease mid-write. ``_lease_idle_released`` is set under the same lock:
-        # a submit that checked the lease before this release, and every rewind, refuses to write the transcript
-        # until the lease is re-claimed.
-        with session.get("history_lock") or contextlib.nullcontext():
-            if session.get("_finalized") or not _session_lease_is_idle(sid, session, now):
-                continue
-            if _release_active_session_slot(session):
-                session["_lease_idle_released"] = sid  # the writer identity a re-claim must present
-                released += 1
-    return released
+    return sum(
+        1 for sid, session in candidates
+        if _release_idle_desktop_lease_if_eligible(sid, session, now=sample_now, min_idle_s=_IDLE_LEASE_RELEASE_S)
+    )
 
 
 def _reclaim_orphaned_leases() -> None:

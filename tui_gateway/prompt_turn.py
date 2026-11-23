@@ -115,6 +115,24 @@ def _plan_goal_compression_recovery(
         "Run /compress, then /goal resume to continue.")
 
 
+def _refuse_closing_or_stale_generation(
+    session: dict, held_lease: Any, queued_prompt_generation: int | None
+) -> bool:
+    if not session.get("_closing") and (
+        queued_prompt_generation is None
+        or int(session.get("_queued_prompt_generation", 0)) == queued_prompt_generation
+    ):
+        return False
+    session["running"] = False
+    session.pop("_submit_user_row", None)
+    if session.get("_closing") and session.get("active_session_lease") is not held_lease:
+        # Close stops waiting for this thread after a grace and then finalizes. A lease this
+        # admission claimed after that finalize has no other code path that releases it; one
+        # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
+        _release_active_session_slot(session)
+    return True
+
+
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
     queued_prompt_generation: int | None, display_kind: str | None,
@@ -136,32 +154,26 @@ def _admit_prompt_turn(
             _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:
-        if session.get("_closing") or (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
-            session["running"] = False
-            session.pop("_submit_user_row", None)
-            if session.get("_closing") and session.get("active_session_lease") is not held_lease:
-                # Close stops waiting for this thread after a grace and then finalizes. A lease this
-                # admission claimed after that finalize has no other code path that releases it; one
-                # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
-                _release_active_session_slot(session)
-            return None
-        images = list(session.get("attached_images", []) if image_paths is None else image_paths)
-        if image_paths is None:
-            session["attached_images"] = []
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(
-                session, text, display_kind=display_kind, display_metadata=display_metadata)
-        agent = session["agent"]
-        if agent is None:
-            session["running"] = False
-        else:
-            with contextlib.suppress(Exception):
-                agent.clear_interrupt()
+        refused = _refuse_closing_or_stale_generation(session, held_lease, queued_prompt_generation)
+        if not refused:
+            images = list(session.get("attached_images", []) if image_paths is None else image_paths)
+            if image_paths is None:
+                session["attached_images"] = []
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(
+                    session, text, display_kind=display_kind, display_metadata=display_metadata)
+            agent = session["agent"]
+            if agent is None:
+                session["running"] = False
+            else:
+                with contextlib.suppress(Exception):
+                    agent.clear_interrupt()
+    if refused:
+        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
+        return None
     if agent is None:
         # A deferred build can finish without attaching an agent (its record was replaced or closed
         # mid-build: ``agent_ready`` set, ``agent`` None, see ``_start_agent_build``).  Every turn source
@@ -173,6 +185,7 @@ def _admit_prompt_turn(
         _emit_terminal_turn_error(
             sid, session, reason,
             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
+        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
         return None
     return images, agent
 
@@ -1253,10 +1266,13 @@ def _run_prompt_submit(
         # _prepare_turn_input owns profile binding for the worker. The context
         # here only gates presentation; do not introduce a second runtime scope.
         from agent.notification_presentation import notification_policy_snapshot
-        with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid):
-            followup = run_body()
-        if followup is not None:
-            _run_post_turn_followups(rid, sid, session, *followup)
+        try:
+            with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid):
+                followup = run_body()
+            if followup is not None:
+                _run_post_turn_followups(rid, sid, session, *followup)
+        finally:
+            _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
     with _routing_provenance_db(session) as routing_db, _sessions_lock:
@@ -1273,6 +1289,7 @@ def _run_prompt_submit(
             session["running"] = False
             if session.get(SESSION_KEY) is segments:
                 session.pop(SESSION_KEY)
+        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
     return can_start
 
 
