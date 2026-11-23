@@ -949,3 +949,524 @@ class TestMultiplexRoutingSecretScrubbingAndSeamInjection:
             )
             assert r3.status == 409
             assert _extract_code(await r3.json()) == "correlation_closed"
+
+
+class TestHostOwnedLocalJitAdoption:
+    @pytest.mark.asyncio
+    async def test_adopts_modern_host_owned_desktop_session_and_reuses_durable_binding_across_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_state_local_migration import LEGACY_PREFIX
+
+        app, adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        host_owner = host_owner_subject()
+        sid = "20261123_152408_b45348"
+        authority.db.create_session(
+            sid,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner,
+        )
+
+        with authority.db._read_ctx() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN (?, ?)",
+                (POLICY_PREFIX + sid, LEGACY_PREFIX + sid),
+            ).fetchone() is None
+        assert sid not in authority.sessions
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                r1 = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-jit-desktop-1"),
+                    headers=_auth_headers(),
+                )
+                assert r1.status == 202
+                b1 = await r1.json()
+                assert b1["ok"] is True
+                assert b1["status"] == "queued"
+
+                with authority.db._read_ctx() as conn:
+                    pol_row = conn.execute(
+                        "SELECT value FROM state_meta WHERE key=?", (POLICY_PREFIX + sid,)
+                    ).fetchone()
+                    leg_row = conn.execute(
+                        "SELECT value FROM state_meta WHERE key=?", (LEGACY_PREFIX + sid,)
+                    ).fetchone()
+                assert pol_row is not None
+                assert leg_row is not None
+
+                session_row = authority.db.get_session(sid)
+                assert session_row is not None
+                assert session_row["source"] == "desktop"
+                assert session_row["user_id"] == host_owner
+                assert session_row["chat_id"] == sid
+                assert session_row["session_key"]
+
+                admissions = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                assert len(admissions) == 1
+                assert admissions[0]["principal_id"] == "api-operator"
+                assert admissions[0]["payload"]["local_operator_v1"]["principal_id"] == "api-operator"
+                assert getattr(authority, "_native_legacy_transports", {}) == {}
+
+                def _boom_adopt(*_a: Any, **_kw: Any) -> Any:
+                    raise AssertionError("Already-bound session must not invoke adopt_legacy_session")
+
+                monkeypatch.setattr(
+                    "gateway.session_local_migration.adopt_legacy_session", _boom_adopt
+                )
+
+                r2 = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-jit-desktop-2"),
+                    headers=_auth_headers(),
+                )
+                assert r2.status == 202
+
+                runner = adapter.gateway_runner
+                runner.adapters = {Platform.API_SERVER: adapter}
+                restarted_authority = await initialize_session_authority(
+                    runner,
+                    profile_id=authority.profile_id,
+                    instance_id="restarted-jit-handoff-instance",
+                )
+                restarted_authority._schedule = lambda _ref: None
+                restarted_authority.sessions.clear()
+
+                r3 = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-jit-desktop-3"),
+                    headers=_auth_headers(),
+                )
+                assert r3.status == 202
+                all_admissions = list_session_admissions(
+                    restarted_authority.db, session_id=sid, pending_only=False
+                )
+                assert len(all_admissions) == 3
+        finally:
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_adopts_dashboard_login_stamped_and_history_pinned_host_owned_desktop_sessions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_state_local_migration import LEGACY_PREFIX
+        from hermes_state_mutation_binding import BINDING_PREFIX
+
+        app, _adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        host_owner = host_owner_subject()
+        db = authority.db
+
+        db.create_session(
+            "desktop-self-hosted-001",
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id="self-hosted:owner-uuid-001",
+        )
+        db.create_session(
+            "desktop-auth-v1-001",
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id='auth:v1:["basic","","admin"]',
+        )
+        pinned_sid = "desktop-pinned-hist-001"
+        db.create_session(
+            pinned_sid,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner,
+        )
+        db._execute_write(
+            lambda conn: (
+                conn.execute("UPDATE sessions SET pinned=1 WHERE id=?", (pinned_sid,)),
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES(?, ?)",
+                    (
+                        BINDING_PREFIX + pinned_sid,
+                        json.dumps([str(authority.profile_id), host_owner], separators=(",", ":")),
+                    ),
+                ),
+            )
+        )
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                for idx, sid in enumerate(
+                    ("desktop-self-hosted-001", "desktop-auth-v1-001", pinned_sid)
+                ):
+                    resp = await client.post(
+                        f"/api/sessions/{sid}/handoff",
+                        json=_valid_envelope(idempotency_key=f"idem-stamp-{idx}"),
+                        headers=_auth_headers(),
+                    )
+                    assert resp.status == 202
+                    after_row = db.get_session(sid)
+                    assert after_row is not None
+                    assert after_row["source"] == "desktop"
+                    assert after_row["user_id"] == host_owner
+                    with db._read_ctx() as conn:
+                        assert conn.execute(
+                            "SELECT 1 FROM state_meta WHERE key=?", (POLICY_PREFIX + sid,)
+                        ).fetchone() is not None
+                        assert conn.execute(
+                            "SELECT 1 FROM state_meta WHERE key=?", (LEGACY_PREFIX + sid,)
+                        ).fetchone() is not None
+                    admissions = list_session_admissions(db, session_id=sid, pending_only=False)
+                    assert len(admissions) == 1
+                    assert admissions[0]["principal_id"] == "api-operator"
+        finally:
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_refuses_unowned_blank_nous_foreign_and_routed_unbound_local_sessions_without_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_mutation_binding import BINDING_PREFIX
+
+        app, _adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        host_owner = host_owner_subject()
+        foreign_uid = "uid:999998" if host_owner == "uid:999999" else "uid:999999"
+        db = authority.db
+
+        cases: list[str] = []
+
+        def _seed(sid: str, *, source: str = "desktop", **kwargs: Any) -> None:
+            db.create_session(sid, source=source, model="fixture-model", cwd=str(tmp_path), **kwargs)
+            cases.append(sid)
+
+        _seed("neg-unowned-null", user_id=None)
+        _seed("neg-unowned-empty", user_id=None)
+        db._execute_write(
+            lambda conn: conn.execute("UPDATE sessions SET user_id='' WHERE id='neg-unowned-empty'")
+        )
+        _seed("neg-unowned-blank", user_id=None)
+        db._execute_write(
+            lambda conn: conn.execute("UPDATE sessions SET user_id='   ' WHERE id='neg-unowned-blank'")
+        )
+        _seed("neg-nous-label", user_id="nous:account-xyz")
+        _seed("neg-foreign-uid", user_id=foreign_uid)
+        _seed("neg-foreign-sid", user_id="sid:S-1-5-21-0-0-0-9999")
+        _seed("neg-foreign-platform", user_id="telegram:424242")
+        _seed("neg-foreign-history", user_id=host_owner)
+        db._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES(?, ?)",
+                (
+                    BINDING_PREFIX + "neg-foreign-history",
+                    json.dumps([str(authority.profile_id), foreign_uid], separators=(",", ":")),
+                ),
+            )
+        )
+        _seed("neg-routed-key", user_id=host_owner, session_key="agent:main:telegram:dm:99")
+        _seed("neg-routed-chat", user_id=host_owner, chat_id="foreign-chat-99")
+        _seed("neg-routed-origin", user_id=host_owner, origin_json='{"platform":"telegram"}')
+        _seed("neg-non-legacy-local", source="local", user_id=host_owner)
+
+        def _meta_snapshot() -> dict[str, str]:
+            with db._read_ctx() as conn:
+                return dict(conn.execute("SELECT key, value FROM state_meta").fetchall())
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                for sid in cases:
+                    before_row = db.get_session(sid)
+                    before_meta = _meta_snapshot()
+                    resp = await client.post(
+                        f"/api/sessions/{sid}/handoff",
+                        json=_valid_envelope(idempotency_key=f"idem-{sid}"),
+                        headers=_auth_headers(),
+                    )
+                    assert resp.status == 409, f"Expected 409 for {sid}, got {resp.status}"
+                    assert _extract_code(await resp.json()) == "legacy_session_unbound"
+                    after_row = db.get_session(sid)
+                    assert after_row is not None and before_row is not None
+                    for col in ("source", "user_id", "session_key", "chat_id", "origin_json"):
+                        assert after_row[col] == before_row[col], f"Column {col} mutated on {sid}"
+                    assert _meta_snapshot() == before_meta, f"state_meta mutated on {sid}"
+                    assert not list_session_admissions(db, session_id=sid, pending_only=False)
+        finally:
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_active_desktop_session_lease_refuses_adoption_with_runtime_coordination_required_and_transport_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gateway.owner_identity import host_owner_subject
+        from hermes_cli.active_sessions import try_acquire_active_session
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_state_local_migration import LEGACY_PREFIX
+
+        app, _adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        sid = "desktop-active-lease-001"
+        authority.db.create_session(
+            sid,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner_subject(),
+        )
+        lease, refusal = try_acquire_active_session(
+            session_id=sid,
+            surface="desktop",
+            config={},
+            registry_home=Path(authority.db.db_path).parent,
+        )
+        assert lease is not None and refusal is None
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                r_blocked = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-lease-blocked"),
+                    headers=_auth_headers(),
+                )
+                assert r_blocked.status == 409
+                assert _extract_code(await r_blocked.json()) == "runtime_coordination_required"
+                with authority.db._read_ctx() as conn:
+                    assert conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key IN (?, ?)",
+                        (POLICY_PREFIX + sid, LEGACY_PREFIX + sid),
+                    ).fetchone() is None
+                row = authority.db.get_session(sid)
+                assert row is not None and row["session_key"] is None
+                assert not list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                assert getattr(authority, "_native_legacy_transports", {}) == {}
+
+                lease.release()
+
+                r_ok = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-lease-released"),
+                    headers=_auth_headers(),
+                )
+                assert r_ok.status == 202
+                assert getattr(authority, "_native_legacy_transports", {}) == {}
+        finally:
+            lease.release()
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_unexpired_turn_lease_refuses_adoption_with_runtime_coordination_required_and_transport_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_state_local_migration import LEGACY_PREFIX
+
+        app, _adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        sid = "desktop-turn-lease-001"
+        authority.db.create_session(
+            sid,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner_subject(),
+        )
+        holder = "desktop-external-turn-holder"
+        assert authority.db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=300.0) is True
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                r_blocked = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-turn-lease-blocked"),
+                    headers=_auth_headers(),
+                )
+                assert r_blocked.status == 409
+                assert _extract_code(await r_blocked.json()) == "runtime_coordination_required"
+                with authority.db._read_ctx() as conn:
+                    assert conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key IN (?, ?)",
+                        (POLICY_PREFIX + sid, LEGACY_PREFIX + sid),
+                    ).fetchone() is None
+                row = authority.db.get_session(sid)
+                assert row is not None and row["session_key"] is None
+                assert not list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                assert getattr(authority, "_native_legacy_transports", {}) == {}
+
+                authority.db.release_session_turn_lease(sid, holder)
+
+                r_ok = await client.post(
+                    f"/api/sessions/{sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-turn-lease-released"),
+                    headers=_auth_headers(),
+                )
+                assert r_ok.status == 202
+                assert getattr(authority, "_native_legacy_transports", {}) == {}
+        finally:
+            authority.db.release_session_turn_lease(sid, holder)
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_handoffs_to_unbound_host_owned_desktop_session_serialize_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gateway import session_local_migration as slm
+        from gateway.owner_identity import host_owner_subject
+
+        app, _adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        host_owner = host_owner_subject()
+        sid = "desktop-concurrent-001"
+        authority.db.create_session(
+            sid,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner,
+        )
+
+        adopt_calls = 0
+        real_adopt = slm.adopt_legacy_session
+
+        def _counting_adopt(auth: Any, actor: Any, row: Any) -> Any:
+            nonlocal adopt_calls
+            adopt_calls += 1
+            return real_adopt(auth, actor, row)
+
+        monkeypatch.setattr(slm, "adopt_legacy_session", _counting_adopt)
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                r1, r2 = await asyncio.gather(
+                    client.post(
+                        f"/api/sessions/{sid}/handoff",
+                        json=_valid_envelope(idempotency_key="idem-conc-1", correlation_id="corr-conc-1"),
+                        headers=_auth_headers(),
+                    ),
+                    client.post(
+                        f"/api/sessions/{sid}/handoff",
+                        json=_valid_envelope(idempotency_key="idem-conc-2", correlation_id="corr-conc-2"),
+                        headers=_auth_headers(),
+                    ),
+                )
+                assert r1.status == 202
+                assert r2.status == 202
+                b1, b2 = await r1.json(), await r2.json()
+                assert b1["admission_id"] != b2["admission_id"]
+                assert adopt_calls == 1
+
+                admissions = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                assert len(admissions) == 2
+                assert [a["status"] for a in admissions] == ["queued", "queued"]
+                after_row = authority.db.get_session(sid)
+                assert after_row is not None
+                assert after_row["source"] == "desktop"
+                assert after_row["user_id"] == host_owner
+                assert getattr(authority, "_native_legacy_transports", {}) == {}
+        finally:
+            store._db.close()
+
+    @pytest.mark.asyncio
+    async def test_handoff_to_compressed_unbound_host_owned_desktop_parent_resolves_and_adopts_compression_tip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_state_local_migration import LEGACY_PREFIX
+
+        app, _adapter, authority, store, _owner, _bound_sid = await _build_handoff_harness(
+            tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
+        )
+        host_owner = host_owner_subject()
+        db = authority.db
+        parent_sid = "desktop-comp-parent-001"
+        tip_sid = "desktop-comp-tip-001"
+
+        db.create_session(
+            parent_sid,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner,
+        )
+        db.end_session(parent_sid, "compression")
+        db.create_session(
+            tip_sid,
+            source="desktop",
+            parent_session_id=parent_sid,
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner,
+        )
+        assert db.get_compression_tip(parent_sid) == tip_sid
+
+        try:
+            async with TestClient(TestServer(app)) as client:
+                env1 = _valid_envelope(idempotency_key="idem-comp-1")
+                r1 = await client.post(
+                    f"/api/sessions/{parent_sid}/handoff",
+                    json=env1,
+                    headers=_auth_headers(),
+                )
+                assert r1.status == 202
+                b1 = await r1.json()
+                assert b1["replayed"] is False
+
+                with db._read_ctx() as conn:
+                    assert conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key=?", (POLICY_PREFIX + tip_sid,)
+                    ).fetchone() is not None
+                    assert conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key=?", (LEGACY_PREFIX + tip_sid,)
+                    ).fetchone() is not None
+                    assert conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key=?", (POLICY_PREFIX + parent_sid,)
+                    ).fetchone() is None
+
+                assert not list_session_admissions(db, session_id=parent_sid, pending_only=False)
+                tip_admissions = list_session_admissions(db, session_id=tip_sid, pending_only=False)
+                assert len(tip_admissions) == 1
+                assert tip_admissions[0]["admission_id"] == b1["admission_id"]
+
+                # Exact retry on parent_sid replays the tip admission cleanly without admission_conflict
+                r_retry = await client.post(
+                    f"/api/sessions/{parent_sid}/handoff",
+                    json=env1,
+                    headers=_auth_headers(),
+                )
+                assert r_retry.status == 202
+                b_retry = await r_retry.json()
+                assert b_retry["replayed"] is True
+                assert b_retry["admission_id"] == b1["admission_id"]
+
+                def _boom_adopt(*_a: Any, **_kw: Any) -> Any:
+                    raise AssertionError("Already-bound compression tip must not re-adopt")
+
+                monkeypatch.setattr(
+                    "gateway.session_local_migration.adopt_legacy_session", _boom_adopt
+                )
+
+                r2 = await client.post(
+                    f"/api/sessions/{parent_sid}/handoff",
+                    json=_valid_envelope(idempotency_key="idem-comp-2"),
+                    headers=_auth_headers(),
+                )
+                assert r2.status == 202
+                assert len(list_session_admissions(db, session_id=tip_sid, pending_only=False)) == 2
+        finally:
+            store._db.close()
+
