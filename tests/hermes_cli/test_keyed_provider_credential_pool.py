@@ -244,3 +244,25 @@ def test_named_provider_pool_requires_matching_endpoint(tmp_path, monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="b-ai", explicit_base_url="https://elsewhere.example/v1")
     assert resolved["base_url"] == "https://elsewhere.example/v1"
     assert resolved["api_key"] != POOL_KEY
+
+
+def test_named_provider_pool_preserves_requested_provider(tmp_path, monkeypatch):
+    """Pooled named custom routes must preserve requested_provider (parity with non-pool path).
+
+    Regression: gateway/session_worker_construct.route_runtime calls _resolve_named_custom_runtime
+    directly without resolve_runtime_provider stamping requested_provider. When a custom provider
+    entry resolves from auth.json's credential_pool (e.g. custom:ai-router), omitting
+    requested_provider leaves AIAgent.requested_provider == 'custom', breaking _is_router_route()
+    in agent.tier_floor_policy on bare cx/* SSE chunk models like 'gpt-6.2-astra'.
+    """
+    _write_keyed_provider_home(tmp_path, monkeypatch)
+
+    from hermes_cli import runtime_provider as rp
+    from hermes_cli.runtime_provider_custom import _resolve_named_custom_runtime
+
+    frozen = rp.load_config()
+    resolved = _resolve_named_custom_runtime(requested_provider="b-ai", config=frozen)
+    assert resolved is not None
+    assert resolved["provider"] == "custom"
+    assert resolved["api_key"] == POOL_KEY
+    assert resolved.get("requested_provider") == "b-ai"

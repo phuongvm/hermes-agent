@@ -796,6 +796,8 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         provider_name=custom_provider.get("provider_key") or custom_provider.get("name"),
     )
     if pool_result:
+        if requested_provider and not pool_result.get("requested_provider"):
+            pool_result["requested_provider"] = requested_provider
         # The pool doesn't know the custom_providers fields — propagate them here too.
         _apply_custom_provider_extras(custom_provider, target_model, pool_result)
         return pool_result
