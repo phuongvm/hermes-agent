@@ -49,6 +49,7 @@ _ELIGIBLE_LOCAL_SOURCES: frozenset[str] = frozenset(
 )
 _ELIGIBLE_API_SOURCES: frozenset[str] = frozenset({"api_server"})
 
+_RELAY_MARKER_RE = re.compile(r"(?i)<<<(?=(?:BEGIN|END)\s+RELAYED\s+MESSAGE)")
 _BEARER_RE = re.compile(r"(?i)(Bearer\s+)(?!<REDACTED_TOKEN>)[A-Za-z0-9._~+/=-]+")
 _KEY_KV_RE = re.compile(
     r"""(?i)((?:AGY_BRIDGE_TOKEN|API_SERVER_KEY|HERMES_API_KEY_[A-Z0-9_]+|BW_SESSION)\s*[:=]\s*)"""
@@ -431,13 +432,10 @@ def parse_handoff_envelope(
 
 
 def _neutralize_relay_delimiters(text: str) -> str:
-    """Deterministically neutralize embedded relay delimiter prefixes to prevent boundary breakout."""
+    """Deterministically neutralize embedded relay begin/end markers inside untrusted content."""
     if not text:
         return text
-    return (
-        text.replace("<<<BEGIN RELAYED MESSAGE", "< < <BEGIN RELAYED MESSAGE")
-        .replace("<<<END RELAYED MESSAGE", "< < <END RELAYED MESSAGE")
-    )
+    return _RELAY_MARKER_RE.sub("< < <", text)
 
 
 def render_envelope_prompt(env: HandoffEnvelope, *, secrets: Iterable[str] = ()) -> str:
@@ -446,13 +444,16 @@ def render_envelope_prompt(env: HandoffEnvelope, *, secrets: Iterable[str] = ())
     Pure function of `(env, secrets)`: zero wall-clock timestamps or random IDs so
     `SessionAuthority` payload-digest checks match byte-for-byte on `request_id` replay.
     """
+    delivery_mode = validate_delivery_mode(env.delivery_mode, intent=env.intent)
     sender_session = env.sender.session_id or "unspecified"
     target_session = env.target.session_id or "unspecified"
     safe_author = scrub_secrets(env.sender.author_label, secrets)
     safe_summary = scrub_secrets(env.summary, secrets)
     safe_body = scrub_secrets(env.body, secrets)
 
-    if env.delivery_mode == "human_relay":
+    if delivery_mode == "human_relay":
+        safe_author = _neutralize_relay_delimiters(safe_author)
+        safe_summary = _neutralize_relay_delimiters(safe_summary)
         directive = (
             f"Human relay (intent=FYI, delivery_mode=human_relay) -> Your response IS the delivery "
             f"to your local human user (NOT a reply to the peer agent). Deliver the relayed message "
@@ -485,7 +486,7 @@ def render_envelope_prompt(env: HandoffEnvelope, *, secrets: Iterable[str] = ())
     lines = [
         "[HERMES <-> ANTIGRAVITY SESSION BRIDGE HANDOFF]",
         (
-            f"Intent: {env.intent} | Delivery-Mode: {env.delivery_mode} | "
+            f"Intent: {env.intent} | Delivery-Mode: {delivery_mode} | "
             f"Correlation-ID: {env.correlation_id} | Hop: {env.hop_count}/{env.max_hops}"
         ),
         f"From: {safe_author} ({env.sender.surface}:{env.sender.node}, session={sender_session})",
@@ -498,7 +499,7 @@ def render_envelope_prompt(env: HandoffEnvelope, *, secrets: Iterable[str] = ())
         f"Directive: {directive}",
         f"Summary: {safe_summary}",
     ]
-    if env.delivery_mode == "human_relay":
+    if delivery_mode == "human_relay":
         relayed_source = safe_body if safe_body.strip() else safe_summary
         neutralized_relayed_content = _neutralize_relay_delimiters(relayed_source)
         lines.append("")
