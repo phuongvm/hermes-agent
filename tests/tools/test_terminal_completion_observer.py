@@ -1,7 +1,9 @@
 """Verify the host's foreground evidence without starting any process."""
 
+import copy
 import io
 import json
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +11,7 @@ import pytest
 from hermes_cli import lifecycle
 from model_tools import _CallIds, _approval_observability, _emit_post_tool_call_hook
 from tools.environments.base import BaseEnvironment
-from tools.terminal_tool_result import finalize_foreground_result
+from tools.terminal_tool_result import confirms_foreground_completion, finalize_foreground_result
 
 
 @pytest.mark.parametrize(
@@ -109,3 +111,41 @@ def test_backend_wait_stdin_error_disqualifies_foreground_completion(monkeypatch
     fields = events.pop()
     assert fields.get("terminal_foreground_completed", False) is expected
     assert not events
+
+
+def test_foreground_result_survives_copy_deepcopy_and_pickle_as_plain_str(tmp_path):
+    """Regression: compression snapshot copy.deepcopy(messages) crashed with
+    TypeError: _CompletedForeground.__new__() missing 1 required positional argument: 'call'.
+    """
+    ids = _CallIds(task_id="task", session_id="session", turn_id="turn", tool_call_id="call")
+    workdir = str(tmp_path)
+    with _approval_observability(ids):
+        result = finalize_foreground_result(
+            command="echo fixture", result={"output": "fixture", "returncode": 0},
+            env=SimpleNamespace(), env_type="local", effective_task_id="task", task_id="task",
+            session_id="session", session_key="session", workdir=workdir, command_cwd=workdir,
+            approval_note=None,
+        )
+    call_tuple = ("session", "turn", "call")
+    assert confirms_foreground_completion(result, call_tuple) is True
+
+    # Shallow copy
+    shallow = copy.copy(result)
+    assert type(shallow) is str
+    assert shallow == result
+    assert confirms_foreground_completion(shallow, call_tuple) is False
+
+    # Deep copy inside a messages list (matches compression_facade._snapshot_worker)
+    messages = [{"role": "tool", "tool_call_id": "call", "content": result}]
+    snapshot = copy.deepcopy(messages)
+    copied_content = snapshot[0]["content"]
+    assert type(copied_content) is str
+    assert copied_content == result
+    assert confirms_foreground_completion(copied_content, call_tuple) is False
+
+    # Pickle round-trip across all protocols
+    for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+        restored = pickle.loads(pickle.dumps(result, protocol=proto))
+        assert type(restored) is str
+        assert restored == result
+        assert confirms_foreground_completion(restored, call_tuple) is False

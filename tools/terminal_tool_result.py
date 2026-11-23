@@ -27,6 +27,15 @@ class _CompletedForeground(str):
         result.call = call
         return result
 
+    def __copy__(self) -> str:
+        return str(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> str:
+        return str(self)
+
+    def __reduce__(self) -> tuple[type[str], tuple[str]]:
+        return (str, (str(self),))
+
 
 def confirms_foreground_completion(result: Any, call: tuple[str, str, str]) -> bool:
     return type(result) is _CompletedForeground and all(call) and result.call == call
