@@ -800,9 +800,10 @@ def cmd_disable(name: str) -> None:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
     _toggle_plugin_toolset(key, enable=False, toolset_key=toolset_key)
-    from hermes_cli.plugins_activation import gateway_reload_hint, reload_running_gateway
+    from hermes_cli.plugins_activation import deactivate_plugin_now, gateway_reload_hint
+    deactivated = deactivate_plugin_now(key, in_process=False)
     console.print(f"[yellow]⊘[/yellow] Plugin [bold]{key}[/bold] disabled.")
-    console.print(f"[dim]{gateway_reload_hint(reload_running_gateway(), key)}[/dim]")
+    console.print(f"[dim]{gateway_reload_hint(deactivated['gateway_answer'], key, serve_reloaded=deactivated['serve_reloaded'])}[/dim]")
 
 
 def _read_manifest_info(d: Path, prefix: str):
@@ -1061,9 +1062,16 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
         return result
     if changed:
         _toggle_plugin_toolset(key, enable=False, toolset_key=toolset_key)
-    # Disable is config-only: there is no un-wire primitive, so a running gateway keeps the plugin's
-    # handlers until restart and every UI says so — #71595/#54941.
-    return {"ok": True, "name": key, "unchanged": not changed, "restart_required": changed}
+        from hermes_cli.plugins_activation import deactivate_plugin_now
+        deactivated = deactivate_plugin_now(key)
+        return {
+            "ok": True,
+            "name": key,
+            "unchanged": False,
+            "gateway_reloaded": deactivated["gateway_reloaded"],
+            "restart_required": deactivated["restart_required"],
+        }
+    return {"ok": True, "name": key, "unchanged": True, "restart_required": False}
 
 
 def _user_installed_plugin_dir(name: str) -> Optional[Path]:

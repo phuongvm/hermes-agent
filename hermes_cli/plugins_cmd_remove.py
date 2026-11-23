@@ -107,7 +107,7 @@ def cmd_remove(name: str) -> None:
     plugins_dir = _pc()._plugins_dir()
     target = _pc()._require_installed_plugin(name, plugins_dir, console)
     try:
-        result = _remove_user_plugin(plugins_dir, name, target)
+        result = _remove_user_plugin(plugins_dir, name, target, in_process=False)
     except (OSError, _pc().PluginOperationError) as exc:
         _pc()._fail(console, f"[red]Error:[/red] Could not remove plugin '{name}': {exc}")
     console.print()
@@ -118,7 +118,7 @@ def cmd_remove(name: str) -> None:
     console.print()
 
 
-def _remove_user_plugin(plugins_dir: Path, name: str, target: Path) -> dict[str, Any]:
+def _remove_user_plugin(plugins_dir: Path, name: str, target: Path, *, in_process: bool = True) -> dict[str, Any]:
     """Shared ``remove`` tail for the CLI, the dashboard and the ``plugins.manage`` RPC.
 
     *target* is the resolved directory; when ``plugins_dir/name`` itself is a symlink only the link
@@ -126,10 +126,13 @@ def _remove_user_plugin(plugins_dir: Path, name: str, target: Path) -> dict[str,
     and following it deleted that plugin plus its install metadata while the alias stayed dangling.
     Config bookkeeping (aliases, toolset) is gathered before the tree disappears.
     """
+    from hermes_cli.plugins_activation import deactivate_plugin_now
     link = plugins_dir / name.strip("/")
     if link.is_symlink():
         link.unlink()
-        return {"ok": True, "name": name, **_pc()._forget_plugin_config({link.name})}
+        forgotten = _pc()._forget_plugin_config({link.name})
+        deactivate_plugin_now(link.name, in_process=in_process)
+        return {"ok": True, "name": name, **forgotten}
     entry = next((e for e in _pc()._discover_all_plugins() if Path(str(e[4])) == target), None)
     key = entry[5] if entry else target.name
     aliases = _pc()._plugin_aliases(key) | {target.name}
@@ -138,7 +141,9 @@ def _remove_user_plugin(plugins_dir: Path, name: str, target: Path) -> dict[str,
     _pc()._toggle_plugin_toolset(key, enable=False)
     _remove_plugin_core(target)
     forget_plugin_grants(grant_key)  # a later plugin installed under the same key must not inherit the sign-in
-    return {"ok": True, "name": name, **_pc()._forget_plugin_config(aliases)}
+    forgotten = _pc()._forget_plugin_config(aliases)
+    deactivate_plugin_now(key, in_process=in_process)
+    return {"ok": True, "name": name, **forgotten}
 
 
 def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:

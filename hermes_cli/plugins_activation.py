@@ -163,6 +163,30 @@ def activate_plugin_now(name: str, *, in_process: bool = True) -> dict[str, Any]
             "restart_required": not reloaded or bool(missing)}
 
 
+def deactivate_plugin_now(name: str, *, in_process: bool = True) -> dict[str, Any]:
+    """After a disable/remove: force plugin re-discovery so ``name`` unloads (detaching hooks,
+    middleware, tools, context engine and running ``on_unload``) in THIS process when ``in_process``
+    is True, or in the running Desktop / dashboard backend (:func:`notify_serve_backend`) when
+    called from the CLI (``in_process=False``), and nudge the running gateway via ``reload-plugins``.
+    Never raises."""
+    from hermes_constants import get_hermes_home
+    serve_reloaded = False
+    if in_process:
+        load_and_go_live(name)
+        serve_reloaded = True
+    else:
+        serve_answer = notify_serve_backend(name, Path(get_hermes_home()))
+        serve_reloaded = bool(serve_answer and serve_answer.get("ok"))
+    gateway_answer = reload_running_gateway()
+    reloaded = bool(gateway_answer and gateway_answer.get("reloaded"))
+    return {
+        "gateway_reloaded": reloaded,
+        "serve_reloaded": serve_reloaded,
+        "gateway_answer": gateway_answer,
+        "restart_required": not reloaded,
+    }
+
+
 def reload_running_gateway() -> Optional[dict[str, Any]]:
     """Ask the gateway serving this profile (its own socket, else the multiplexer's for a served
     secondary) to force plugin re-discovery, so an enable loads and a disable unloads in the running
@@ -182,10 +206,12 @@ def reload_running_gateway() -> Optional[dict[str, Any]]:
         return None
 
 
-def gateway_reload_hint(answer: Optional[dict[str, Any]], name: str) -> str:
-    """One honest sentence after disabling plugin ``name``, a change only the gateway's re-discovery
-    applies (an open session stops running its commands at once). Callbacks the plugin already
-    wired into platform adapters outlive a reload (the plugin guide), so a restart still ends those."""
+def gateway_reload_hint(
+    answer: Optional[dict[str, Any]], name: str, *, serve_reloaded: bool = False
+) -> str:
+    """One honest sentence after disabling plugin ``name``, a change the serve backend and gateway's
+    re-discovery apply immediately for Python hooks/middleware/tools/commands. Callbacks the plugin
+    already wired into platform adapters outlive a reload (the plugin guide), so a restart still ends those."""
     if answer and answer.get("reloaded"):
         return (f"The running gateway reloaded its plugins and unloaded {name}; platform hooks it already "
                 "wired up stay until a gateway restart (hermes gateway restart).")
@@ -193,6 +219,9 @@ def gateway_reload_hint(answer: Optional[dict[str, Any]], name: str) -> str:
         return (f"The running gateway refused to reload its plugins: {answer.get('error') or 'no reason given'}.\n"
                 "Only the saved config changed; restart the gateway serving this profile to apply it:\n"
                 "  hermes gateway restart")
+    if serve_reloaded:
+        return (f"The running desktop/dashboard backend reloaded its plugins and unloaded {name}. "
+                "If a standalone gateway is also running, restart it (hermes gateway restart).")
     return ("No running gateway answered. If one is running, restart it for this to take effect:\n"
             "  hermes gateway restart")
 
@@ -214,6 +243,7 @@ def load_and_go_live(name: str) -> Optional[dict[str, Any]]:
 
 def _go_live(name: str) -> Optional[dict[str, Any]]:
     from hermes_cli.plugins_activation_live import connect_plugin_mcp, live_notice, plugin_skills
+    had_portable = False
     try:
         from hermes_cli.plugins import _join_background_discovery, get_plugin_manager
         _join_background_discovery()
@@ -221,6 +251,11 @@ def _go_live(name: str) -> Optional[dict[str, Any]]:
         # Other forced passes (a reload-plugins verb, the dashboard) do not take the go-live lock, so the
         # reads share the discovery lock with the pass that produced them.
         with manager._discovery_lock:
+            had_portable = any(
+                name in (owner, owner.rsplit("/", 1)[-1])
+                or getattr(getattr(manager._plugins.get(owner), "manifest", None), "name", None) == name
+                for owner in manager._portable_mcp_server_plugins.values()
+            )
             manager.discover_and_load(force=True)
             activation = find_activation(activation_summaries(manager), name)
             blocked = None if activation else find_activation(dependency_blocked_summaries(manager), name)
@@ -230,6 +265,8 @@ def _go_live(name: str) -> Optional[dict[str, Any]]:
         logger.debug("in-process plugin reload after change to %r failed", name, exc_info=True)
         return None
     if activation is None:
+        if had_portable:
+            _reconcile_deactivated_portable_mcp(name)
         return blocked
     servers = connect_plugin_mcp(activation, portable)
     activation["live_now"] = {"mcp_servers": servers, "skills": skills}
@@ -244,6 +281,25 @@ def _go_live(name: str) -> Optional[dict[str, Any]]:
         except Exception:
             logger.warning("open chats were not refreshed after activating %r", name, exc_info=True)
     return activation
+
+
+def _reconcile_deactivated_portable_mcp(name: str) -> None:
+    """Disconnect portable MCP servers dropped by a disabled/removed plugin and refresh open chats."""
+    try:
+        from tools.mcp_oauth import suppress_interactive_oauth
+        from tools.mcp_tool_discovery import reconcile_mcp_servers_with_config
+        with suppress_interactive_oauth():
+            reconcile_mcp_servers_with_config()
+    except Exception:
+        logger.debug("MCP reconcile after deactivating %r failed", name, exc_info=True)
+    import sys
+    server = sys.modules.get("tui_gateway.server")
+    if server is not None:
+        from hermes_constants import get_hermes_home
+        try:
+            server.refresh_plugin_sessions(Path(get_hermes_home()), name, "")
+        except Exception:
+            logger.warning("open chats were not refreshed after deactivating %r", name, exc_info=True)
 
 
 def _serve_backend_record():

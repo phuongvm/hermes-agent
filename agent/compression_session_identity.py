@@ -19,7 +19,7 @@ def rebind_session_context(session_id: str) -> None:
     try:
         from gateway.session_context import set_current_session_id
         set_current_session_id(session_id)
-    except Exception:
+    except (ImportError, AttributeError):
         os.environ["HERMES_SESSION_ID"] = session_id
     with suppress(Exception):
         from hermes_logging import set_session_context
