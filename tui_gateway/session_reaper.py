@@ -345,7 +345,7 @@ def _session_lease_is_idle(
     )) or _session_holds_transcript_claim(session, now):
         return False
     ready = session.get("agent_ready")
-    if ready is not None and not ready.is_set():
+    if ready is not None and not ready.is_set() and session.get("agent_build_started"):
         return False
     return not (_session_pending_kind(sid) or _session_has_active_delegations(sid, session)
                 or _session_owns_live_wakeup_schedule(session) or _session_owns_pending_process_notification(session))

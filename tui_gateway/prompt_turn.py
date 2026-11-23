@@ -115,9 +115,10 @@ def _plan_goal_compression_recovery(
         "Run /compress, then /goal resume to continue.")
 
 
-def _refuse_closing_or_stale_generation(
+def _abort_closing_or_stale_generation(
     session: dict, held_lease: Any, queued_prompt_generation: int | None
 ) -> bool:
+    """Clear ``running`` and any post-close lease when admission meets a closing session or stale queue gen."""
     if not session.get("_closing") and (
         queued_prompt_generation is None
         or int(session.get("_queued_prompt_generation", 0)) == queued_prompt_generation
@@ -153,9 +154,11 @@ def _admit_prompt_turn(
         if report_ownership_refusal:
             _emit("error", sid, {"message": str(ownership_refusal)})
         return None
+    agent = None
+    images: list[str] = []
     with session["history_lock"]:
-        refused = _refuse_closing_or_stale_generation(session, held_lease, queued_prompt_generation)
-        if not refused:
+        aborted = _abort_closing_or_stale_generation(session, held_lease, queued_prompt_generation)
+        if not aborted:
             images = list(session.get("attached_images", []) if image_paths is None else image_paths)
             if image_paths is None:
                 session["attached_images"] = []
@@ -171,10 +174,9 @@ def _admit_prompt_turn(
             else:
                 with contextlib.suppress(Exception):
                     agent.clear_interrupt()
-    if refused:
-        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
-        return None
-    if agent is None:
+    if not aborted and agent is not None:
+        return images, agent
+    if not aborted:
         # A deferred build can finish without attaching an agent (its record was replaced or closed
         # mid-build: ``agent_ready`` set, ``agent`` None, see ``_start_agent_build``).  Every turn source
         # crosses this gate, so refuse here with a retryable frame: the turn body used to dereference the
@@ -185,9 +187,8 @@ def _admit_prompt_turn(
         _emit_terminal_turn_error(
             sid, session, reason,
             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
-        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
-        return None
-    return images, agent
+    _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
+    return None
 
 
 def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,

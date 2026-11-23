@@ -671,6 +671,12 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
     return error
 
 
+def _finish_unstarted_submit(sid: str, session: dict, response: dict) -> dict:
+    """Release an idle Desktop lease when ``prompt.submit`` returns before dispatching a turn."""
+    _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
+    return response
+
+
 def _run_after_agent_ready(
     rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
     hosted_images=None,
@@ -691,17 +697,22 @@ def _run_after_agent_ready(
             session["running"] = False
             session["last_active"] = time.time()
         _emit("session.info", sid, _session_info(session.get("agent"), session))
+        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
         return
+    cancel_message = None
     with session["history_lock"]:
         if session.get("_turn_cancel_requested") or not session.get("running"):
             session["running"] = False
             _clear_inflight_turn(session)
-            # Without this emit the turn vanishes silently after {"status": "streaming"}.
-            _emit("error", sid, {"message": (
+            cancel_message = (
                 "Turn cancelled before the agent was ready"
                 if session.get("_turn_cancel_requested")
-                else "Session no longer running before the agent was ready")})
-            return
+                else "Session no longer running before the agent was ready")
+    if cancel_message is not None:
+        # Without this emit the turn vanishes silently after {"status": "streaming"}.
+        _emit("error", sid, {"message": cancel_message})
+        _release_idle_desktop_lease_if_eligible(sid, session, min_idle_s=0.0)
+        return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
         image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author)
@@ -899,15 +910,18 @@ def _(rid, params: dict) -> dict:
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     if _turn_isolation_enabled(isolation_cfg) and not turn_isolation:
-        return _err(rid, 4092, "turn isolation enabled: pre-existing in-process session cannot execute in-process; restart or resume session")
+        return _finish_unstarted_submit(
+            sid, session,
+            _err(rid, 4092, "turn isolation enabled: pre-existing in-process session cannot execute in-process; restart or resume session"))
     if internal_hosted_submit and turn_isolation:
-        return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
+        return _finish_unstarted_submit(
+            sid, session, _err(rid, 4121, "hosted room turns do not support isolated compute workers yet"))
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
     # socket that already closed cannot cancel the orphan reap without coming back (#116464).
     with _session_resume_lock:
         if (refusal := _reattach_refusal(rid, sid, session)) is not None:
-            return refusal
+            return _finish_unstarted_submit(sid, session, refusal)
         if (t := current_transport()) is not None:
             _rebind_live_transport(sid, session, t)
     # Claim the turn against a possibly-running session (busy/queued reply, else fall
@@ -943,7 +957,7 @@ def _(rid, params: dict) -> dict:
         rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
         internal_hosted_submit)
     if err is not None:
-        return err
+        return _finish_unstarted_submit(sid, session, err)
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
@@ -973,7 +987,7 @@ def _(rid, params: dict) -> dict:
         logger.error(
             "compute-host dispatch failed for session %s; failing closed under turn_isolation: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
-        return isolated_response
+        return _finish_unstarted_submit(sid, session, isolated_response)
     if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
         return err
     # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.

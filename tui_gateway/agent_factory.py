@@ -26,17 +26,26 @@ def _resolve_model() -> str:
     return PREFERRED_SILENT_DEFAULT_MODEL
 
 
+def _desktop_chat_allowed(*, force_desktop: bool = False) -> bool:
+    """True when Desktop chat surface applies (``HERMES_DESKTOP`` or resumed Desktop row, never embedded TUI)."""
+    return (force_desktop or is_truthy_value(os.environ.get("HERMES_DESKTOP"))) and not is_truthy_value(
+        os.environ.get("HERMES_DESKTOP_TERMINAL"))
+
+
 def _resolve_session_platform() -> str:
     """``HERMES_DESKTOP=1`` without ``HERMES_DESKTOP_TERMINAL`` → "desktop" (chat panel; the agent then
     suggests TUI-only slash commands), else "tui" (embedded terminal pane or standalone ``hermes --tui``)."""
-    desktop = is_truthy_value(os.environ.get("HERMES_DESKTOP"))
-    return "desktop" if desktop and not is_truthy_value(os.environ.get("HERMES_DESKTOP_TERMINAL")) else "tui"
+    return "desktop" if _desktop_chat_allowed() else "tui"
 
 
-def _resolve_session_source(explicit: str | None) -> str:
+def _resolve_session_source(explicit: str | None, fallback_source: str | None = None) -> str:
     """Session DB ``source``: an explicit caller value (plugin session tagged ``"telegram"``) is never
-    rewritten; only empty/None falls back to the env-resolved platform."""
-    return explicit or _resolve_session_platform()
+    rewritten; empty/None honours a resumed ``"desktop"`` fallback outside embedded TUI, else env platform."""
+    if explicit:
+        return explicit
+    if fallback_source == "desktop" and _desktop_chat_allowed(force_desktop=True):
+        return "desktop"
+    return _resolve_session_platform()
 
 
 def _resolve_agent_platform(source: str | None) -> str:

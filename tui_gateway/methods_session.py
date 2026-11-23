@@ -63,8 +63,8 @@ def _int_param(params: dict, key: str, default: int) -> int:
 
 
 def _new_runtime_ids(params: dict, *, fallback_source: str | None = None) -> tuple[str, str]:
-    fallback = None if is_truthy_value(os.environ.get("HERMES_DESKTOP_TERMINAL")) else fallback_source
-    return uuid.uuid4().hex[:8], _resolve_session_source(_str_param(params, "source") or fallback or None)
+    """Fresh runtime sid + resolved DB ``source`` for a session minted from ``params``."""
+    return uuid.uuid4().hex[:8], _resolve_session_source(_str_param(params, "source") or None, fallback_source)
 
 
 def _profile_build_scope(profile_home):

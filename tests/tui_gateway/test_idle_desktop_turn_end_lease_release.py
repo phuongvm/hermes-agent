@@ -5,21 +5,44 @@ Layer 2 of Desktop->Gateway session handoff:
    caller omits ``params.source`` and ``HERMES_DESKTOP_TERMINAL`` is unset, without letting gateway
    sources bleed into TUI sessions or overriding explicit caller ``source`` / embedded terminals.
 2. Truly-idle Desktop sessions release their ``active_sessions.json`` lease immediately when an
-   in-process or isolated compute-host turn settles (after post-turn follow-ups drain), while
-   retaining leases across queued follow-ups, interactive waits, local wakeups, delegations,
-   off-turn transcript claims, and closing sessions, and preserving 4090 writer fencing +
-   out-of-band turn adoption on the next Desktop prompt.
+   in-process or isolated compute-host turn settles (after post-turn follow-ups drain) or when a
+   post-claim submit exits before starting a turn, while retaining leases across queued follow-ups,
+   active builds, interactive waits, local wakeups, delegations, off-turn transcript claims, and
+   closing sessions, and preserving 4090 writer fencing + out-of-band turn adoption.
 """
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
-from hermes_cli.active_sessions import active_session_registry_snapshot
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.owner_identity import host_owner_subject
+from gateway.platforms.api_server import APIServerAdapter
+from gateway.session import SessionStore
+from gateway.session_authority import initialize_session_authority
+from hermes_cli.active_sessions import (
+    ActiveSessionLease,
+    active_session_liveness_guard,
+    active_session_registry_snapshot,
+    try_acquire_active_session,
+)
+from hermes_cli.heartbeat import HeartbeatManager
+from hermes_cli.loops import LoopManager
+from hermes_cli.model_switch import ModelSwitchResult
 from hermes_state import SessionDB
+from tests.waiting import wait_until
+from tools.process_registry import process_registry
+from tools.process_registry_awaiting import release as release_awaiting, take_ready
 from tui_gateway import server
+
+_HANDOFF_API_KEY = "test-handoff-api-key-0123456789"
 
 
 class _StubResumeAgent:
@@ -28,6 +51,54 @@ class _StubResumeAgent:
 
     def close(self) -> None:
         return None
+
+
+class _LiveTransport:
+    _closed = False
+
+    def write(self, _frame) -> bool:
+        return True
+
+
+def _install_tui_server_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cwd: Path | None = None,
+    make_agent=None,
+    model_name: str = "test-model",
+) -> None:
+    """Install deterministic non-network stubs on ``tui_gateway.server``."""
+    stubs: dict[str, Any] = {
+        "_resolve_model": lambda: model_name,
+        "_enable_gateway_prompts": lambda: None,
+        "_schedule_agent_build": lambda *a, **k: None,
+        "_schedule_session_cap_enforcement": lambda *a, **k: None,
+        "_maybe_schedule_auto_continue": lambda *a, **k: None,
+        "_child_run_active": lambda _key, _home=None: False,
+        "_make_agent": make_agent or (lambda *a, **k: _StubResumeAgent()),
+        "_wire_session_agent": lambda *a, **k: False,
+        "_start_session_services": lambda *a, **k: None,
+        "_schedule_mcp_late_refresh": lambda *a, **k: None,
+        "_session_info": lambda *a, **k: {},
+        "_emit": lambda *a, **k: None,
+        "_wire_callbacks": lambda _sid: None,
+        "_sync_agent_model_with_config": lambda _sid, _s: None,
+        "_sync_agent_compression_with_config": lambda _sid, _s: None,
+        "_sync_agent_fallback_with_config": lambda _sid, _s: None,
+        "_sync_bot_capabilities": lambda _sid, _s: None,
+        "_register_session_cwd": lambda _s: None,
+        "_tts_stream_begin": lambda: None,
+        "_get_usage": lambda _a: {},
+        "_start_agent_build": lambda _sid, _s: None,
+        "_session_uses_compute_host": lambda *a, **k: False,
+        "_turn_isolation_enabled": lambda *a, **k: False,
+    }
+    if cwd is not None:
+        stubs["_session_cwd"] = lambda _s: str(cwd)
+    for name, stub in stubs.items():
+        monkeypatch.setattr(server, name, stub)
+    monkeypatch.setattr(server.git_probe, "branch", lambda _cwd: None)
+    monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: None)
 
 
 @pytest.fixture
@@ -39,23 +110,7 @@ def resume_harness(monkeypatch):
     monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
     db = SessionDB(db_path=server.get_hermes_home() / "state.db")
     monkeypatch.setattr(server, "_db", db)
-    for name, stub in {
-        "_resolve_model": lambda: "test-model",
-        "_enable_gateway_prompts": lambda: None,
-        "_schedule_agent_build": lambda *a, **k: None,
-        "_schedule_session_cap_enforcement": lambda *a, **k: None,
-        "_maybe_schedule_auto_continue": lambda *a, **k: None,
-        "_child_run_active": lambda _key, _home=None: False,
-        "_make_agent": lambda *a, **k: _StubResumeAgent(),
-        "_wire_session_agent": lambda *a, **k: False,
-        "_start_session_services": lambda *a, **k: None,
-        "_schedule_mcp_late_refresh": lambda *a, **k: None,
-        "_session_info": lambda *a, **k: {},
-        "_emit": lambda *a, **k: None,
-    }.items():
-        monkeypatch.setattr(server, name, stub)
-    monkeypatch.setattr(server.git_probe, "branch", lambda _cwd: None)
-    monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: None)
+    _install_tui_server_stubs(monkeypatch)
     created_sids: list[str] = []
 
     def resume(stored_id: str, *, stored_source: str = "desktop", **params) -> tuple[str, dict]:
@@ -130,19 +185,23 @@ def test_resume_source_embedded_terminal_stays_tui(resume_harness):
     assert live["active_session_lease"].track_liveness is False
 
 
+def test_resume_source_explicit_desktop_overrides_embedded_terminal_env(resume_harness):
+    resume_harness.monkeypatch.setenv("HERMES_DESKTOP", "1")
+    resume_harness.monkeypatch.setenv("HERMES_DESKTOP_TERMINAL", "1")
+
+    sid, live = resume_harness.resume("stored-explicit-desktop-term", stored_source="tui", source="desktop")
+
+    assert live["source"] == "desktop"
+    assert server._ensure_active_session_slot(sid, live) is None
+    assert live["active_session_lease"].track_liveness is True
+
+
 def test_resume_source_gateway_originated_does_not_bleed_into_tui(resume_harness):
     sid, live = resume_harness.resume("stored-telegram-row", stored_source="telegram")
 
     assert live["source"] == "tui"
     assert server._ensure_active_session_slot(sid, live) is None
     assert live["active_session_lease"].track_liveness is False
-
-
-class _LiveTransport:
-    _closed = False
-
-    def write(self, _frame):
-        return True
 
 
 def _make_desktop_record(sid: str, **extra) -> dict:
@@ -207,6 +266,21 @@ def test_eligibility_releases_freshly_settled_desktop_lease_at_zero_min_idle(eli
     }
 
 
+def test_eligibility_releases_unbuilt_compute_host_record_with_unset_agent_ready(eligibility_record):
+    """A session that never started a local agent build (e.g. ``turn_isolation=True`` or ``lazy`` resume)
+    has an unset ``agent_ready`` Event and no ``agent_build_started`` flag; it must still release cleanly."""
+    sid, record = eligibility_record(
+        "elig-unbuilt-compute-host",
+        agent=None,
+        agent_ready=server.threading.Event(),
+        _compute_host_active=True,
+    )
+
+    assert server._release_idle_desktop_lease_if_eligible(sid, record, min_idle_s=0.0) is True
+    assert record.get("active_session_lease") is None
+    assert record.get("_lease_idle_released") == sid
+
+
 def _arm_blocker_field(field: str, value):
     def _setup(_sid: str, record: dict, _monkeypatch):
         record[field] = value
@@ -220,12 +294,11 @@ def _arm_transcript_claim(_sid: str, record: dict, _monkeypatch):
 
 def _arm_unready_build(_sid: str, record: dict, _monkeypatch):
     record["agent_ready"] = server.threading.Event()
+    record["agent_build_started"] = True
     return lambda: None
 
 
 def _arm_non_liveness_lease(sid: str, record: dict, _monkeypatch):
-    from hermes_cli.active_sessions import try_acquire_active_session
-
     server._release_active_session_slot(record)
     lease, refusal = try_acquire_active_session(
         session_id=sid, surface="tui", config={}, metadata={"live_session_id": sid}, track_liveness=False
@@ -236,8 +309,6 @@ def _arm_non_liveness_lease(sid: str, record: dict, _monkeypatch):
 
 
 def _arm_borrowed_lease(sid: str, record: dict, _monkeypatch):
-    from hermes_cli.active_sessions import ActiveSessionLease
-
     parent_lease = record["active_session_lease"]
     record["active_session_lease"] = ActiveSessionLease(
         lease_id=f"borrowed:{parent_lease.lease_id}", session_id=sid, surface="desktop", enabled=False
@@ -256,27 +327,20 @@ def _arm_active_delegation(sid: str, _record: dict, monkeypatch):
 
 
 def _arm_loop(sid: str, _record: dict, _monkeypatch):
-    from hermes_cli.loops import LoopManager
-
     mgr = LoopManager(sid)
     mgr.set("check status", interval_seconds=1800)
     return mgr.clear
 
 
 def _arm_heartbeat(sid: str, _record: dict, _monkeypatch):
-    from hermes_cli.heartbeat import HeartbeatManager
-
     mgr = HeartbeatManager(sid)
     mgr.set("heartbeat check", interval_seconds=1800)
     return mgr.clear
 
 
 def _arm_process_notification(sid: str, _record: dict, _monkeypatch):
-    from tools.process_registry import process_registry
-    from tools.process_registry_awaiting import release, take_ready
-
     process_registry.completion_queue.put({"type": "process_exit", "owner_task_id": sid, "session_id": "bg-proc-1"})
-    return lambda: release(take_ready(process_registry.completion_queue, 0))
+    return lambda: release_awaiting(take_ready(process_registry.completion_queue, 0))
 
 
 _ELIGIBILITY_BLOCKERS = {
@@ -395,30 +459,16 @@ def desktop_turn_env(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
     db = SessionDB(db_path=server.get_hermes_home() / "state.db")
     monkeypatch.setattr(server, "_db", db)
-    for name, stub in {
-        "_emit": lambda *a, **k: None,
-        "_wire_callbacks": lambda _sid: None,
-        "_sync_agent_model_with_config": lambda _sid, _s: None,
-        "_sync_agent_compression_with_config": lambda _sid, _s: None,
-        "_sync_agent_fallback_with_config": lambda _sid, _s: None,
-        "_sync_bot_capabilities": lambda _sid, _s: None,
-        "_session_cwd": lambda _s: str(tmp_path),
-        "_register_session_cwd": lambda _s: None,
-        "_tts_stream_begin": lambda: None,
-        "_get_usage": lambda _a: {},
-        "_start_agent_build": lambda _sid, _s: None,
-        "_session_uses_compute_host": lambda *a, **k: False,
-        "_turn_isolation_enabled": lambda *a, **k: False,
-    }.items():
-        monkeypatch.setattr(server, name, stub)
+    _install_tui_server_stubs(monkeypatch, cwd=tmp_path)
     sessions_created: list[tuple[str, dict]] = []
     foreign_leases: list = []
 
-    def create(stored_id: str = "desktop-e2e-chat") -> SimpleNamespace:
+    def create(stored_id: str = "desktop-e2e-chat", *, built_agent: bool = True) -> SimpleNamespace:
         db.create_session(stored_id, source="desktop", model="old/model")
-        agent = _TurnAgent(stored_id, db)
+        agent = _TurnAgent(stored_id, db) if built_agent else None
         ready = server.threading.Event()
-        ready.set()
+        if built_agent:
+            ready.set()
         now = server.time.time()
         sid = f"ui-{stored_id}"
         record = {
@@ -447,8 +497,6 @@ def desktop_turn_env(monkeypatch, tmp_path):
         return SimpleNamespace(sid=sid, stored_id=stored_id, record=record, agent=agent, db=db)
 
     def foreign_claim(stored_id: str, surface: str = "gateway"):
-        from hermes_cli.active_sessions import try_acquire_active_session
-
         lease, refusal = try_acquire_active_session(
             session_id=stored_id,
             surface=surface,
@@ -471,8 +519,6 @@ def desktop_turn_env(monkeypatch, tmp_path):
 
 
 def _join_session_work(record: dict) -> None:
-    from tests.waiting import wait_until
-
     if (run_thread := record.get("_run_thread")) is not None:
         run_thread.join(timeout=10)
         assert not run_thread.is_alive()
@@ -480,8 +526,6 @@ def _join_session_work(record: dict) -> None:
 
 
 def test_in_process_desktop_turn_fences_mid_turn_then_releases_lease_immediately_at_turn_end(desktop_turn_env):
-    from hermes_cli.active_sessions import active_session_liveness_guard
-
     chat = desktop_turn_env.create("desktop-inproc-turn")
     turn_started = server.threading.Event()
     allow_finish = server.threading.Event()
@@ -501,8 +545,6 @@ def test_in_process_desktop_turn_fences_mid_turn_then_releases_lease_immediately
     assert resp["result"]["status"] == "streaming", resp
     assert turn_started.wait(10)
 
-    # Mid-turn: lease is held, Gateway JIT liveness guard is True (HTTP 409 runtime_coordination_required),
-    # and a competing surface cannot acquire the session.
     with active_session_liveness_guard(chat.stored_id) as mid_active:
         mid_liveness_guard = mid_active
     mid_lease, mid_refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
@@ -518,12 +560,8 @@ def test_in_process_desktop_turn_fences_mid_turn_then_releases_lease_immediately
 
     allow_finish.set()
     _join_session_work(chat.record)
-    from tests.waiting import wait_until
-
     assert wait_until(lambda: chat.record.get("active_session_lease") is None, timeout=5)
 
-    # Immediately at turn end (0s idle wait, no reaper tick): lease is gone, warm record stays in _sessions,
-    # _lease_idle_released is stamped, and Gateway can immediately claim the session.
     with active_session_liveness_guard(chat.stored_id) as post_active:
         post_liveness_guard = post_active
     gw_lease, gw_refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
@@ -541,13 +579,16 @@ def test_in_process_desktop_turn_fences_mid_turn_then_releases_lease_immediately
     }
 
 
-def test_compute_host_turn_done_releases_parent_lease_while_child_borrowed_token_is_noop(desktop_turn_env):
-    parent = desktop_turn_env.create("desktop-compute-host")
+def test_compute_host_turn_done_releases_unbuilt_parent_lease_while_child_borrowed_token_is_noop(desktop_turn_env):
+    """Real compute-host parent shape: ``agent=None``, unset ``agent_ready``, ``agent_build_started`` absent."""
+    parent = desktop_turn_env.create("desktop-compute-host", built_agent=False)
+    parent.record["_compute_host_active"] = True
+    assert not parent.record["agent_ready"].is_set()
+    assert "agent_build_started" not in parent.record
     assert server._ensure_active_session_slot(parent.sid, parent.record) is None
     parent_lease = parent.record["active_session_lease"]
     assert parent_lease.track_liveness is True
 
-    # Child side: borrowed lease (enabled=False) running in-process must NOT release the parent's registry entry.
     child_chat = desktop_turn_env.create("desktop-compute-host-child")
     child_chat.record["session_key"] = parent.stored_id
     server._install_borrowed_lease(
@@ -562,12 +603,9 @@ def test_compute_host_turn_done_releases_parent_lease_while_child_borrowed_token
     child_chat.record["running"] = True
     assert server._run_prompt_submit("child-rid", child_chat.sid, child_chat.record, "child turn") is True
     _join_session_work(child_chat.record)
-    from tests.waiting import wait_until
-
     assert wait_until(lambda: not child_chat.record.get("running"), timeout=5)
     assert [e["lease_id"] for e in active_session_registry_snapshot()] == [parent_lease.lease_id]
 
-    # Parent side: _on_compute_host_turn_done with no queued prompt immediately releases the parent's real lease.
     parent.record["running"] = True
     server._on_compute_host_turn_done(
         "parent-rid",
@@ -589,14 +627,15 @@ def test_compute_host_turn_done_releases_parent_lease_while_child_borrowed_token
 
 
 def test_compute_host_turn_done_with_queued_prompt_retains_parent_lease(desktop_turn_env, monkeypatch):
-    parent = desktop_turn_env.create("desktop-compute-host-queued")
+    parent = desktop_turn_env.create("desktop-compute-host-queued", built_agent=False)
+    parent.record["_compute_host_active"] = True
     assert server._ensure_active_session_slot(parent.sid, parent.record) is None
     parent_lease = parent.record["active_session_lease"]
     dispatched = []
 
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: True)
 
-    def fake_submit_to_host(rid, sid, session, text, **_kw):
+    def fake_submit_to_host(rid, _sid, session, text, **_kw):
         dispatched.append(text)
         with session["history_lock"]:
             session["_compute_host_turn_id"] = "chained-host-turn-2"
@@ -630,8 +669,6 @@ def test_compute_host_turn_done_with_queued_prompt_retains_parent_lease(desktop_
 def test_chained_followups_retain_lease_without_steal_window_then_release_after_chain(
     desktop_turn_env, monkeypatch, followup_kind
 ):
-    from tests.waiting import wait_until
-
     chat = desktop_turn_env.create(f"desktop-chain-{followup_kind}")
     turn2_started = server.threading.Event()
     allow_turn2_finish = server.threading.Event()
@@ -667,7 +704,6 @@ def test_chained_followups_retain_lease_without_steal_window_then_release_after_
     assert resp["result"]["status"] == "streaming", resp
     assert turn2_started.wait(10)
 
-    # During chained Turn 2: zero steal window — competing surface is still fenced out!
     stolen_lease, refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
     assert stolen_lease is None and getattr(refusal, "reason", None) == "SESSION_NOT_OWNED"
 
@@ -709,12 +745,116 @@ def test_non_closing_early_turn_refusal_releases_desktop_lease_backstop(desktop_
     }
 
 
+def _setup_submit_isolation_mismatch(_chat, monkeypatch) -> dict:
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    return {}
+
+
+def _setup_submit_reattach_refusal(_chat, monkeypatch) -> dict:
+    monkeypatch.setattr(server, "_reattach_refusal", lambda rid, _sid, _s: {"id": rid, "error": {"code": 4009, "message": "gone"}})
+    return {}
+
+
+def _setup_submit_truncation_refusal(chat, _monkeypatch) -> dict:
+    uid = chat.db.append_message(chat.stored_id, "user", "q0")
+    aid = chat.db.append_message(chat.stored_id, "assistant", "a0")
+    chat.record["history"] = [
+        {"role": "user", "content": "q0", "_row_id": uid},
+        {"role": "assistant", "content": "a0", "_row_id": aid},
+    ]
+    return {"truncate_before_user_ordinal": 0}
+
+
+def _setup_submit_compute_host_error(chat, monkeypatch) -> dict:
+    chat.record["agent"] = None
+    chat.record["agent_ready"] = server.threading.Event()
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda rid, *_a, **_k: {"id": rid, "error": {"code": 5019, "message": "host saturated"}},
+    )
+    return {}
+
+
+def _setup_submit_wait_agent_error(_chat, monkeypatch) -> dict:
+    monkeypatch.setattr(
+        server,
+        "_wait_agent_for_prompt",
+        lambda _s, rid, _sid: {"id": rid, "error": {"code": 5000, "message": "build failed"}},
+    )
+    return {}
+
+
+def _setup_submit_cancel_before_ready(_chat, monkeypatch) -> dict:
+    def cancel_during_wait(session, _rid, _sid) -> None:
+        session["_turn_cancel_requested"] = True
+
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", cancel_during_wait)
+    return {}
+
+
+_POST_CLAIM_SUBMIT_FAILURES = {
+    "isolation_mismatch": _setup_submit_isolation_mismatch,
+    "reattach_refusal": _setup_submit_reattach_refusal,
+    "truncation_refusal": _setup_submit_truncation_refusal,
+    "compute_host_dispatch_error": _setup_submit_compute_host_error,
+    "wait_agent_build_error": _setup_submit_wait_agent_error,
+    "cancel_before_agent_ready": _setup_submit_cancel_before_ready,
+}
+
+
+@pytest.mark.parametrize("failure_mode", sorted(_POST_CLAIM_SUBMIT_FAILURES))
+def test_post_claim_prompt_submit_failures_release_desktop_lease(desktop_turn_env, monkeypatch, failure_mode):
+    chat = desktop_turn_env.create(f"desktop-submit-fail-{failure_mode}")
+    extra_params = _POST_CLAIM_SUBMIT_FAILURES[failure_mode](chat, monkeypatch)
+
+    resp = server.handle_request({
+        "id": f"fail-{failure_mode}",
+        "method": "prompt.submit",
+        "params": {"session_id": chat.sid, "text": "hello", **extra_params},
+    })
+    if "error" not in resp:
+        _join_session_work(chat.record)
+    assert wait_until(lambda: chat.record.get("active_session_lease") is None, timeout=5)
+    assert {
+        "lease": chat.record.get("active_session_lease"),
+        "idle_marker": chat.record.get("_lease_idle_released"),
+        "registry": active_session_registry_snapshot(),
+    } == {
+        "lease": None,
+        "idle_marker": chat.sid,
+        "registry": [],
+    }
+
+
+def test_post_claim_prompt_submit_closing_refusal_keeps_existing_lease(desktop_turn_env, monkeypatch):
+    """When ``_closing`` is set, a pre-existing lease belongs to teardown and must not be idle-released."""
+    chat = desktop_turn_env.create("desktop-submit-closing")
+    assert server._ensure_active_session_slot(chat.sid, chat.record) is None
+    held = chat.record["active_session_lease"]
+    chat.record["_closing"] = True
+    monkeypatch.setattr(
+        server,
+        "_reattach_refusal",
+        lambda rid, _sid, _s: {"id": rid, "error": {"code": 4009, "message": "closing"}},
+    )
+
+    resp = server.handle_request({
+        "id": "closing-sub",
+        "method": "prompt.submit",
+        "params": {"session_id": chat.sid, "text": "hello"},
+    })
+    assert "error" in resp
+    assert chat.record.get("active_session_lease") is held
+    assert chat.record.get("_lease_idle_released") is None
+
+
 def test_off_turn_writers_refuse_with_4090_when_competing_surface_claims_turn_end_released_chat(
     desktop_turn_env, monkeypatch
 ):
-    from hermes_cli.model_switch import ModelSwitchResult
-    from tests.waiting import wait_until
-
     chat = desktop_turn_env.create("desktop-fenced-after-turn")
     resp = server.handle_request({
         "id": "turn-1",
@@ -725,7 +865,6 @@ def test_off_turn_writers_refuse_with_4090_when_competing_surface_claims_turn_en
     _join_session_work(chat.record)
     assert wait_until(lambda: chat.record.get("active_session_lease") is None, timeout=5)
 
-    # Competing Gateway handoff claims the chat immediately (no reaper tick!) and appends a turn.
     gw_lease, gw_refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
     assert gw_lease is not None and gw_refusal is None
     chat.db.append_message(chat.stored_id, "user", "gateway user msg")
@@ -794,11 +933,8 @@ def test_off_turn_writers_refuse_with_4090_when_competing_surface_claims_turn_en
 
 
 def test_next_desktop_prompt_after_gateway_handoff_reacquires_lease_and_adopts_foreign_turns(desktop_turn_env):
-    from tests.waiting import wait_until
-
     chat = desktop_turn_env.create("desktop-roundtrip-handoff")
 
-    # Turn 1 on Desktop -> settles and immediately releases lease.
     resp1 = server.handle_request({
         "id": "rt-1",
         "method": "prompt.submit",
@@ -809,15 +945,12 @@ def test_next_desktop_prompt_after_gateway_handoff_reacquires_lease_and_adopts_f
     assert wait_until(lambda: chat.record.get("active_session_lease") is None, timeout=5)
     assert chat.record.get("_lease_idle_released") == chat.sid
 
-    # External Gateway handoff acquires lease, appends a handoff exchange to state.db, and releases its lease.
     gw_lease, gw_refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
     assert gw_lease is not None and gw_refusal is None
     chat.db.append_message(chat.stored_id, "user", "gateway handoff prompt")
     chat.db.append_message(chat.stored_id, "assistant", "gateway handoff answer")
     gw_lease.release()
 
-    # Turn 2 on Desktop: lazily re-acquires liveness-tracked lease, clears _lease_idle_released,
-    # and folds Gateway's out-of-band messages into model-facing conversation_history.
     observed_turn2: dict = {}
 
     def inspect_turn2(call_idx, _prompt, hist_copy):
@@ -854,15 +987,10 @@ def test_next_desktop_prompt_after_gateway_handoff_reacquires_lease_and_adopts_f
 
 
 def test_reaper_backstop_and_concurrency_cap_accounting_after_turn_end_release(desktop_turn_env, monkeypatch):
-    from hermes_cli.model_switch import ModelSwitchResult
-    from tests.waiting import wait_until
-
     monkeypatch.setattr(server, "_load_cfg", lambda: {"sessions": {"max_concurrent_sessions": 1}})
     chat_a = desktop_turn_env.create("desktop-cap-a")
     chat_b = desktop_turn_env.create("desktop-cap-b")
 
-    # Chat A runs under max_concurrent_sessions=1, then frees the concurrency slot immediately at turn end
-    # while both warm records remain in server._sessions (max_live_sessions resident count unchanged).
     resp_a = server.handle_request({
         "id": "cap-a",
         "method": "prompt.submit",
@@ -873,7 +1001,6 @@ def test_reaper_backstop_and_concurrency_cap_accounting_after_turn_end_release(d
     assert wait_until(lambda: chat_a.record.get("active_session_lease") is None, timeout=5)
     assert chat_a.sid in server._sessions and chat_b.sid in server._sessions
 
-    # Chat B can immediately acquire the single concurrency slot without waiting 600s!
     resp_b = server.handle_request({
         "id": "cap-b",
         "method": "prompt.submit",
@@ -883,7 +1010,6 @@ def test_reaper_backstop_and_concurrency_cap_accounting_after_turn_end_release(d
     _join_session_work(chat_b.record)
     assert wait_until(lambda: chat_b.record.get("active_session_lease") is None, timeout=5)
 
-    # Off-turn writer on Chat A re-claims its lease without running a turn; periodic 600s reaper remains the backstop.
     monkeypatch.setattr(
         "hermes_cli.model_switch.switch_model",
         lambda **_kw: ModelSwitchResult(success=True, new_model="other/model", target_provider="prov"),
@@ -903,6 +1029,63 @@ def test_reaper_backstop_and_concurrency_cap_accounting_after_turn_end_release(d
     assert chat_a.sid in server._sessions
 
 
+async def _make_gateway_handoff_app(monkeypatch: pytest.MonkeyPatch):
+    """Build a minimal local Gateway ``APIServerAdapter`` app sharing ``conftest``'s isolated ``HERMES_HOME``."""
+    home = Path(server.get_hermes_home())
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda *_a, **_kw: {"platform_toolsets": {"cli": [], "desktop": []}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *_a, **_kw: {"gateway": {"api_server": {"allow_operator_handoff": True}}},
+    )
+    store = SessionStore(home / "sessions", GatewayConfig(multiplex_profiles=False))
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=False),
+        session_store=store,
+        _session_db=store._db,
+        adapters={},
+        _draining=False,
+        _cached_agent_for=lambda _route: None,
+        _adapter_for_source=lambda source: runner.adapters.get(source.platform),
+    )
+    authority = await initialize_session_authority(runner, profile_id=str(home), instance_id="test-handoff-instance")
+    authority._schedule = lambda _ref: None
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": 0, "key": _HANDOFF_API_KEY})
+    )
+    adapter.gateway_runner = runner
+    runner.adapters[Platform.API_SERVER] = adapter
+    app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+    for method, path, handler in adapter._http_route_table():
+        app.router.add_route(method, path, handler)
+    return app, authority, store
+
+
+def _handoff_envelope(idempotency_key: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "idempotency_key": idempotency_key,
+        "correlation_id": f"corr-{idempotency_key}",
+        "intent": "REQUEST",
+        "hop_count": 1,
+        "max_hops": 4,
+        "from": {
+            "surface": "antigravity",
+            "node": "agent4070",
+            "session_id": "af6ff0ac-1d63-460a-b633-228ca68bb5a4",
+            "author_label": "Operator",
+        },
+        "to": {"surface": "hermes", "node": "agent4070", "profile": "default"},
+        "safety_mode": "read_only_default",
+        "summary": "Handoff check",
+        "body": "Inspect current session state read-only.",
+    }
+
+
 @pytest.mark.asyncio
 async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_then_accepts_202_at_turn_end(
     tmp_path, monkeypatch
@@ -910,23 +1093,9 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
     """Full Layer 1 + Layer 2 round-trip: Dashboard resumes a stored ``source="desktop"`` session without
     ``params.source`` (``HERMES_DESKTOP`` unset), fences ``POST /api/sessions/{id}/handoff`` with HTTP 409
     ``runtime_coordination_required`` mid-turn, and immediately allows HTTP 202 once the turn settles."""
-    import asyncio
-    from aiohttp.test_utils import TestClient, TestServer
-    from gateway.owner_identity import host_owner_subject
-    from tests.gateway.test_api_server_session_handoff import (
-        ENABLED_CANONICAL_CFG,
-        _auth_headers,
-        _build_handoff_harness,
-        _extract_code,
-        _valid_envelope,
-    )
-    from tests.waiting import wait_until
-
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
-    app, _adapter, authority, store, _owner, _seed_sid = await _build_handoff_harness(
-        tmp_path, monkeypatch, config_data=ENABLED_CANONICAL_CFG
-    )
+    app, authority, store = await _make_gateway_handoff_app(monkeypatch)
     stored_id = "20261123_152408_b45348"
     authority.db.create_session(
         stored_id,
@@ -947,36 +1116,13 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
 
     turn_agent.on_turn = hold_turn
     monkeypatch.setattr(server, "_db", authority.db)
-    for name, stub in {
-        "_resolve_model": lambda: "fixture-model",
-        "_enable_gateway_prompts": lambda: None,
-        "_schedule_session_cap_enforcement": lambda *a, **k: None,
-        "_maybe_schedule_auto_continue": lambda *a, **k: None,
-        "_make_agent": lambda *a, **k: turn_agent,
-        "_wire_session_agent": lambda *a, **k: False,
-        "_start_session_services": lambda *a, **k: None,
-        "_schedule_mcp_late_refresh": lambda *a, **k: None,
-        "_session_info": lambda *a, **k: {},
-        "_emit": lambda *a, **k: None,
-        "_wire_callbacks": lambda _sid: None,
-        "_sync_agent_model_with_config": lambda _sid, _s: None,
-        "_sync_agent_compression_with_config": lambda _sid, _s: None,
-        "_sync_agent_fallback_with_config": lambda _sid, _s: None,
-        "_sync_bot_capabilities": lambda _sid, _s: None,
-        "_session_cwd": lambda _s: str(tmp_path),
-        "_register_session_cwd": lambda _s: None,
-        "_tts_stream_begin": lambda: None,
-        "_get_usage": lambda _a: {},
-        "_start_agent_build": lambda _sid, _s: None,
-        "_session_uses_compute_host": lambda *a, **k: False,
-        "_turn_isolation_enabled": lambda *a, **k: False,
-    }.items():
-        monkeypatch.setattr(server, name, stub)
-    monkeypatch.setattr(server.git_probe, "branch", lambda _cwd: None)
-    monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: None)
-
-    home_dir = authority.db.db_path.parent
-    monkeypatch.setattr(server, "_profile_home", lambda name: home_dir if name == "default" else None)
+    _install_tui_server_stubs(
+        monkeypatch,
+        cwd=tmp_path,
+        make_agent=lambda *a, **k: turn_agent,
+        model_name="fixture-model",
+    )
+    headers = {"Authorization": f"Bearer {_HANDOFF_API_KEY}"}
 
     ui_sid = None
     try:
@@ -985,7 +1131,7 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
             {
                 "id": "res-1",
                 "method": "session.resume",
-                "params": {"session_id": stored_id, "profile": "default", "eager_build": True},
+                "params": {"session_id": stored_id, "eager_build": True},
             },
         )
         assert "error" not in resume_resp, resume_resp
@@ -1003,23 +1149,22 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
         async with TestClient(TestServer(app)) as client:
             r_mid = await client.post(
                 f"/api/sessions/{stored_id}/handoff",
-                json=_valid_envelope(idempotency_key="idem-mid-turn"),
-                headers=_auth_headers(),
+                json=_handoff_envelope("idem-mid-turn"),
+                headers=headers,
             )
             mid_body = await r_mid.json()
+            mid_code = mid_body.get("code") or (mid_body.get("error") or {}).get("code")
             assert r_mid.status == 409, mid_body
-            assert _extract_code(mid_body) == "runtime_coordination_required"
+            assert mid_code == "runtime_coordination_required"
 
             allow_finish.set()
             await asyncio.to_thread(_join_session_work, live)
-            assert await asyncio.to_thread(
-                wait_until, lambda: live.get("active_session_lease") is None, 5
-            )
+            assert await asyncio.to_thread(wait_until, lambda: live.get("active_session_lease") is None, 5)
 
             r_post = await client.post(
                 f"/api/sessions/{stored_id}/handoff",
-                json=_valid_envelope(idempotency_key="idem-post-turn"),
-                headers=_auth_headers(),
+                json=_handoff_envelope("idem-post-turn"),
+                headers=headers,
             )
             post_body = await r_post.json()
             assert r_post.status == 202, post_body
