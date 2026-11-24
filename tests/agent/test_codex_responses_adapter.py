@@ -1189,3 +1189,38 @@ def test_failed_turn_notice_skips_subagent_output_contract_retry_and_marks_faile
     assert entry_b["status"] == "failed"
     assert entry_b["exit_reason"] == "error"
     assert "schema_note" not in entry_b
+
+
+def test_preflight_accepts_developer_role_and_omitted_instructions():
+    with_developer = _preflight_codex_api_kwargs({
+        "model": "gpt-6.2-sol",
+        "input": [
+            {"role": "developer", "content": "Be exact."},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Extra."}]},
+            {"role": "user", "content": "Hi"},
+        ],
+        "store": False,
+    })
+
+    assert "instructions" not in with_developer
+    assert with_developer["input"][0] == {"type": "message", "role": "developer", "content": "Be exact."}
+    assert with_developer["input"][1] == {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "Extra."}],
+    }
+
+    with pytest.raises(ValueError, match="missing required field\\(s\\): instructions"):
+        _preflight_codex_api_kwargs({
+            "model": "gpt-6.1-sol",
+            "input": [{"role": "user", "content": "Hi"}],
+            "store": False,
+        })
+
+    with pytest.raises(ValueError, match="unsupported item shape"):
+        _preflight_codex_api_kwargs({
+            "model": "gpt-6.2-sol",
+            "instructions": "stub",
+            "input": [{"role": "system", "content": "bad"}],
+            "store": False,
+        })

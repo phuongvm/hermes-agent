@@ -36,7 +36,9 @@ from hermes_cli.active_sessions import (
 from hermes_cli.heartbeat import HeartbeatManager
 from hermes_cli.loops import LoopManager
 from hermes_cli.model_switch import ModelSwitchResult
-from hermes_state import SessionDB
+from persistence.conversation.messages import ConversationRequest, NewMessage, TranscriptView
+from persistence.conversation.sessions import NewSession
+from persistence_assembly import Persistence, close_stores_under, open_persistence, profile_scope
 from tests.waiting import wait_until
 from tools.process_registry import process_registry
 from tools.process_registry_awaiting import release as release_awaiting, take_ready
@@ -108,13 +110,13 @@ def resume_harness(monkeypatch):
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
     monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
-    db = SessionDB(db_path=server.get_hermes_home() / "state.db")
+    db = open_persistence(profile_scope(home=Path(server.get_hermes_home())), eager=True)
     monkeypatch.setattr(server, "_db", db)
     _install_tui_server_stubs(monkeypatch)
     created_sids: list[str] = []
 
     def resume(stored_id: str, *, stored_source: str = "desktop", **params) -> tuple[str, dict]:
-        db.create_session(stored_id, source=stored_source, model="test-model")
+        db.sessions.create(NewSession(session_id=stored_id, source=stored_source, model="test-model"))
         resp = server.handle_request({
             "id": f"resume-{stored_id}",
             "method": "session.resume",
@@ -133,6 +135,7 @@ def resume_harness(monkeypatch):
         record = server._sessions.pop(sid, None)
         server._release_active_session_slot(record)
     db.close()
+    close_stores_under(Path(server.get_hermes_home()))
 
 
 @pytest.mark.parametrize(
@@ -405,11 +408,12 @@ def test_eligibility_rechecks_predicate_under_history_lock_when_followup_queues_
 
 
 class _TurnAgent:
-    """Deterministic stub agent persisting real ``SessionDB`` rows with ``_row_id`` stamps."""
+    """Deterministic stub agent persisting real ``Persistence`` rows with ``_row_id`` stamps."""
 
-    def __init__(self, session_id: str, db: SessionDB) -> None:
+    def __init__(self, session_id: str, db: Persistence) -> None:
         self.session_id = session_id
         self._session_db = db
+        self.persistence = db
         self.model = "old/model"
         self.provider = "prov"
         self.base_url = ""
@@ -440,10 +444,14 @@ class _TurnAgent:
         if isinstance(staged, dict) and staged.get("_row_id") is not None:
             user_msg = dict(staged)
         else:
-            uid = self._session_db.append_message(self.session_id, "user", str(prompt))
+            uid = self._session_db.messages.append(
+                self.session_id, NewMessage.from_live({"role": "user", "content": str(prompt)})
+            )
             user_msg = {"role": "user", "content": str(prompt), "_row_id": uid}
         reply = extra.pop("reply", f"assistant-reply-{call_index}")
-        aid = self._session_db.append_message(self.session_id, "assistant", reply)
+        aid = self._session_db.messages.append(
+            self.session_id, NewMessage.from_live({"role": "assistant", "content": reply})
+        )
         assistant_msg = {"role": "assistant", "content": reply, "_row_id": aid}
         return {
             "final_response": reply,
@@ -454,17 +462,17 @@ class _TurnAgent:
 
 @pytest.fixture
 def desktop_turn_env(monkeypatch, tmp_path):
-    """End-to-end ``tui_gateway`` Desktop session environment with real ``SessionDB`` + ``active_sessions.json``."""
+    """End-to-end ``tui_gateway`` Desktop session environment with real ``Persistence`` + ``active_sessions.json``."""
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
-    db = SessionDB(db_path=server.get_hermes_home() / "state.db")
+    db = open_persistence(profile_scope(home=Path(server.get_hermes_home())), eager=True)
     monkeypatch.setattr(server, "_db", db)
     _install_tui_server_stubs(monkeypatch, cwd=tmp_path)
     sessions_created: list[tuple[str, dict]] = []
     foreign_leases: list = []
 
     def create(stored_id: str = "desktop-e2e-chat", *, built_agent: bool = True) -> SimpleNamespace:
-        db.create_session(stored_id, source="desktop", model="old/model")
+        db.sessions.create(NewSession(session_id=stored_id, source="desktop", model="old/model"))
         agent = _TurnAgent(stored_id, db) if built_agent else None
         ready = server.threading.Event()
         if built_agent:
@@ -516,6 +524,7 @@ def desktop_turn_env(monkeypatch, tmp_path):
         server._release_active_session_slot(record)
         server._sessions.pop(sid, None)
     db.close()
+    close_stores_under(Path(server.get_hermes_home()))
 
 
 def _join_session_work(record: dict) -> None:
@@ -757,8 +766,8 @@ def _setup_submit_reattach_refusal(_chat, monkeypatch) -> dict:
 
 
 def _setup_submit_truncation_refusal(chat, _monkeypatch) -> dict:
-    uid = chat.db.append_message(chat.stored_id, "user", "q0")
-    aid = chat.db.append_message(chat.stored_id, "assistant", "a0")
+    uid = chat.db.messages.append(chat.stored_id, NewMessage.from_live({"role": "user", "content": "q0"}))
+    aid = chat.db.messages.append(chat.stored_id, NewMessage.from_live({"role": "assistant", "content": "a0"}))
     chat.record["history"] = [
         {"role": "user", "content": "q0", "_row_id": uid},
         {"role": "assistant", "content": "a0", "_row_id": aid},
@@ -867,8 +876,10 @@ def test_off_turn_writers_refuse_with_4090_when_competing_surface_claims_turn_en
 
     gw_lease, gw_refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
     assert gw_lease is not None and gw_refusal is None
-    chat.db.append_message(chat.stored_id, "user", "gateway user msg")
-    chat.db.append_message(chat.stored_id, "assistant", "gateway assistant msg")
+    chat.db.messages.append(chat.stored_id, NewMessage.from_live({"role": "user", "content": "gateway user msg"}))
+    chat.db.messages.append(
+        chat.stored_id, NewMessage.from_live({"role": "assistant", "content": "gateway assistant msg"})
+    )
     expected_transcript = [
         "desktop question 1",
         "assistant-reply-0",
@@ -926,7 +937,12 @@ def test_off_turn_writers_refuse_with_4090_when_competing_surface_claims_turn_en
         assert err.get("code") == 4090, (req, out)
         assert (err.get("data") or {}).get("reason") == "SESSION_NOT_OWNED", (req, out)
 
-    actual_transcript = [m["content"] for m in chat.db.get_messages_as_conversation(chat.stored_id)]
+    actual_transcript = [
+        m.as_openai_message()["content"]
+        for m in chat.db.messages.read_conversation(
+            chat.stored_id, ConversationRequest(view=TranscriptView.ACTIVE)
+        )
+    ]
     assert actual_transcript == expected_transcript
     assert chat.record["model_override"] == pin
     assert chat.agent.switched == []
@@ -947,8 +963,10 @@ def test_next_desktop_prompt_after_gateway_handoff_reacquires_lease_and_adopts_f
 
     gw_lease, gw_refusal = desktop_turn_env.foreign_claim(chat.stored_id, surface="gateway")
     assert gw_lease is not None and gw_refusal is None
-    chat.db.append_message(chat.stored_id, "user", "gateway handoff prompt")
-    chat.db.append_message(chat.stored_id, "assistant", "gateway handoff answer")
+    chat.db.messages.append(chat.stored_id, NewMessage.from_live({"role": "user", "content": "gateway handoff prompt"}))
+    chat.db.messages.append(
+        chat.stored_id, NewMessage.from_live({"role": "assistant", "content": "gateway handoff answer"})
+    )
     gw_lease.release()
 
     observed_turn2: dict = {}
@@ -1095,19 +1113,21 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
     ``runtime_coordination_required`` mid-turn, and immediately allows HTTP 202 once the turn settles."""
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
-    app, authority, store = await _make_gateway_handoff_app(monkeypatch)
+    app, authority, _store = await _make_gateway_handoff_app(monkeypatch)
     stored_id = "20261123_152408_b45348"
-    authority.db.create_session(
-        stored_id,
-        source="desktop",
-        model="fixture-model",
-        cwd=str(tmp_path),
-        user_id=host_owner_subject(),
+    authority.persistence.sessions.create(
+        NewSession(
+            session_id=stored_id,
+            source="desktop",
+            model="fixture-model",
+            cwd=str(tmp_path),
+            user_id=host_owner_subject(),
+        )
     )
 
     turn_started = server.threading.Event()
     allow_finish = server.threading.Event()
-    turn_agent = _TurnAgent(stored_id, authority.db)
+    turn_agent = _TurnAgent(stored_id, authority.persistence)
 
     def hold_turn(_idx, _prompt, _hist):
         turn_started.set()
@@ -1115,7 +1135,7 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
         return {}
 
     turn_agent.on_turn = hold_turn
-    monkeypatch.setattr(server, "_db", authority.db)
+    monkeypatch.setattr(server, "_db", authority.persistence)
     _install_tui_server_stubs(
         monkeypatch,
         cwd=tmp_path,
@@ -1175,4 +1195,4 @@ async def test_e2e_resumed_desktop_session_fences_gateway_handoff_409_mid_turn_t
             if record is not None and (rt := record.get("_run_thread")) is not None:
                 await asyncio.to_thread(rt.join, 5)
             server._release_active_session_slot(record)
-        store._db.close()
+        close_stores_under(Path(server.get_hermes_home()))

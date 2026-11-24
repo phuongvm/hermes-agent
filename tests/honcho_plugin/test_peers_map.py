@@ -52,12 +52,14 @@ class TestSeenGatewayAccounts:
         ]
 
     def test_shared_session_lists_only_its_last_author(self, tmp_path):
-        """record_gateway_session_peer overwrites the row's user_id, so earlier authors are gone."""
-        from hermes_state import SessionDB
+        """record_session_peer overwrites the row's user_id, so earlier authors are gone."""
+        from persistence_assembly import open_persistence, profile_scope
 
-        db = SessionDB(tmp_path / "state.db")
-        for uid in ("alice", "bob"):
-            db.record_gateway_session_peer("shared", source="telegram", user_id=uid, session_key="telegram:group:1")
+        with open_persistence(profile_scope(home=tmp_path), eager=True) as store:
+            for uid in ("alice", "bob"):
+                store.routing.record_session_peer(
+                    "shared", source="telegram", user_id=uid, session_key="telegram:group:1"
+                )
         assert [a["user_id"] for a in _seen_gateway_accounts(tmp_path / "state.db")] == ["bob"]
 
     def test_missing_db_or_table_returns_empty(self, tmp_path):

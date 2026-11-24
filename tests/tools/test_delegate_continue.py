@@ -2,7 +2,7 @@
 
 The child is rebuilt on the route and toolsets it ran with, its history comes from its saved transcript, and the
 follow-up message is its next turn, dispatched as a new background unit through the normal async delegation path.
-Only the model is scripted: registry, child build, SessionDB, dispatch and completion delivery are the real ones.
+Only the model is scripted: registry, child build, store, dispatch and completion delivery are the real ones.
 """
 
 import json
@@ -14,7 +14,9 @@ from unittest.mock import MagicMock, patch
 import hermes_yaml as yaml
 import pytest
 
-from hermes_state import SessionDB
+from persistence_assembly import open_persistence, profile_scope
+from tests.fixtures.storage_read import conversation, session_row
+from tests.fixtures.storage_seed import seed_session
 from tests.waiting import wait_until
 from tools.process_registry import process_registry
 
@@ -31,7 +33,7 @@ def _empty_completion_queue():
 
 class _ScriptedModel:
     """Stands in for AIAgent: records how each child was built and what each turn saw, and persists each turn
-    into the child's dedicated SessionDB handle the way a real child's transcript lands there."""
+    into the child's dedicated store handle the way a real child's transcript lands there."""
 
     def __init__(self, *, first_complete=True):
         self.first_complete = first_complete
@@ -49,13 +51,14 @@ class _ScriptedModel:
 
         def run_conversation(user_message, conversation_history=None, **_):
             from agent.delegation_context import current_task_intent
+            from tests.fixtures.storage_seed import seed_messages, seed_session
             intent = current_task_intent(child.session_id, child._parent_session_id)
             self.turns.append({"intent": intent, "session_id": child.session_id, "message": user_message,
                                "history": conversation_history, "home": str(get_hermes_home())})
-            db.create_session(child.session_id, "subagent", parent_session_id=kw.get("parent_session_id"))
+            seed_session(db, child.session_id, "subagent", parent_session_id=kw.get("parent_session_id"))
             reply = f"done: {user_message}"
-            db.append_message(child.session_id, "user", user_message)
-            db.append_message(child.session_id, "assistant", reply)
+            seed_messages(db, child.session_id, {"role": "user", "content": user_message},
+                          {"role": "assistant", "content": reply})
             return {"final_response": reply, "completed": self.first_complete or len(self.turns) > 1, "api_calls": 1}
 
         child.run_conversation.side_effect = run_conversation
@@ -70,8 +73,10 @@ def _parent(session_id="parent-sess", db=None):
     parent.providers_allowed = parent.providers_ignored = parent.providers_order = parent.provider_sort = None
     parent.session_id, parent._delegate_depth, parent._interrupt_requested = session_id, 0, False
     parent.enabled_toolsets, parent.disabled_toolsets = ["terminal", "file", "web"], []
-    parent._session_db = db if db is not None else SessionDB()
-    parent._session_db.create_session(session_id, "cli")
+    # One storage handle as the store and its interface: the children's stores open its scope, and the
+    # compression-lineage ownership check reads through it.
+    parent._session_db = parent.persistence = db if db is not None else open_persistence(profile_scope())
+    seed_session(parent.persistence, session_id, "cli")
     parent._active_children, parent._active_children_lock = [], threading.Lock()
     parent._print_fn = parent.tool_progress_callback = parent.thinking_callback = None
     return parent
@@ -123,7 +128,7 @@ def test_continue_runs_the_finished_child_on_its_transcript_route_and_toolsets()
         ("user", "CONTEXT:\nrepo at /src\n\nTASK:\nwrite the parser"),
         ("assistant", "done: CONTEXT:\nrepo at /src\n\nTASK:\nwrite the parser")]
     assert "done: now add tests for it" in json.dumps(done)
-    stored = parent._session_db.get_messages_as_conversation(turn["session_id"])
+    stored = conversation(parent.persistence, turn["session_id"])
     assert [m["content"] for m in stored][-2:] == ["now add tests for it", "done: now add tests for it"]
 
 
@@ -238,6 +243,7 @@ def _write_profile(home, *, host, model, key):
     (home / ".env").write_text(f"PROFILE_KEY={key}\n", encoding="utf-8")
 
 
+@pytest.mark.live_system_guard_bypass  # its HOME is the test's own tmp dir: the "real" Hermes root is temporary
 def test_profile_routed_child_continues_inside_its_profile_scope(tmp_path, monkeypatch):
     from tools.delegate_tool import delegate_task
     from tools.delegate_tool_routes import _route_to_task_route
@@ -251,7 +257,7 @@ def test_profile_routed_child_continues_inside_its_profile_scope(tmp_path, monke
     monkeypatch.setenv("PROFILE_KEY", "launch-key")
 
     model = _ScriptedModel()
-    parent = _parent(db=SessionDB(db_path=tmp_path / "parent-db" / "state.db"))
+    parent = _parent(db=open_persistence(profile_scope(home=tmp_path / "parent-db")))
     route = _route_to_task_route({"profile": "coder", "label": "coder"}, parent, {})
     with patch("run_agent.AIAgent", side_effect=model), \
             patch("tools.delegate_tool_routes.resolve_task_routes", return_value=([route], None)):
@@ -311,8 +317,8 @@ def test_finished_grandchild_keeps_ancestor_continuation_ownership(caller):
         if caller in {"rebuilt-root", "compressed-root"}:
             parent = _parent("root-sess", db=root._session_db)
         if caller == "compressed-root":
-            root._session_db.create_session("root-rotated", "cli", parent_session_id="root-sess")
-            root._session_db.end_session("root-sess", "compression")
+            seed_session(root.persistence, "root-rotated", "cli", parent_session_id="root-sess")
+            root.persistence.sessions.end("root-sess", "compression")
             parent.session_id = "root-rotated"
         out = json.loads(delegate_task(action="continue", subagent_id=sid, message="more grandchild work",
                                        background=True, parent_agent=parent))
@@ -417,7 +423,7 @@ def test_timeout_continue_waits_for_worker_close_and_resource_cleanup(monkeypatc
             if first:
                 close_started.set()
                 assert close_release.wait(30)
-            parent._session_db.end_session(child.session_id, "completed")
+            parent.persistence.sessions.end(child.session_id, "completed")
             resources.pop(child.session_id, None)
             if first:
                 close_done.set()
@@ -476,7 +482,7 @@ def test_timeout_continue_waits_for_worker_close_and_resource_cleanup(monkeypatc
             assert attempted["subagent_ids"] == [sid]
             assert next_started.wait(10)
             session_id = model.turns[0]["session_id"]
-            assert parent._session_db.get_session(session_id)["ended_at"] is None
+            assert session_row(parent.persistence, session_id)["ended_at"] is None
             assert resources[session_id] == "continued task"
         finally:
             for event in (worker_release, close_release, cleanup_release, next_release):

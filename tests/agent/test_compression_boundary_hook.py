@@ -13,9 +13,13 @@ this from a real user-initiated /new.
 
 import os
 from contextlib import closing
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.fixtures.storage_seed import seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
@@ -26,7 +30,7 @@ class TestCompressionBoundaryHook:
                 base_url="https://openrouter.ai/api/v1",
                 model="test/model",
                 quiet_mode=True,
-                session_db=session_db,
+                persistence=session_db,
                 session_id="original-session",
                 skip_context_files=True,
                 skip_memory=True,
@@ -35,11 +39,9 @@ class TestCompressionBoundaryHook:
             agent.compression_in_place = False
             return agent
 
-    def test_on_session_start_called_with_compression_boundary(self, tmp_path):
-        from hermes_state import SessionDB
-
-        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
-            db.create_session("delegating-parent", "cli")
+    def test_on_session_start_called_with_compression_boundary(self, tmp_path: Path):
+        with closing(storage_handle(tmp_path)) as db:
+            seed_session(db, "delegating-parent", "cli")
             agent = self._make_agent(db)
 
             # Stub the context compressor: we only need to observe the hook.
@@ -102,11 +104,9 @@ class TestCompressionBoundaryHook:
                 f"Expected old_session_id={original_sid!r}, got {call.kwargs!r}"
             assert len(comp_calls) == 1
 
-    def test_automatic_notification_follows_core_persistence(self, tmp_path):
-        from hermes_state import SessionDB
-
+    def test_automatic_notification_follows_core_persistence(self, tmp_path: Path):
         events = []
-        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
+        with closing(storage_handle(tmp_path)) as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.return_value = [
@@ -123,7 +123,7 @@ class TestCompressionBoundaryHook:
                 )
             )
             agent.context_compressor = compressor
-            original_publish = db.publish_compression_child
+            original_publish = db.lineage.publish_compression_child
 
             def _record_publish(*args, **kwargs):
                 result = original_publish(*args, **kwargs)
@@ -131,7 +131,7 @@ class TestCompressionBoundaryHook:
                 return result
 
             with patch.object(
-                db, "publish_compression_child", side_effect=_record_publish
+                db.lineage, "publish_compression_child", side_effect=_record_publish
             ):
                 agent._compress_context(
                     [{"role": "user", "content": "request"}],
@@ -141,10 +141,8 @@ class TestCompressionBoundaryHook:
 
             assert events == ["persist", "compression"]
 
-    def test_failure_before_persistence_does_not_notify(self, tmp_path):
-        from hermes_state import SessionDB
-
-        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
+    def test_failure_before_persistence_does_not_notify(self, tmp_path: Path):
+        with closing(storage_handle(tmp_path)) as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.side_effect = RuntimeError("synthetic compression failure")
@@ -159,10 +157,8 @@ class TestCompressionBoundaryHook:
 
             compressor.on_session_start.assert_not_called()
 
-    def test_no_progress_does_not_notify(self, tmp_path):
-        from hermes_state import SessionDB
-
-        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
+    def test_no_progress_does_not_notify(self, tmp_path: Path):
+        with closing(storage_handle(tmp_path)) as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.side_effect = lambda messages, **_kwargs: messages
@@ -216,11 +212,9 @@ class TestCompressionBoundaryHook:
             f"got {comp_calls!r}"
         )
 
-    def test_hook_failure_does_not_break_compression(self, tmp_path):
+    def test_hook_failure_does_not_break_compression(self, tmp_path: Path):
         """If the context engine raises from on_session_start, compression still completes."""
-        from hermes_state import SessionDB
-
-        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
+        with closing(storage_handle(tmp_path)) as db:
             agent = self._make_agent(db)
 
             compressor = MagicMock()
@@ -260,7 +254,7 @@ class TestSessionCompressEvent:
                 base_url="https://openrouter.ai/api/v1",
                 model="test/model",
                 quiet_mode=True,
-                session_db=session_db,
+                persistence=session_db,
                 session_id="original-session",
                 skip_context_files=True,
                 skip_memory=True,
@@ -283,11 +277,9 @@ class TestSessionCompressEvent:
         compressor._last_compress_aborted = False
         return compressor
 
-    def test_event_emitted_on_compression(self, tmp_path):
-        from hermes_state import SessionDB
-
+    def test_event_emitted_on_compression(self, tmp_path: Path):
         events = []
-        with closing(SessionDB(db_path=tmp_path / "test.db")) as db:
+        with closing(storage_handle(tmp_path)) as db:
             agent = self._make_agent(
                 db, event_callback=lambda et, ctx: events.append((et, ctx))
             )

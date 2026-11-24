@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import quote, unquote
 
 from plugins.teams_pipeline.models import MeetingArtifact, TeamsMeetingRef
-from tools.microsoft_graph_client import MicrosoftGraphAPIError, MicrosoftGraphClient
+from plugins.teams_pipeline.graph_client import MicrosoftGraphAPIError, MicrosoftGraphClient
 
 # Graph uses both slash keys (users/{id}/...) and quoted keys (users('{id}')/...).
 _USERS_MEETING_RE = re.compile(
@@ -821,7 +821,6 @@ async def _resolve_artifact_meeting_ref(
 
 async def _get_beta_graph_client(client: MicrosoftGraphClient) -> MicrosoftGraphClient:
     """Create a beta version of the Graph client for endpoints not available in v1.0."""
-    from tools.microsoft_graph_auth import MicrosoftGraphTokenProvider
     return MicrosoftGraphClient(
         token_provider=client.token_provider,
         base_url="https://graph.microsoft.com/beta",

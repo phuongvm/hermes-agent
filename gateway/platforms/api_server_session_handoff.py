@@ -27,7 +27,7 @@ except ImportError:
 from agent.turn_author import parse_turn_author
 from gateway.session import _is_path_unsafe
 from gateway.session_contract import AdmissionReceipt, SessionActor, SessionRef, Submission
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import STORE_FAILURES, AuthorityRefusal
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -524,6 +524,15 @@ def _resolve_authority(adapter: Any) -> Any:
     return active_authority(runner)
 
 
+def _authority_store_and_holder(authority: Any) -> tuple[Any, Any]:
+    store = getattr(authority, "persistence", None)
+    if store is None:
+        return None, None
+    bound_fn = getattr(store, "_bound_store", None)
+    holder = bound_fn().holder() if callable(bound_fn) else None
+    return store, holder
+
+
 def _active_profile_label() -> str:
     try:
         from gateway.platforms.api_server import _api_request_profile
@@ -543,14 +552,15 @@ def _check_correlation_and_existing_admission(
     request_id: str,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Read durable closed-correlation record and whether `request_id` was already admitted."""
-    db = getattr(authority, "db", None)
-    if db is None:
+    del idempotency_key
+    _store, holder = _authority_store_and_holder(authority)
+    if holder is None:
         closed_mem = getattr(authority, "_handoff_closed_correlations", {})
         admitted_mem = getattr(authority, "_handoff_admitted_keys", {})
         return closed_mem.get(correlation_id), request_id in admitted_mem
 
     meta_key = HANDOFF_CLOSED_CORR_PREFIX + correlation_id
-    with db._read_ctx() as conn:
+    with holder._read_ctx() as conn:
         raw_closed = conn.execute(
             "SELECT value FROM state_meta WHERE key=?", (meta_key,)
         ).fetchone()
@@ -586,8 +596,8 @@ def _persist_closed_correlation(
         "session_id": session_id,
         "closed_at": time.time(),
     }
-    db = getattr(authority, "db", None)
-    if db is None:
+    _store, holder = _authority_store_and_holder(authority)
+    if holder is None:
         closed_mem = getattr(authority, "_handoff_closed_correlations", None)
         if closed_mem is None:
             closed_mem = {}
@@ -604,7 +614,7 @@ def _persist_closed_correlation(
             (meta_key, encoded),
         )
 
-    db._execute_write(_write)
+    holder._execute_write(_write)
 
 
 @dataclass(frozen=True)
@@ -634,6 +644,7 @@ def _ensure_other_target_clear(
 
 
 def _ensure_local_policy_source_eligible(policy_meta: Any, session_id: str) -> None:
+    del session_id
     if policy_meta is None:
         return
     try:
@@ -654,23 +665,25 @@ def _ensure_local_policy_source_eligible(policy_meta: Any, session_id: str) -> N
 
 
 def _is_adoptable_host_owned_local_row(
-    db: Any,
+    store: Any,
     conn: sqlite3.Connection,
     row: Mapping[str, Any],
 ) -> bool:
     """Fail-closed conjunctive check for JIT adoption of an unbound host-owned local row."""
     from gateway.owner_identity import host_owner_subject, same_owner
-    from hermes_state_local_migration import validate_legacy_row
-    from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
+    from gateway.session_persistence import owner_rule
+    from persistence.sqlite.authority._binding_history import BINDING_PREFIX
+    from session_rules.legacy_local import binding_names, validate_legacy_row
 
     host_owner = host_owner_subject()
     raw_uid = row.get("user_id")
     if not isinstance(raw_uid, str) or not raw_uid.strip() or not same_owner(raw_uid, host_owner):
         return False
     row_dict = dict(row)
+    rule = owner_rule()
     try:
-        validate_legacy_row(db, row_dict, subject=host_owner)
-    except RuntimeStoreError:
+        validate_legacy_row(store.sessions.store_owner(), row_dict, subject=host_owner, rule=rule)
+    except AuthorityRefusal:
         return False
     adopt_id = str(row_dict.get("id") or "")
     if not adopt_id:
@@ -679,7 +692,7 @@ def _is_adoptable_host_owned_local_row(
         "SELECT value FROM state_meta WHERE key=?",
         (BINDING_PREFIX + adopt_id,),
     ).fetchone()
-    if saved is not None and not binding_names(saved[0], host_owner):
+    if saved is not None and not binding_names(saved[0], host_owner, rule):
         return False
     return True
 
@@ -690,7 +703,7 @@ def _load_live_session_row(
     *,
     requested_id: str,
 ) -> dict[str, Any]:
-    from hermes_state_mutation_retirement import retired_in
+    from persistence.sqlite.conversation._store.retirement import retired_in
 
     if retired_in(conn, lookup_id):
         raise HandoffError(404, "not_found", f"Session not found: {requested_id}")
@@ -712,8 +725,8 @@ def _has_bound_live_session(authority: Any, owner_id: str) -> bool:
 
 
 def _inspect_local_bound_meta(conn: sqlite3.Connection, target_id: str, *, session_id: str) -> bool:
-    from hermes_state_local import POLICY_PREFIX
-    from hermes_state_local_migration import LEGACY_PREFIX
+    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+    from persistence.sqlite.conversation._store.local_migration import LEGACY_PREFIX
 
     policy_meta = conn.execute(
         "SELECT value FROM state_meta WHERE key=?",
@@ -736,7 +749,7 @@ def _inspect_api_server_eligibility(
     request_id: str,
     has_bound_live: bool,
 ) -> _SessionEligibility:
-    from hermes_state_local import API_BINDING_PREFIX
+    from persistence.sqlite.conversation._store.local import API_BINDING_PREFIX
 
     _ensure_other_target_clear(conn, request_id, owner_id)
     api_meta = conn.execute(
@@ -774,7 +787,7 @@ def _load_compressed_tip_target(
     session_id: str,
     own_profile: str,
 ) -> tuple[str, dict[str, Any]]:
-    from hermes_state_local import local_lineage_owner
+    from persistence.sqlite.conversation._store.local import local_lineage_owner
 
     tip_row = _load_live_session_row(conn, tip_id, requested_id=session_id)
     adopt_id = local_lineage_owner(conn, tip_id)
@@ -805,7 +818,8 @@ def _load_compressed_tip_target(
 
 def _resolve_unbound_local_eligibility(
     authority: Any,
-    db: Any,
+    store: Any,
+    holder: Any,
     *,
     session_id: str,
     owner_id: str,
@@ -814,12 +828,14 @@ def _resolve_unbound_local_eligibility(
     request_id: str,
 ) -> _SessionEligibility:
     from gateway.owner_identity import host_owner_subject
-    from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
+    from gateway.session_persistence import owner_rule
+    from persistence.sqlite.authority._binding_history import BINDING_PREFIX
+    from session_rules.legacy_local import binding_names
 
-    tip_fn = getattr(db, "get_compression_tip", None)
-    tip_id = (tip_fn(session_id) if callable(tip_fn) else None) or owner_id
+    tip_id = store.lineage.tip(session_id) or owner_id
+    rule = owner_rule()
 
-    with db._read_ctx() as conn:
+    with holder._read_ctx() as conn:
         adopt_id, adopt_row = (
             _load_compressed_tip_target(
                 conn,
@@ -842,14 +858,14 @@ def _resolve_unbound_local_eligibility(
                 "SELECT value FROM state_meta WHERE key=?",
                 (BINDING_PREFIX + session_id,),
             ).fetchone()
-            if parent_hist is not None and not binding_names(parent_hist[0], host_owner_subject()):
+            if parent_hist is not None and not binding_names(parent_hist[0], host_owner_subject(), rule):
                 raise HandoffError(
                     409,
                     "legacy_session_unbound",
                     f"Legacy session {session_id} has no native owner binding; open it locally first.",
                 )
 
-        if not _is_adoptable_host_owned_local_row(db, conn, adopt_row):
+        if not _is_adoptable_host_owned_local_row(store, conn, adopt_row):
             raise HandoffError(
                 409,
                 "legacy_session_unbound",
@@ -863,20 +879,20 @@ def _inspect_session_eligibility(
     session_id: str,
     request_id: str,
 ) -> _SessionEligibility:
-    """Validate target session eligibility against `authority.db` without mutating rows.
+    """Validate target session eligibility against `authority.persistence` without mutating rows.
 
     Returns `_SessionEligibility`. Raises `HandoffError` on refusal.
     """
-    db = getattr(authority, "db", None)
-    if db is None:
+    store, holder = _authority_store_and_holder(authority)
+    if store is None or holder is None:
         return _SessionEligibility(owner_id=session_id)
 
-    from hermes_state_local import local_lineage_owner
+    from persistence.sqlite.conversation._store.local import local_lineage_owner
 
     logical_fn = getattr(authority, "logical_owner", None)
     logical_root = logical_fn(session_id) if callable(logical_fn) else session_id
 
-    with db._read_ctx() as conn:
+    with holder._read_ctx() as conn:
         row = _load_live_session_row(conn, session_id, requested_id=session_id)
         owner_id = local_lineage_owner(conn, logical_root or session_id)
         owner_row = (
@@ -884,7 +900,7 @@ def _inspect_session_eligibility(
             if owner_id != session_id
             else row
         )
-        own_profile = db._own_profile_name() or "default"
+        own_profile = store.sessions.store_owner() or "default"
         if owner_row.get("profile_name") not in (None, "", own_profile):
             raise HandoffError(404, "not_found", f"Session not found: {session_id}")
         if bool(row.get("archived")) or bool(owner_row.get("archived")):
@@ -918,7 +934,8 @@ def _inspect_session_eligibility(
 
     return _resolve_unbound_local_eligibility(
         authority,
-        db,
+        store,
+        holder,
         session_id=session_id,
         owner_id=owner_id,
         owner_row=owner_row,
@@ -943,18 +960,20 @@ async def _adopt_host_owned_local_session(
         unbind_native_transport,
     )
     from gateway.session_runtime_workers import track_mutation, tracked_write
-    from hermes_state_local import POLICY_PREFIX
-    from hermes_state_local_migration import LEGACY_PREFIX
-    from hermes_state_mutation_guards import MUTATION_GUARD_REFUSALS
-    from hermes_state_mutation_retirement import retired_in
+    from persistence.core.errors import CompressionBusy, CompressionInProgress, TurnLeaseLost
+    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+    from persistence.sqlite.conversation._store.local_migration import LEGACY_PREFIX
+    from persistence.sqlite.conversation._store.retirement import retired_in
 
     def _adopt_step() -> None:
-        db = authority.db
+        store, holder = _authority_store_and_holder(authority)
+        if store is None or holder is None:
+            return
         if _has_bound_live_session(authority, owner_id):
             return
-        with db._read_ctx() as conn:
+        with holder._read_ctx() as conn:
             if retired_in(conn, owner_id):
-                raise RuntimeStoreError("not_found")
+                raise AuthorityRefusal("not_found")
             bound = conn.execute(
                 "SELECT 1 FROM state_meta WHERE key IN (?, ?) LIMIT 1",
                 (POLICY_PREFIX + owner_id, LEGACY_PREFIX + owner_id),
@@ -962,17 +981,18 @@ async def _adopt_host_owned_local_session(
             if bound is not None:
                 return
 
-        fresh_row = db.get_session(owner_id)
-        if fresh_row is None or fresh_row.get("end_reason") == "deleted":
-            raise RuntimeStoreError("not_found")
-        if bool(fresh_row.get("archived")):
+        fresh_record = store.sessions.get(owner_id)
+        if fresh_record is None or fresh_record.end_reason == "deleted":
+            raise AuthorityRefusal("not_found")
+        if bool(fresh_record.archived):
             raise HandoffError(
                 409,
                 "session_not_handoff_eligible",
                 f"Session {session_id} is archived and not eligible for operator handoff.",
             )
-        with db._read_ctx() as conn:
-            if not _is_adoptable_host_owned_local_row(db, conn, fresh_row):
+        fresh_row = fresh_record.as_session_row()
+        with holder._read_ctx() as conn:
+            if not _is_adoptable_host_owned_local_row(store, conn, fresh_row):
                 raise HandoffError(
                     409,
                     "legacy_session_unbound",
@@ -998,9 +1018,9 @@ async def _adopt_host_owned_local_session(
                 },
             )
             try:
-                adopt_legacy_session(authority, adopt_actor, fresh_row)
-            except MUTATION_GUARD_REFUSALS as exc:
-                raise RuntimeStoreError("runtime_coordination_required") from exc
+                adopt_legacy_session(authority, adopt_actor, fresh_record)
+            except (TurnLeaseLost, CompressionInProgress, CompressionBusy) as exc:
+                raise AuthorityRefusal("runtime_coordination_required") from exc
             finally:
                 unbind_native_transport(authority, adopt_actor)
 
@@ -1017,10 +1037,10 @@ async def _adopt_host_owned_local_session(
 def _compute_queue_position(authority: Any, owner_id: str, receipt: AdmissionReceipt) -> int:
     if receipt.status != "queued":
         return 0
-    db = getattr(authority, "db", None)
-    if db is None:
+    _store, holder = _authority_store_and_holder(authority)
+    if holder is None:
         return 1
-    with db._read_ctx() as conn:
+    with holder._read_ctx() as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM session_admissions WHERE target_session_id=? AND status='queued' AND seq<=?",
             (owner_id, receipt.sequence),
@@ -1029,7 +1049,7 @@ def _compute_queue_position(authority: Any, owner_id: str, receipt: AdmissionRec
     return max(1, count)
 
 
-def _map_runtime_store_error(exc: RuntimeStoreError, *, secrets: Iterable[str] = ()) -> web.Response:
+def _map_authority_refusal(exc: AuthorityRefusal, *, secrets: Iterable[str] = ()) -> web.Response:
     reason = str(exc.reason or "admission_conflict")
     status_map = {
         "not_found": 404,
@@ -1052,20 +1072,16 @@ async def _submit_with_replay_tracking(
 ) -> tuple[AdmissionReceipt, bool]:
     """Submit to `SessionAuthority` while atomically detecting exact `request_id` replays."""
     params = inspect.signature(authority.submit).parameters
-    if "_authorize_write" in params and "_replay_guard" in params:
+    if "_on_admit_created" in params:
         replayed_box = [False]
 
-        def _on_new(_conn: Any) -> None:
-            replayed_box[0] = False
-
-        def _on_replay(_conn: Any) -> None:
-            replayed_box[0] = True
+        def _on_created(created: bool) -> None:
+            replayed_box[0] = not created
 
         receipt = await authority.submit(
             actor,
             submission,
-            _authorize_write=_on_new,
-            _replay_guard=_on_replay,
+            _on_admit_created=_on_created,
         )
         return receipt, replayed_box[0]
 
@@ -1084,7 +1100,7 @@ async def _submit_with_replay_tracking(
     if existing is not None:
         prev_sid, prev_fp, prev_receipt = existing
         if prev_sid != submission.ref.session_id or prev_fp != payload_fp:
-            raise RuntimeStoreError("admission_conflict")
+            raise AuthorityRefusal("admission_conflict")
         return prev_receipt, True
 
     receipt = await authority.submit(actor, submission)
@@ -1093,7 +1109,7 @@ async def _submit_with_replay_tracking(
 
 
 def _handoff_exception_response(
-    exc: HandoffError | RuntimeStoreError | sqlite3.Error | OSError,
+    exc: BaseException,
     *,
     secrets: Iterable[str],
 ) -> web.Response:
@@ -1105,8 +1121,8 @@ def _handoff_exception_response(
             err_type=exc.err_type,
             secrets=secrets,
         )
-    if isinstance(exc, RuntimeStoreError):
-        return _map_runtime_store_error(exc, secrets=secrets)
+    if isinstance(exc, AuthorityRefusal):
+        return _map_authority_refusal(exc, secrets=secrets)
     return _error_json(
         f"Session store unavailable: {type(exc).__name__}",
         503,
@@ -1306,7 +1322,7 @@ async def handle_session_handoff(
             normalized_author=normalized_author,
             secrets=secrets,
         )
-    except (HandoffError, RuntimeStoreError, sqlite3.Error, OSError) as exc:
+    except (HandoffError, AuthorityRefusal, *STORE_FAILURES, sqlite3.Error, OSError) as exc:
         return _handoff_exception_response(exc, secrets=secrets)
 
     # HX017: never log user body, summary, or display names at INFO+

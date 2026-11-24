@@ -3,7 +3,7 @@ import sqlite3
 import json
 
 from hermes_state import SessionDB
-from hermes_state_schema import run_openspec_migration
+from persistence.sqlite.openspec import run_openspec_migration
 
 def test_openspec_immutability_triggers(tmp_path):
     """

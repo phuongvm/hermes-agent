@@ -24,8 +24,10 @@ from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipel
 from plugins.teams_pipeline.subscriptions import (
     build_graph_client,
     maintain_graph_subscriptions,
+    sync_graph_subscription_record,
+    utc_timestamp,
 )
-from tools.microsoft_graph_auth import MicrosoftGraphConfigError, MicrosoftGraphTokenProvider
+from plugins.teams_pipeline.graph_auth import MicrosoftGraphConfigError, MicrosoftGraphTokenProvider
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:

@@ -4,7 +4,7 @@ import json
 import threading
 
 from hermes_state import SessionDB
-from hermes_state_schema import run_openspec_migration
+from persistence.sqlite.openspec import run_openspec_migration
 
 def test_openspec_registry_negative_cases(tmp_path):
     """
@@ -90,16 +90,12 @@ def test_concurrent_inserts_race_condition(tmp_path):
     
     def insert_worker(worker_id):
         try:
-            # Each worker uses its own connection to properly simulate concurrent DB access
-            # that might hit locks. SessionDB is meant to be instantiated or we can use the same 
-            # with lock, but let's test SQLite's underlying concurrency handling or the lock's protection.
-            local_db = SessionDB(db_path)
-            with local_db._lock:
-                local_db._conn.execute(
+            with sqlite3.connect(str(db_path), timeout=30.0) as worker_conn:
+                worker_conn.execute(
                     "INSERT INTO openspec_registry (id, openspec_contract, status, created_at) VALUES (?, ?, ?, ?)",
                     (f'reg_worker_{worker_id}', f'spec_{worker_id}', 'active', 1.0)
                 )
-                local_db._conn.commit()
+                worker_conn.commit()
         except Exception as e:
             exceptions.append(e)
 
@@ -170,7 +166,7 @@ def test_board_transition_validates_inside_transaction(board_conn, monkeypatch):
     before_status = board_conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
     before_events = board_conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
     with pytest.raises(ValueError, match="OpenSpec.*hash"):
-        kanban_db.complete_task(board_conn, task_id)
+        kanban_db.complete_task(board_conn, task_id, summary="completed work")
     assert transactions == [True]
     assert board_conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == before_status
     assert board_conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == before_events

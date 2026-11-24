@@ -350,8 +350,8 @@ class TeamsSummaryWriter:
         if self._graph_client is not None:
             return self._graph_client
 
-        from tools.microsoft_graph_auth import MicrosoftGraphTokenProvider
-        from tools.microsoft_graph_client import MicrosoftGraphClient
+        from plugins.teams_pipeline.graph_auth import MicrosoftGraphTokenProvider
+        from plugins.teams_pipeline.graph_client import MicrosoftGraphClient
 
         # PRIORITY 1: Delegated OAuth token (can post to user chats)
         # Try first — if tokens exist, use delegated auth for delivery

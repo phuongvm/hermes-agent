@@ -11,18 +11,16 @@ def test_generic_task_parity(tmp_path):
     Test that standard non-OpenSpec tasks work exactly as before.
     (Lifecycle: create -> running -> completed)
     """
+    from hermes_cli.kanban_db_connect import _migrate_add_optional_columns
     from hermes_state import SessionDB
-    from hermes_state_schema import run_openspec_migration
+    from persistence.sqlite.openspec import run_openspec_migration
 
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path)
-    
+
     with db._lock:
-        db._conn.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT, priority INTEGER, created_by TEXT, created_at REAL, started_at REAL, completed_at REAL, workspace_kind TEXT, workspace_path TEXT, branch_name TEXT, project_id TEXT, claim_lock TEXT, claim_expires INTEGER, tenant TEXT, idempotency_key TEXT, max_runtime_seconds INTEGER, skills TEXT, max_retries INTEGER, model_override TEXT, provider_override TEXT, reasoning_effort TEXT, goal_mode INTEGER, goal_max_turns INTEGER, session_id TEXT, result TEXT, current_run_id INTEGER, current_step_key TEXT)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT, outcome TEXT, summary TEXT, ended_at REAL, claim_lock TEXT, claim_expires REAL, worker_pid INTEGER, profile TEXT, step_key TEXT, max_runtime_seconds INTEGER, started_at REAL)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_dependencies (parent_id TEXT, child_id TEXT)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_links (parent_id TEXT, child_id TEXT)")
+        db._conn.executescript(kanban_db.SCHEMA_SQL)
+        _migrate_add_optional_columns(db._conn)
         run_openspec_migration(db._conn)
         db._conn.commit()
 
@@ -63,18 +61,16 @@ def test_openspec_registered_task_enforcement(tmp_path):
     """
     Test that OpenSpec registered tasks enforce strict state machine transitions.
     """
+    from hermes_cli.kanban_db_connect import _migrate_add_optional_columns
     from hermes_state import SessionDB
-    from hermes_state_schema import run_openspec_migration
+    from persistence.sqlite.openspec import run_openspec_migration
 
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path)
-    
+
     with db._lock:
-        db._conn.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT, priority INTEGER, created_by TEXT, created_at REAL, started_at REAL, completed_at REAL, workspace_kind TEXT, workspace_path TEXT, branch_name TEXT, project_id TEXT, claim_lock TEXT, claim_expires INTEGER, tenant TEXT, idempotency_key TEXT, max_runtime_seconds INTEGER, skills TEXT, max_retries INTEGER, model_override TEXT, provider_override TEXT, reasoning_effort TEXT, goal_mode INTEGER, goal_max_turns INTEGER, session_id TEXT, result TEXT, current_run_id INTEGER, current_step_key TEXT)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT, outcome TEXT, summary TEXT, ended_at REAL, claim_lock TEXT, claim_expires REAL, worker_pid INTEGER, profile TEXT, step_key TEXT, max_runtime_seconds INTEGER, started_at REAL)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_dependencies (parent_id TEXT, child_id TEXT)")
-        db._conn.execute("CREATE TABLE IF NOT EXISTS task_links (parent_id TEXT, child_id TEXT)")
+        db._conn.executescript(kanban_db.SCHEMA_SQL)
+        _migrate_add_optional_columns(db._conn)
         run_openspec_migration(db._conn)
         db._conn.commit()
 
