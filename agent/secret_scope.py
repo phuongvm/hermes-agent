@@ -206,8 +206,11 @@ _GLOBAL_ENV_EXACT = frozenset({
     # every process must resolve the SAME directory or a routed child silently loses
     # administrator policy, so it is never residue and never profile-scoped (#135200).
     "HERMES_MANAGED_DIR",
-    # OS / interpreter
+    # OS / interpreter (POSIX + Windows equivalents needed by child CLIs such as bw/op/git)
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "PWD", "SHELL", "TMPDIR",
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH",
+    "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES",
     "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE",
     # Kanban paths (per-board, not per-profile-secret)
     "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",

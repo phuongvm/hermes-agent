@@ -864,6 +864,15 @@ def cmd_mcp_test(args):
     cfg = _lookup_server(name, _get_mcp_servers(), "Available")
     if cfg is None:
         return 3
+    # Built-in ``mcp`` subcommands skip argparse plugin discovery; ensure any enabled plugin
+    # secret source (e.g. Vaultwarden) registers and hydrates before probing ${VAR} headers.
+    try:
+        from hermes_cli.env_loader import _ensure_plugin_secret_sources_discovered, _load_secrets_config
+        from hermes_constants import get_hermes_home
+        _home = get_hermes_home()
+        _ensure_plugin_secret_sources_discovered(_load_secrets_config(_home), _home)
+    except Exception:
+        pass
     print()
     print(color(f"  Testing '{name}'...", Colors.CYAN))
     if "url" in cfg:

@@ -330,3 +330,108 @@ def test_removing_the_last_plugin_source_revokes_its_process_env_value(
         os.environ.pop("REVIEW_PLUGIN_SECRET", None)
         reg._reset_registry_for_tests()
         env_loader.reset_secret_source_cache()
+
+
+def _write_profile_scoped_plugin_home(
+    home: Path,
+    *,
+    secret_key: str,
+    secret_value: str,
+    plugin_enabled: bool,
+) -> None:
+    plugin_dir = home / "plugins" / "fixture-secret-source"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.yaml").write_text("name: fixture-secret-source\nversion: 0.1.0\n", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "from agent.secret_sources.base import (\n"
+        "    SECRET_SOURCE_API_VERSION, FetchResult, SecretSource,\n"
+        ")\n\n"
+        "class FixtureVault(SecretSource):\n"
+        "    name = 'fixturevault'\n"
+        "    label = 'Fixture vault'\n"
+        "    api_version = SECRET_SOURCE_API_VERSION\n"
+        "    shape = 'bulk'\n\n"
+        "    def fetch(self, cfg: dict, home_path: Path) -> FetchResult:\n"
+        f"        return FetchResult(secrets={{{secret_key!r}: {secret_value!r}}})\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_secret_source(FixtureVault())\n",
+        encoding="utf-8",
+    )
+    enabled = "[fixture-secret-source]" if plugin_enabled else "[]"
+    (home / "config.yaml").write_text(
+        f"plugins:\n  enabled: {enabled}\nsecrets:\n  fixturevault:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+
+
+def test_secondary_profile_hydration_discovers_its_plugin_secret_source(monkeypatch, tmp_path):
+    """Under multiplex hosting, binding a secondary profile's runtime scope (e.g. from MCP
+    reconciliation before any agent turn has run on that profile) must discover that profile's
+    enabled plugin secret sources before hydrating them, without leaking into os.environ or across
+    profiles."""
+    import agent.secret_sources.registry as reg
+    from agent.secret_scope import current_secret_scope, get_secret, set_multiplex_active
+    from gateway.run import _profile_runtime_scope
+    from hermes_cli import env_loader
+    from hermes_cli.plugins import _reset_plugin_managers_for_tests, discover_plugins
+    from tui_gateway.launch_profile_policy import activate_multi_profile_hosting
+
+    _reset_plugin_managers_for_tests()
+    reg._reset_registry_for_tests()
+    env_loader.reset_secret_source_cache()
+
+    launch = tmp_path / ".hermes"
+    ops = launch / "profiles" / "ops"
+    noplugin = launch / "profiles" / "noplugin"
+    _write_profile_scoped_plugin_home(
+        launch, secret_key="LAUNCH_VAULT_TOKEN", secret_value="from-launch", plugin_enabled=True
+    )
+    _write_profile_scoped_plugin_home(
+        ops, secret_key="OPS_VAULT_TOKEN", secret_value="from-ops", plugin_enabled=True
+    )
+    _write_profile_scoped_plugin_home(
+        noplugin, secret_key="NOPLUGIN_VAULT_TOKEN", secret_value="should-not-load", plugin_enabled=False
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    for k in ("LAUNCH_VAULT_TOKEN", "OPS_VAULT_TOKEN", "NOPLUGIN_VAULT_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+
+    try:
+        # Gateway boot only calls discover_plugins() on the launch home, then activates multiplex.
+        discover_plugins()
+        activate_multi_profile_hosting()
+
+        # Secondary with plugin enabled hydrates its own scoped secret source automatically.
+        with _profile_runtime_scope(ops):
+            assert get_secret("OPS_VAULT_TOKEN") == "from-ops"
+            assert "LAUNCH_VAULT_TOKEN" not in (current_secret_scope() or {})
+        assert "OPS_VAULT_TOKEN" not in os.environ
+
+        # Secondary without plugin enabled stays strictly isolated (no launch leakage).
+        with _profile_runtime_scope(noplugin):
+            assert get_secret("NOPLUGIN_VAULT_TOKEN") is None
+            assert get_secret("LAUNCH_VAULT_TOKEN") is None
+            assert get_secret("OPS_VAULT_TOKEN") is None
+    finally:
+        set_multiplex_active(False)
+        for k in ("LAUNCH_VAULT_TOKEN", "OPS_VAULT_TOKEN", "NOPLUGIN_VAULT_TOKEN"):
+            os.environ.pop(k, None)
+        _reset_plugin_managers_for_tests()
+        reg._reset_registry_for_tests()
+        env_loader.reset_secret_source_cache()
+
+
+def test_multiplex_hydration_preserves_windows_os_env_for_secret_cli_helpers(monkeypatch, tmp_path):
+    """Windows CLI secret helpers (e.g. Bitwarden/Vaultwarden `bw`) locate their config in
+    APPDATA/USERPROFILE and require SYSTEMROOT for Winsock/TLS. Multiplex hydration must keep
+    those OS globals in `source_child_env()` while still excluding sibling credentials."""
+    from agent.secret_scope import _is_global_env
+
+    for key in ("APPDATA", "LOCALAPPDATA", "USERPROFILE", "SYSTEMROOT", "TEMP", "TMP", "COMSPEC", "PATHEXT"):
+        assert _is_global_env(key), f"Expected OS global env var {key!r} to be preserved under multiplex"
+    for secret in ("BW_SESSION", "KB_MCP_TOKEN", "OPENAI_API_KEY", "API_SERVER_KEY"):
+        assert not _is_global_env(secret), f"Credential {secret!r} must never be process-global"
+
+

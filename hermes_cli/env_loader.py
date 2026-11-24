@@ -70,6 +70,7 @@ _RELEASED_BRIDGE_CLAIMS_BY_HOME: dict[str, dict[str, tuple[str, str]]] = {}
 # several hot modules, so without this the Bitwarden status line prints 3-5x per startup and the config
 # re-parse + ASCII sweep re-run each time (Bitwarden's own cache only saves the network call).
 _APPLIED_HOMES: set[str] = set()
+_DISCOVERING_SECRET_PLUGIN_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
 # What THIS process has published from dotenv files, per variable: (value before our first publish, or
@@ -225,6 +226,54 @@ def hydrate_profile_secret_sources(hermes_home: str | os.PathLike) -> dict[str, 
         return _hydrate_profile_secret_sources(Path(hermes_home))
 
 
+def _ensure_plugin_secret_sources_discovered(cfg: dict, home: Path) -> None:
+    """Discover *home*'s plugins when ``secrets:`` enables a source not yet registered in *home*'s
+    scope (e.g. a secondary profile hydrated by MCP reconciliation before any agent turn ran on
+    that profile, or a built-in CLI subcommand like ``hermes mcp test`` that skipped argparse
+    plugin discovery). No-op when all enabled sources are already registered, during ``hermes
+    update``, or on re-entrant calls from ``discover_plugins()`` itself."""
+    if not isinstance(cfg, dict):
+        return
+    from hermes_cli import _early_recovery
+
+    if _early_recovery._should_skip_external_secret_sources():
+        return
+    enabled_cfg = [
+        name for name, sec in cfg.items()
+        if name != "sources" and isinstance(sec, dict) and sec.get("enabled") is True
+    ]
+    if not enabled_cfg:
+        return
+    home_key = hermes_home_key(home)
+    try:
+        from agent.secret_sources.registry import list_sources
+
+        registered = {s.name for s in list_sources(scope=home_key)}
+    except Exception:
+        return
+    if all(name in registered for name in enabled_cfg):
+        return
+    if home_key in _DISCOVERING_SECRET_PLUGIN_HOMES:
+        return
+    _DISCOVERING_SECRET_PLUGIN_HOMES.add(home_key)
+    try:
+        from hermes_cli.plugins import discover_plugins
+        from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+        token = None
+        if hermes_home_key(get_hermes_home()) != home_key:
+            token = set_hermes_home_override(str(home))
+        try:
+            discover_plugins()
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+    except Exception:
+        logger.debug("Plugin discovery before secret hydration for %s failed", home, exc_info=True)
+    finally:
+        _DISCOVERING_SECRET_PLUGIN_HOMES.discard(home_key)
+
+
 def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     """Locked implementation for :func:`hydrate_profile_secret_sources`."""
     from agent.safe_worker_policy import worker_config_snapshot
@@ -249,6 +298,11 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
 
         publish_secret_source_values(home, {})
         return {}
+
+    _ensure_plugin_secret_sources_discovered(cfg, home)
+    # discover_plugins() refreshes secret sources for *home*; avoid a duplicate fetch if it succeeded.
+    if home_key in _APPLIED_HOMES:
+        return get_secret_source_values(home)
 
     try:
         from agent.secret_scope import _is_global_env, load_env_file
