@@ -448,3 +448,42 @@ def test_guard_correlates_allowed_cx_header_with_exact_unprefixed_body():
             profile_model="cb-agent-reviewer",
             agent=non_router_agent,
         )
+
+
+def test_tier_floor_can_be_disabled_via_config_or_env(monkeypatch):
+    """Operators can disable the client-side tier floor guard via tier_floor.enabled=false or env."""
+    from types import SimpleNamespace
+
+    disabled_cfg = {"tier_floor": {"enabled": False}}
+    assert tfp.is_tier_floor_enabled(disabled_cfg) is False
+    assert tfp.enforce_tier1_response_guard(
+        {"model": "gpt-6.2-sol[1m]"}, profile_model="cb-agent-coder", agent=disabled_cfg
+    ) is None
+    assert tfp.enforce_tier1_response_guard(
+        {"model": "nemotron-free"}, profile_model="cb-agent-coder", agent=disabled_cfg
+    ) is None
+
+    disabled_agent = SimpleNamespace(model="cb-agent-coder", config=disabled_cfg)
+    assert tfp.tier_floor_blocks_fallback(disabled_agent, "ai-router", "cb-always-on") is False
+    guard = tfp.Tier1StreamGuard(disabled_agent, SimpleNamespace(headers={}))
+    assert guard.pinned is False
+    guard.accept(SimpleNamespace(model="gpt-6.2-sol[1m]"))
+
+    # Env override disables guard even when config has enabled=True
+    monkeypatch.setenv("HERMES_TIER_FLOOR_ENABLED", "0")
+    assert tfp.is_tier_floor_enabled({"tier_floor": {"enabled": True}}) is False
+    assert tfp.enforce_tier1_response_guard(
+        {"model": "gpt-6.2-sol[1m]"}, profile_model="cb-agent-coder", agent={"tier_floor": {"enabled": True}}
+    ) is None
+    monkeypatch.delenv("HERMES_TIER_FLOOR_ENABLED", raising=False)
+    assert tfp.is_tier_floor_enabled({"tier_floor": {"enabled": True}}) is True
+
+    # extra_prefixes allows bare gpt-6.2-sol[1m] while still blocking Tier-3 markers
+    prefixed_cfg = {"tier_floor": {"extra_prefixes": ["gpt-6"]}}
+    assert tfp.enforce_tier1_response_guard(
+        {"model": "gpt-6.2-sol[1m]"}, profile_model="cb-agent-coder", agent=prefixed_cfg
+    ) == "gpt-6.2-sol[1m]"
+    with pytest.raises(tfp.TierFloorViolationError):
+        tfp.enforce_tier1_response_guard(
+            {"model": "nemotron-free"}, profile_model="cb-agent-coder", agent=prefixed_cfg
+        )

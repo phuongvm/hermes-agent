@@ -165,6 +165,23 @@ def is_tier1_model_id(model_id: Any, source: Any = None) -> bool:
     return any(lower.startswith(prefix) for prefix in get_tier1_provider_prefixes(source))
 
 
+def is_tier_floor_enabled(source: Any = None) -> bool:
+    """Return False when the operator explicitly disables the client-side tier floor guard
+    via ``tier_floor: {enabled: false}`` in config.yaml or ``HERMES_TIER_FLOOR_ENABLED=0``."""
+    env_val = os.environ.get("HERMES_TIER_FLOOR_ENABLED")
+    if env_val is not None and env_val.strip() != "":
+        return env_val.strip().lower() not in ("0", "false", "off", "no")
+    cfg = _extract_tier_floor_config(source)
+    if "enabled" in cfg and cfg["enabled"] is not None:
+        val = cfg["enabled"]
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() not in ("0", "false", "off", "no")
+        return bool(val)
+    return True
+
+
 def is_tier_pinned_model(profile_model: Any) -> bool:
     return isinstance(profile_model, str) and profile_model.strip() in SPECIALIST_COMBO_IDS
 
@@ -172,6 +189,8 @@ def is_tier_pinned_model(profile_model: Any) -> bool:
 def tier_floor_blocks_fallback(agent: Any, fb_provider: str, fb_model: str) -> bool:
     """Slice 4 / Module D4: a specialist primary (``cb-agent-*``) never falls back to a TIER_3 tail. The
     pinned profile's primary model is remembered on first sight so the check survives a mid-turn swap."""
+    if not is_tier_floor_enabled(agent):
+        return False
     pinned = getattr(agent, "_tier_pinned_primary", None)
     if not is_tier_pinned_model(pinned):  # unset, stale, or a MagicMock attribute
         pinned = None
@@ -250,7 +269,7 @@ def enforce_tier1_response_guard(response_or_headers: Any, *, profile_model: Opt
     ``profile_model`` is a specialist combo and either ``x-model-id`` or ``response.model`` is outside
     ``TIER_1_ALLOWLIST``, or if model provenance is missing/empty on a specialist profile. Non-specialist
     profiles are never guarded."""
-    if not is_tier_pinned_model(profile_model):
+    if not is_tier_floor_enabled(agent) or not is_tier_pinned_model(profile_model):
         return None
     assert profile_model is not None
 
@@ -294,7 +313,7 @@ class Tier1StreamGuard:
     def __init__(self, agent: Any, response: Any) -> None:
         self.agent = agent
         self.profile_model = str(getattr(agent, "_tier_pinned_primary", None) or getattr(agent, "model", ""))
-        self.pinned = is_tier_pinned_model(self.profile_model)
+        self.pinned = is_tier_floor_enabled(agent) and is_tier_pinned_model(self.profile_model)
         self.model_id: Optional[str] = None
         if self.pinned:
             header = _header_lookup(response)(MODEL_ID_HEADER)
