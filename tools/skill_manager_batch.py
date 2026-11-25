@@ -216,6 +216,72 @@ def _rollback(snapshots, find_skill, results):
 _ADVISORY_KEYS = ("lint_warnings", "lint_hint")
 
 
+def _stage_split_background_batch(operations, names, tool_error):
+    """Split cross-skill background_review batches per target skill at staging time."""
+    try:
+        from tools import write_approval as wa
+    except Exception:
+        return None
+    if wa.current_origin() != "background_review":
+        return None
+    decision = wa.evaluate_gate(wa.SKILLS)
+    if decision.allow:
+        return ""
+    if decision.blocked:
+        return tool_error(decision.message, success=False)
+    grouped: dict[str, list[dict]] = {}
+    for i, op in enumerate(operations):
+        target = names[i]
+        grouped.setdefault(target, []).append({**op, "name": target})
+    dups = wa.find_duplicate_pending_skills(list(grouped.keys()))
+    pending_ids: list[str] = []
+    split_targets: list[str] = []
+    gists: list[str] = []
+    skipped_duplicates: dict[str, list[str]] = {}
+    for target, target_ops in grouped.items():
+        if target in dups:
+            skipped_duplicates[target] = dups[target]
+            continue
+        acts = ", ".join(op["action"] for op in target_ops)
+        target_gist = f"batch({len(target_ops)} ops: {acts}) on {target}"
+        rec = wa.stage_write(
+            wa.SKILLS,
+            {"action": "batch", "operations": target_ops},
+            summary=target_gist,
+            origin="background_review",
+        )
+        pending_ids.append(rec["id"])
+        split_targets.append(target)
+        gists.append(target_gist)
+    if not pending_ids:
+        return json.dumps(
+            {
+                "success": False,
+                "duplicate_pending": True,
+                "skipped_duplicates": skipped_duplicates,
+                "existing_pending_ids": [pid for ids in skipped_duplicates.values() for pid in ids],
+                "error": (
+                    "All target skills in batch already have pending proposals awaiting review: "
+                    + ", ".join(f"{t} ({', '.join(ids)})" for t, ids in skipped_duplicates.items())
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "staged": True,
+            "pending_id": pending_ids[0],
+            "pending_ids": pending_ids,
+            "split_targets": split_targets,
+            "skipped_duplicates": skipped_duplicates,
+            "gist": "; ".join(gists),
+            "message": decision.message,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _skill_manage_batch(operations, default_name: str | None = None, task_id: str | None = None,
                         session_id: str | None = None) -> str:
     """Apply operations atomically: every touched skill is snapshotted first and any
@@ -242,14 +308,31 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
     if err is not None:
         return err
     if not _smt._skill_gate_bypass.get():
-        # Approval gate for the WHOLE batch as one pending write.
-        def _staging(wa):
-            acts = ", ".join(op["action"] for op in operations)
-            gist = f"batch({len(operations)} ops: {acts}) on {', '.join(sorted(set(names)))}"
-            return {"action": "batch", "operations": operations}, gist
-        staged = _smt._run_write_gate(_staging)
-        if staged is not None:
-            return staged
+        unique_targets = list(dict.fromkeys(names))
+        if len(unique_targets) > 1:
+            split_staged = _stage_split_background_batch(operations, names, tool_error)
+            if split_staged == "":
+                pass
+            elif split_staged is not None:
+                return split_staged
+            else:
+                def _staging(wa):
+                    acts = ", ".join(op["action"] for op in operations)
+                    gist = f"batch({len(operations)} ops: {acts}) on {', '.join(sorted(set(names)))}"
+                    return {"action": "batch", "operations": operations}, gist
+                staged = _smt._run_write_gate(_staging)
+                if staged is not None:
+                    return staged
+        else:
+            def _staging(wa):
+                norm_ops = [op if op.get("name") else {**op, "name": names[i]}
+                            for i, op in enumerate(operations)]
+                acts = ", ".join(op["action"] for op in norm_ops)
+                gist = f"batch({len(norm_ops)} ops: {acts}) on {', '.join(sorted(set(names)))}"
+                return {"action": "batch", "operations": norm_ops}, gist
+            staged = _smt._run_write_gate(_staging)
+            if staged is not None:
+                return staged
     # Every target's lock is held from the snapshot through commit or rollback; the per-op
     # skill_manage() calls re-enter them. Without the outer fence a concurrent writer landing
     # between the snapshot and a rollback would be silently reverted.

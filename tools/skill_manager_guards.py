@@ -253,16 +253,66 @@ def _locked_guard(name: str, action: str) -> Optional[dict[str, Any]]:
         return _refusal(f"Refusing {action}: {skill_refusal(locked)}", _locked=True)
     return None
 
-def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
+_MUTATING_EXISTING_ACTIONS = frozenset({"patch", "edit", "write_file", "remove_file", "delete"})
+
+
+def _background_review_read_only_guard(
+    name: str, skill_dir: Path, action: str
+) -> Optional[dict[str, Any]]:
+    """Refuse autonomous background-review mutations targeting skills.read_only_dirs."""
+    if not _is_background_review():
+        return None
+    try:
+        from agent.skill_utils import is_read_only_skill_path
+        if is_read_only_skill_path(skill_dir) or is_read_only_skill_path(skill_dir / "SKILL.md"):
+            return _refusal(
+                f"Refusing background curator {action} for skill '{name}': the skill lives in "
+                f"skills.read_only_dirs, which are read-only to autonomous maintenance.",
+                _read_only_external=True,
+            )
+    except Exception:
+        logger.debug("read-only external skill guard lookup failed for %s", name, exc_info=True)
+    return None
+
+
+def _background_review_preflight(
+    action: str,
+    name: str,
+    *,
+    absorbed_into: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Guards that run on the bare action/name before any handler, for the single-op AND the
-    batch path: the content lock (every mutating action) and the ownership delete guard."""
+    batch path: the content lock, read-only external directory guard, ownership delete guard,
+    and consolidation umbrella verification."""
     if (locked := _locked_guard(name, action)) is not None:
         return locked
-    if action != "delete":
+    if action not in _MUTATING_EXISTING_ACTIONS:
         return None
     from tools import skill_manager_tool as _smt
     existing = _smt._find_skill(name)
-    return _background_review_delete_guard(name, existing["path"]) if existing else None
+    if existing and (ro := _background_review_read_only_guard(name, existing["path"], action)) is not None:
+        return ro
+    if action != "delete":
+        return None
+    if existing and (del_guard := _background_review_delete_guard(name, existing["path"])) is not None:
+        return del_guard
+    if (consol_guard := _curator_consolidation_delete_guard(name, absorbed_into)) is not None:
+        return consol_guard
+    if _is_background_review():
+        absorbed_target = absorbed_into.strip() if isinstance(absorbed_into, str) else ""
+        if absorbed_target:
+            if absorbed_target == name:
+                return _refusal(
+                    f"absorbed_into='{absorbed_target}' cannot equal the skill being deleted.",
+                    _fail_closed=True,
+                )
+            if not _smt._find_skill(absorbed_target):
+                return _refusal(
+                    f"absorbed_into='{absorbed_target}' does not exist. "
+                    f"Create or patch the umbrella skill first, then retry the delete.",
+                    _fail_closed=True,
+                )
+    return None
 
 
 def _curator_consolidation_delete_guard(

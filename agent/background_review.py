@@ -556,9 +556,10 @@ _SKILL_REVIEW_PROMPT = (
     "new learning, PATCH that one first (re-load it with skill_view during this review — see "
     "Read-before-write below). It is the skill that was in play, so it's the right one to extend — "
     "whoever wrote it: hand-written, installed, bundled, and pinned skills are all yours to "
-    "improve. The one exception is a skill the user LOCKED (`hermes curator lock`): skill_manage "
-    "refuses it — do not retry and do not recreate it under another name; put the suggested "
-    "change in your summary instead.\n"
+    "improve. Exceptions: skills the user LOCKED (`hermes curator lock`) and skills under "
+    "configured read-only external directories (`skills.read_only_dirs`) cannot be modified "
+    "autonomously — `skill_manage` refuses them; do not retry and do not recreate them under "
+    "another name; put the suggested change in your summary instead.\n"
     "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). If no loaded skill fits but "
     "an existing class-level skill does, patch it. Add a subsection, a pitfall, or broaden a "
     "trigger.\n"
@@ -589,6 +590,8 @@ _SKILL_REVIEW_PROMPT = (
     "skill_view just returned. Creating a brand-new skill or adding a NEW supporting file needs no "
     "prior read. If a write is refused with a read-before-write error, call skill_view for the "
     "named target once and retry the write once; do not loop.\n\n"
+    "Call scoping: target ONE skill per `skill_manage` call (multiple operations on that same "
+    "skill in one call are fine; never bundle unrelated skills into a single batch call).\n\n"
     "User-preference embedding (important): when the user expressed a style/format/workflow "
     "preference, the update belongs in the SKILL.md body, not just in memory. Memory captures 'who "
     "the user is and what the current situation and state of your operations are'; skills capture "
@@ -623,7 +626,9 @@ _COMBINED_REVIEW_PROMPT = (
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were loaded via /skill-name or "
     "skill_view in the conversation. If one of them covers the learning, PATCH it first (re-load "
     "it with skill_view during this review — see Read-before-write below). It was in play; it's "
-    "the right place, whoever wrote it.\n"
+    "the right place, whoever wrote it (except locked skills or read-only external skills under "
+    "`skills.read_only_dirs`, which cannot be modified autonomously — do not retry or recreate "
+    "them under another name).\n"
     "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to find the right one). Patch it.\n"
     "  3. ADD A SUPPORT FILE under an existing umbrella via skill_manage action=write_file. Three "
     "kinds: `references/<topic>.md` for topical depth (decision tables, recipes, quirks, condensed "
@@ -640,6 +645,8 @@ _COMBINED_REVIEW_PROMPT = (
     "file. Content quoted earlier in the transcript does NOT count — base the write on what "
     "skill_view just returned. New skills and NEW supporting files need no prior read. On a "
     "read-before-write refusal: view the named target once, retry the write once, do not loop.\n\n"
+    "Call scoping: target ONE skill per `skill_manage` call (do not bundle unrelated skills into "
+    "a single batch call).\n\n"
     "User-preference embedding: when the user complains about how you handled a task, update the "
     "skill that governs that task rather than memory. Memory says 'who the user is and "
     "what the current situation and state of your operations are'; skills say 'how to do this "
@@ -1455,6 +1462,7 @@ _PROMPT_NAME_BY_SCOPE = {
     (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
     (False, True): "_SKILL_REVIEW_PROMPT", (False, False): "_SKILL_REVIEW_PROMPT",
 }
+_PENDING_SKILL_HINT_MAX = 50
 
 
 def spawn_background_review_thread(
@@ -1474,6 +1482,22 @@ def spawn_background_review_thread(
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
+    if review_skills:
+        with suppress(Exception):
+            from tools.write_approval import pending_skill_targets
+            pending_names = sorted(pending_skill_targets().keys())
+            if pending_names:
+                shown = pending_names[:_PENDING_SKILL_HINT_MAX]
+                extra = (
+                    f" (+{len(pending_names) - _PENDING_SKILL_HINT_MAX} more)"
+                    if len(pending_names) > _PENDING_SKILL_HINT_MAX
+                    else ""
+                )
+                prompt = (
+                    f"{prompt}\n\nSkills already pending review "
+                    f"(do NOT propose duplicate edits to these skills): "
+                    f"{', '.join(shown)}{extra}"
+                )
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "

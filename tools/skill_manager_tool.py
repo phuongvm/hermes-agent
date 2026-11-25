@@ -772,7 +772,26 @@ def _run_write_gate(build_staging):
     if decision.blocked:
         return tool_error(decision.message, success=False)
     payload, gist = build_staging(wa)
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    origin = wa.current_origin()
+    if origin == "background_review":
+        targets = wa._extract_pending_skill_names({"payload": payload})
+        dups = wa.find_duplicate_pending_skills(targets)
+        if dups:
+            target, ids = next(iter(dups.items()))
+            return json.dumps(
+                {
+                    "success": False,
+                    "duplicate_pending": True,
+                    "target": target,
+                    "existing_pending_ids": ids,
+                    "error": (
+                        f"Skill '{target}' already has pending proposal(s) ({', '.join(ids)}) "
+                        f"awaiting review; skipping duplicate autonomous proposal."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=origin)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"],
                        "gist": gist, "message": decision.message}, ensure_ascii=False)
 
@@ -884,7 +903,7 @@ def skill_manage(
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
-    if (preflight := _background_review_preflight(action, name)) is not None:
+    if (preflight := _background_review_preflight(action, name, absorbed_into=absorbed_into)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
     # of origin; bypassed when replaying an approved staged write.

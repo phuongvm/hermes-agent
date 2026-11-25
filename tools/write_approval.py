@@ -24,7 +24,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -139,6 +139,57 @@ def pending_count(subsystem: str) -> int:
     with suppress(Exception):
         return sum(1 for _ in d.glob("*.json"))
     return 0
+
+
+def _extract_pending_skill_names(record: dict[str, Any]) -> list[str]:
+    """Ordered unique target skill names referenced by a pending skill record."""
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    default_name = str(payload.get("name") or "").strip()
+    ops = payload.get("operations")
+    names: list[str] = []
+    if isinstance(ops, list) and ops:
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            nm = str(op.get("name") or default_name).strip()
+            if nm and nm not in names:
+                names.append(nm)
+        if names:
+            return names
+    return [default_name] if default_name else []
+
+
+def pending_skill_targets(subsystem: str = SKILLS) -> dict[str, list[str]]:
+    """Map each pending target skill name to its ordered list of pending record IDs."""
+    targets: dict[str, list[str]] = {}
+    for record in list_pending(subsystem):
+        pid = str(record.get("id") or "").strip()
+        if not pid:
+            continue
+        for name in _extract_pending_skill_names(record):
+            bucket = targets.setdefault(name, [])
+            if pid not in bucket:
+                bucket.append(pid)
+    return targets
+
+
+def find_duplicate_pending_skills(
+    target_names: Sequence[str],
+    *,
+    subsystem: str = SKILLS,
+) -> dict[str, list[str]]:
+    """Return ``{target_name: pending_ids}`` for requested targets already pending."""
+    cleaned = [str(n).strip() for n in target_names if str(n or "").strip()]
+    if not cleaned:
+        return {}
+    existing = pending_skill_targets(subsystem)
+    out: dict[str, list[str]] = {}
+    for name in dict.fromkeys(cleaned):
+        if name in existing:
+            out[name] = list(existing[name])
+    return out
 
 
 # --- Write origin ---

@@ -320,11 +320,13 @@ def _normalize_string_set(values) -> set[str]:
 # config identity -> resolved external dirs. Called once per skill during
 # banner / tool-registry scans; re-resolving each time dominated cold-start.
 _EXTERNAL_DIRS_CACHE: dict[tuple[str, int, int, int, int], list[Path]] = {}
+_READ_ONLY_DIRS_CACHE: dict[tuple[str, int, int, int, int], list[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
     _EXTERNAL_DIRS_CACHE.clear()
+    _READ_ONLY_DIRS_CACHE.clear()
     _raw_config_cache_clear()
 
 
@@ -364,6 +366,36 @@ def get_external_skills_dirs() -> list[Path]:
             logger.debug("External skills dir does not exist, skipping: %s", p)
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    return result
+
+
+def get_read_only_skills_dirs() -> list[Path]:
+    """Validated, deduplicated ``skills.read_only_dirs`` (existing dirs only). Entries
+    are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped."""
+    from hermes_cli.config_backend import config_exists
+    config_path = get_config_path()
+    cache_key = _config_cache_key(config_path) if config_exists(config_path) else None
+    cached = _READ_ONLY_DIRS_CACHE.get(cache_key) if cache_key is not None else None
+    if cached is not None:
+        return list(cached)
+    skills_cfg = _skills_cfg()
+    if skills_cfg is None:
+        return []
+    local_skills = get_skills_dir().resolve()
+    result: list[Path] = []
+    for entry in parse_config_string_list(skills_cfg.get("read_only_dirs")):
+        cleaned = entry.strip()
+        if not cleaned:
+            continue
+        p = _home_relative(_expand_path(cleaned)).resolve()
+        if p == local_skills or p in result:
+            continue
+        if p.is_dir():
+            result.append(p)
+        else:
+            logger.debug("Read-only skills dir does not exist, skipping: %s", p)
+    if cache_key is not None:
+        _READ_ONLY_DIRS_CACHE[cache_key] = list(result)
     return result
 
 
@@ -773,6 +805,15 @@ def is_external_skill_path(path) -> bool:
         roots.extend(get_project_skills_dirs())
     except Exception:
         pass
+    return any(candidate.is_relative_to(_resolve_for_skill_ownership(root)) for root in roots)
+
+
+def is_read_only_skill_path(path) -> bool:
+    """True when ``path`` resolves under ``skills.read_only_dirs``."""
+    roots = get_read_only_skills_dirs()
+    if not roots:
+        return False
+    candidate = _resolve_for_skill_ownership(path)
     return any(candidate.is_relative_to(_resolve_for_skill_ownership(root)) for root in roots)
 
 
