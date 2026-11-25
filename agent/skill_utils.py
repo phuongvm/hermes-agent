@@ -674,7 +674,7 @@ def get_untrusted_project_skills_root() -> Optional[tuple[Path, int]]:
 # high-confidence findings only. The scan cache lives under HERMES_HOME, never inside the repo (we don't
 # write artifacts into the user's checkout).
 _PROJECT_SCAN_SOURCE = "project-local"
-_PROJECT_QUARANTINE_CACHE: dict[str, bool] = {}  # skill_dir -> quarantined
+_PROJECT_QUARANTINE_CACHE: dict[str, tuple[str, str, bool]] = {}  # skill_dir -> (stat_sig, scanner_ver, quarantined)
 
 
 def is_quarantined_project_skill(skill_md) -> bool:
@@ -686,21 +686,26 @@ def is_quarantined_project_skill(skill_md) -> bool:
         key = str(skill_dir.resolve())
     except OSError:
         key = str(skill_dir)
-    if key in _PROJECT_QUARANTINE_CACHE:
-        return _PROJECT_QUARANTINE_CACHE[key]
     try:
-        from tools.skills_guard import scan_skill_cached
+        from tools.skills_guard import SCANNER_VERSION, _skill_dir_stat_signature, scan_skill_cached
         from hermes_constants import get_hermes_home
+        stat_sig = _skill_dir_stat_signature(skill_dir)
+        cached = _PROJECT_QUARANTINE_CACHE.get(key)
+        if stat_sig is not None and isinstance(cached, tuple) and len(cached) == 3:
+            cached_sig, cached_ver, cached_quarantined = cached
+            if cached_sig == stat_sig and cached_ver == SCANNER_VERSION:
+                return cached_quarantined
         cache_dir = get_hermes_home() / "cache" / "project_skill_scans"
         result, _prov = scan_skill_cached(skill_dir, source=_PROJECT_SCAN_SOURCE, cache_dir=cache_dir)
         quarantined = result.verdict == "dangerous"
         if quarantined:
             logger.warning("Project skill quarantined (verdict=dangerous): %s — %s", skill_dir, result.summary)
+        if stat_sig is not None:
+            _PROJECT_QUARANTINE_CACHE[key] = (stat_sig, SCANNER_VERSION, quarantined)
+        return quarantined
     except Exception:
         logger.warning("Project skill scan failed — quarantining (fail closed): %s", skill_dir, exc_info=True)
-        quarantined = True
-    _PROJECT_QUARANTINE_CACHE[key] = quarantined
-    return quarantined
+        return True
 
 
 def iter_project_skill_files(project_dir: Path):

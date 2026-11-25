@@ -289,20 +289,29 @@ def _find_skill_path(name: str) -> Optional[Path]:
     return found["path"] if found else None
 
 
+def _staged_base_status(
+    name: str, target_label: str, staged: Optional[dict[str, dict[str, str]]]
+) -> tuple[str, bool, bool]:
+    """Return ``(content, skill_found, file_found)`` from batch staged state or on-disk skill."""
+    files = (staged or {}).get(name)
+    in_staged = files is not None
+    if files and target_label in files:
+        return files[target_label], True, True
+    skill_dir = _find_skill_path(name) if name else None
+    if not skill_dir:
+        return "", in_staged, False
+    with suppress(Exception):
+        p = skill_dir / target_label
+        if p.is_file():
+            return p.read_text(encoding="utf-8-sig"), True, True
+    return "", True, False
+
+
 def _staged_base(name: str, target_label: str, staged: Optional[dict[str, dict[str, str]]]) -> str:
     """What an op diffs against: the content earlier ops of the same batch left in this file,
     else the on-disk copy (empty for a file that does not exist yet)."""
-    files = (staged or {}).get(name)
-    if files and target_label in files:
-        return files[target_label]
-    skill_dir = _find_skill_path(name)
-    if not skill_dir:
-        return ""
-    with suppress(Exception):
-        p = skill_dir / target_label
-        if p.exists():
-            return p.read_text(encoding="utf-8-sig")
-    return ""
+    content, _skill_found, _file_found = _staged_base_status(name, target_label, staged)
+    return content
 
 
 def skill_pending_diff(
@@ -320,26 +329,34 @@ def skill_pending_diff(
         return _batch_pending_diff(payload)
     if action == "create":
         return payload.get("content") or ""
+    if action in {"remove_file", "delete"}:
+        _, skill_found, _ = _staged_base_status(name, "SKILL.md", staged)
+        if not skill_found:
+            return f"(No matching canonical target for skill '{name}' — cannot compute {action} diff)"
+        return {
+            "remove_file": f"remove file: {payload.get('file_path')} from skill '{name}'",
+            "delete": f"delete skill '{name}'",
+        }[action]
     if action not in {"edit", "patch", "write_file"}:
-        return {"remove_file": f"remove file: {payload.get('file_path')} from skill '{name}'",
-                "delete": f"delete skill '{name}'"}.get(action, f"({action} on '{name}')")
+        return f"({action} on '{name}')"
 
     # patch/write_file target a file inside the skill; edit always targets SKILL.md.
     target_label = "SKILL.md" if action == "edit" else (payload.get("file_path") or "SKILL.md")
-    current = _staged_base(name, target_label, staged)
+    current, skill_found, file_found = _staged_base_status(name, target_label, staged)
+    if not skill_found:
+        return f"(No matching canonical target for skill '{name}' — cannot compute {action} diff)"
 
     if action == "patch":
         old_s, new_s = payload.get("old_string") or "", payload.get("new_string") or ""
-        if not current:
-            new = f"(patch {old_s!r} → {new_s!r})"
-        else:
-            # Fold through the same matcher approve will run, so the preview can't
-            # fabricate a result the approve path would reject (repeated anchor without
-            # replace_all, whitespace-only anchor, escape drift, old_string == new_string).
-            folded, patch_err = _fold_patch(current, old_s, new_s, payload.get("replace_all"))
-            if patch_err:
-                return f"(patch would fail: {patch_err})"
-            new = folded
+        if not file_found:
+            return f"(patch would fail: target file '{target_label}' does not exist in skill '{name}')"
+        # Fold through the same matcher approve will run, so the preview can't
+        # fabricate a result the approve path would reject (repeated anchor without
+        # replace_all, whitespace-only anchor, escape drift, old_string == new_string).
+        folded, patch_err = _fold_patch(current, old_s, new_s, payload.get("replace_all"))
+        if patch_err:
+            return f"(patch would fail: {patch_err})"
+        new = folded
     else:
         new = payload.get("content" if action == "edit" else "file_content") or ""
     diff = difflib.unified_diff(current.splitlines(keepends=True), new.splitlines(keepends=True),

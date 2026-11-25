@@ -430,3 +430,93 @@ def test_staged_hint_keeps_command_for_chat_gateway_platform(hermes_home, monkey
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     r = _stage_one_memory_write()
     assert "/memory pending" in r["message"], r["message"]
+
+
+# ---------------------------------------------------------------------------
+# C1.3 — Explicit missing canonical target diagnostic in skill_pending_diff
+# ---------------------------------------------------------------------------
+
+
+def test_skill_pending_diff_reports_no_matching_canonical_target_for_orphaned_mutations(hermes_home, monkeypatch):
+    from pathlib import Path
+    from tools import write_approval as wa
+
+    skills_root = Path(hermes_home) / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_root)
+    monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_root])
+
+    for action, extra in (
+        ("patch", {"old_string": "old", "new_string": "new"}),
+        ("edit", {"content": "---\nname: ghost\ndescription: d\n---\nbody\n"}),
+        ("write_file", {"file_path": "references/guide.md", "file_content": "hello\n"}),
+        ("remove_file", {"file_path": "references/guide.md"}),
+        ("delete", {}),
+    ):
+        out = wa.skill_pending_diff({"payload": {"action": action, "name": "ghost-skill", **extra}})
+        assert "No matching canonical target" in out, (action, out)
+        assert "ghost-skill" in out, (action, out)
+        assert "(patch 'old'" not in out
+
+
+def test_skill_pending_diff_preserves_create_batch_and_existing_skill_supporting_files(hermes_home, monkeypatch):
+    from pathlib import Path
+    from tools import write_approval as wa
+
+    skills_root = Path(hermes_home) / "skills"
+    existing = skills_root / "existing-skill"
+    existing.mkdir(parents=True, exist_ok=True)
+    (existing / "SKILL.md").write_text(
+        "---\nname: existing-skill\ndescription: Demo\n---\n# Existing\nStep A.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_root)
+    monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_root])
+
+    # 1. Standalone create and in-batch create -> patch/write_file still render real diffs
+    created_body = "---\nname: brand-new\ndescription: New\n---\n# New\nLine 1.\n"
+    assert wa.skill_pending_diff({"payload": {"action": "create", "name": "brand-new", "content": created_body}}) == created_body
+
+    batch_out = wa.skill_pending_diff(
+        {
+            "payload": {
+                "action": "batch",
+                "operations": [
+                    {"action": "create", "name": "brand-new", "content": created_body},
+                    {"action": "patch", "name": "brand-new", "old_string": "Line 1.", "new_string": "Line 2."},
+                ],
+            }
+        }
+    )
+    assert "No matching canonical target" not in batch_out
+    assert "-Line 1." in batch_out and "+Line 2." in batch_out
+
+    # 2. write_file adding a brand-new supporting file to an existing skill diffs cleanly against ""
+    wf_out = wa.skill_pending_diff(
+        {
+            "payload": {
+                "action": "write_file",
+                "name": "existing-skill",
+                "file_path": "references/guide.md",
+                "file_content": "# Guide\nNew doc.\n",
+            }
+        }
+    )
+    assert "No matching canonical target" not in wf_out
+    assert "+# Guide" in wf_out
+
+    # 3. patch against a missing supporting file inside an existing skill reports explicit missing-file failure
+    missing_file_patch = wa.skill_pending_diff(
+        {
+            "payload": {
+                "action": "patch",
+                "name": "existing-skill",
+                "file_path": "references/missing.md",
+                "old_string": "x",
+                "new_string": "y",
+            }
+        }
+    )
+    assert "(patch would fail:" in missing_file_patch
+    assert "references/missing.md" in missing_file_patch
+    assert "(patch 'x'" not in missing_file_patch

@@ -272,6 +272,7 @@ def query_runtime_control(home: Path, request: bytes, timeout: float) -> bytes:
     deadline = time.monotonic() + timeout
     name = windows_pipe_name(home)
     _remaining_ms(deadline)
+    busy_spins = 0
     while True:
         try:
             # SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION: the server may read (never act as)
@@ -286,12 +287,24 @@ def query_runtime_control(home: Path, request: bytes, timeout: float) -> bytes:
                 raise PermissionError('runtime control pipe inaccessible') from None
             if exc.winerror != 231:
                 raise
+            wait_started = time.monotonic()
             try:
                 win.WaitNamedPipe(name, _remaining_ms(deadline))
             except OSError as wait_error:
                 if wait_error.winerror == 121:
                     raise TimeoutError('runtime control deadline exceeded') from None
-                raise
+                if wait_error.winerror != 231:
+                    raise
+            if time.monotonic() - wait_started < 0.005:
+                busy_spins += 1
+                if busy_spins > 8:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('runtime control deadline exceeded') from None
+                time.sleep(min(0.02, remaining * 0.5))
+            else:
+                busy_spins = 0
     try:
         _peer_subject(handle, server=True)
         _write(handle, request.rstrip(b'\n') + b'\n', deadline)

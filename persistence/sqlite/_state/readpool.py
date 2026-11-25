@@ -32,7 +32,45 @@ logger = logging.getLogger("hermes_state")
 # number of short retries makes the open succeed instead of 500-ing the whole /api/sessions poll (or any
 # other read-only opener). Deliberately NOT attempted on writable opens: a writer owns the transition, so an
 # IOERR there means a real storage/fd problem.
-_READ_POOL_MAX = 8
+_READ_POOL_MAX_ENV = "HERMES_SQLITE_READ_POOL_MAX"
+_READ_POOL_PROCESS_MAX_ENV = "HERMES_SQLITE_READ_POOL_PROCESS_MAX"
+_DEFAULT_READ_POOL_MAX = 16
+_DEFAULT_READ_POOL_PROCESS_MAX = 48
+
+
+def _resolve_read_pool_max() -> int:
+    raw = os.environ.get(_READ_POOL_MAX_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_READ_POOL_MAX
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to default %d",
+            _READ_POOL_MAX_ENV, raw, _DEFAULT_READ_POOL_MAX,
+        )
+        return _DEFAULT_READ_POOL_MAX
+    return max(1, min(64, value))
+
+
+def _resolve_read_pool_process_max(per_file_max: Optional[int] = None) -> int:
+    floor = max(1, _resolve_read_pool_max() if per_file_max is None else int(per_file_max))
+    raw = os.environ.get(_READ_POOL_PROCESS_MAX_ENV)
+    if raw is None or not raw.strip():
+        return max(floor, min(256, _DEFAULT_READ_POOL_PROCESS_MAX))
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        fallback = max(floor, min(256, _DEFAULT_READ_POOL_PROCESS_MAX))
+        logger.warning(
+            "Invalid %s=%r; falling back to default %d",
+            _READ_POOL_PROCESS_MAX_ENV, raw, fallback,
+        )
+        return fallback
+    return max(floor, min(256, value))
+
+
+_READ_POOL_MAX = _resolve_read_pool_max()
 
 # Ceiling ALIVE in this PROCESS across every state.db (a multiplexed gateway
 # opens one per profile); three profiles' worth, then readers degrade likewise.
@@ -41,7 +79,7 @@ _READ_POOL_MAX = 8
 # the same shape as the per-instance bug, one level out (#98573). Past it, readers on the (N+1)th file
 # degrade to their writer connection instead of opening descriptors, which is the same trade _READ_POOL_MAX
 # makes and for the same reason: a slow read path is recoverable, a process-wide EMFILE is not.
-_READ_POOL_PROCESS_MAX = 24
+_READ_POOL_PROCESS_MAX = _resolve_read_pool_process_max(_READ_POOL_MAX)
 
 # Warn past this many store holders on one file in one process (diagnostic:
 # writer connections cannot be rationed the way read connections can).
@@ -60,6 +98,17 @@ _FD_HEADROOM_RESERVE = 64
 _FD_USAGE_CACHE_SECONDS = 0.25
 
 _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
+
+
+def _reconfigure_read_pool_limits() -> tuple[int, int]:
+    """Re-evaluate per-file and process read-pool limits from environment variables."""
+    global _READ_POOL_MAX, _READ_POOL_PROCESS_MAX, _process_read_permits
+    per_file = _resolve_read_pool_max()
+    proc_max = _resolve_read_pool_process_max(per_file)
+    _READ_POOL_MAX = per_file
+    _READ_POOL_PROCESS_MAX = proc_max
+    _process_read_permits = threading.BoundedSemaphore(proc_max)
+    return per_file, proc_max
 
 # Read opens refused for low descriptor headroom — the only visible signal the
 # guard fires. Guarded by _read_budgets_lock.
@@ -149,8 +198,9 @@ class _PathReadBudget:
     (#98573: EMFILE in a healthy process).
     """
 
-    def __init__(self) -> None:
-        self.permits = threading.BoundedSemaphore(_READ_POOL_MAX)
+    def __init__(self, max_permits: Optional[int] = None) -> None:
+        self.max_permits = max(1, int(_READ_POOL_MAX if max_permits is None else max_permits))
+        self.permits = threading.BoundedSemaphore(self.max_permits)
         self._lock = threading.Lock()
         # Weak: a holder dropped without close() must not pin peers' budget.
         self._members: weakref.WeakSet[StoreHolder] = weakref.WeakSet()
@@ -186,7 +236,7 @@ class _PathReadBudget:
                 "its own writer connection (read connections are capped at %d "
                 "for the file). A long-lived process should share one handle per path. "
                 "Created at: %s",
-                handles, db.db_path, _READ_POOL_MAX, creation_sites,
+                handles, db.db_path, self.max_permits, creation_sites,
             )
 
     def unregister(self, db: "StoreHolder") -> None:
@@ -278,11 +328,14 @@ def note_read_pool_exhausted(db_path) -> None:
             return
         _pool_exhaustion_warned_at[key] = now
         suppressed = _pool_exhaustion_suppressed.pop(key, 0)
+    with _read_budgets_lock:
+        budget = _read_budgets.get(_read_budget_key(db_path))
+    capacity = budget.max_permits if budget is not None else _READ_POOL_MAX
     logger.warning(
         "read pool at capacity (%d) for %s; serving this read from the locked writer connection, so it waits "
         "behind every in-flight write%s. Sustained, this means long writes or slow storage (a network "
         "filesystem) are holding readers too. Logged at most once per %.0fs per database.",
-        _READ_POOL_MAX, db_path,
+        capacity, db_path,
         f" ({suppressed} more reads since the last warning)" if last is not None else "",
         _POOL_EXHAUSTION_WARN_INTERVAL_S,
     )

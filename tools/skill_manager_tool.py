@@ -248,32 +248,123 @@ def _read_frontmatter_name(skill_md: Path) -> Optional[str]:
     return None
 
 
+def _normalize_categorized_skill_name(name: str) -> Optional[str]:
+    """Return normalized POSIX relative skill path when safe, else ``None``."""
+    from tools.path_security import has_traversal_component, has_unsafe_path_chars
+
+    if not isinstance(name, str) or not name.strip() or has_unsafe_path_chars(name):
+        return None
+    raw_posix = name.replace("\\", "/")
+    if (
+        has_traversal_component(name)
+        or has_traversal_component(raw_posix)
+        or Path(name).is_absolute()
+        or raw_posix.startswith("/")
+        or ":" in raw_posix.split("/")[0]
+    ):
+        return None
+    parts = [part for part in raw_posix.strip("/").split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _categorized_roots_with_tiers() -> list[tuple[int, Path]]:
+    from agent.skill_utils import (
+        TIER_CREATE_DIR,
+        TIER_EXTERNAL,
+        TIER_LOCAL,
+        get_all_skills_dirs,
+        get_skill_create_dir,
+    )
+
+    local_dir = _skills_dir()
+    try:
+        local_resolved = local_dir.resolve()
+    except OSError:
+        local_resolved = local_dir
+    create_dir = None
+    with suppress(Exception):
+        create_dir = get_skill_create_dir()
+    tagged: list[tuple[int, Path]] = []
+    for root in get_all_skills_dirs():
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            root_resolved = root
+        if root == local_dir or root_resolved == local_resolved:
+            tier = TIER_LOCAL
+        elif create_dir is not None and (root == create_dir or root_resolved == create_dir):
+            tier = TIER_CREATE_DIR
+        else:
+            tier = TIER_EXTERNAL
+        tagged.append((tier, root))
+    return tagged
+
+
+def _categorized_skill_candidates(name: str) -> list[tuple[int, Path, Path]]:
+    """Return ``(tier, skills_dir, skill_dir)`` matches for a categorized skill identifier."""
+    normalized = _normalize_categorized_skill_name(name)
+    if not normalized:
+        return []
+    matches: list[tuple[int, Path, Path]] = []
+    for tier, skills_dir in _categorized_roots_with_tiers():
+        if not skills_dir.exists():
+            continue
+        try:
+            root_resolved = skills_dir.resolve()
+        except OSError:
+            root_resolved = skills_dir
+        for skill_dir in _iter_skill_dirs(skills_dir):
+            lexical_hit = False
+            with suppress(ValueError, OSError):
+                lexical_hit = skill_dir.relative_to(skills_dir).as_posix() == normalized
+            resolved_hit = False
+            if not lexical_hit:
+                with suppress(ValueError, OSError):
+                    resolved_dir = skill_dir.resolve()
+                    resolved_hit = (
+                        resolved_dir.is_relative_to(root_resolved)
+                        and resolved_dir.relative_to(root_resolved).as_posix() == normalized
+                    )
+            if lexical_hit or resolved_hit:
+                matches.append((tier, skills_dir, skill_dir))
+    return matches
+
+
 def _find_skill(name: str) -> Optional[dict[str, Any]]:
-    """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
+    """Find a skill (local > create_dir > external_dirs) -> ``{"path": Path}`` | None.
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
-    categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
-    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs).
+    categorized relative path (``mlops/axolotl``) across every configured skill root, normalizing
+    Windows backslashes and rejecting path traversal or same-tier divergent collisions.
 
     As a last resort the frontmatter ``name:`` is matched too, so the name ``skills list``
     and the dashboard display (frontmatter name wins over the directory name there)
     resolves everywhere instead of failing with a misleading "not found in active
-    profile" error when the two names diverge. Directory-name matches keep priority —
-    a frontmatter match is only considered after the whole scan found no
-    directory/categorized match, so one skill's frontmatter cannot shadow another
-    skill's directory. A display name held by two or more distinct skills resolves to
-    nothing: like skill_view's same-tier collision refusal, refusing to guess beats
-    silently mutating the wrong skill; the directory name still resolves."""
-    from agent.skill_utils import get_all_skills_dirs
-    local_root = None
+    profile" error when the two names diverge."""
+    from agent.skill_utils import get_all_skills_dirs, provably_same_skill
+    from tools.path_security import has_traversal_component
+
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if has_traversal_component(name) or has_traversal_component(name.replace("\\", "/")) or Path(name).is_absolute():
+        return None
     if "/" in name or "\\" in name:
-        try:
-            local_root = _skills_dir().resolve()
-        except OSError:
-            logger.debug(
-                "skills dir resolve failed; categorized lookups fall back to the unresolved path",
-                exc_info=True)
-            local_root = _skills_dir()
+        candidates = _categorized_skill_candidates(name)
+        if not candidates:
+            return None
+        top_tier = min(tier for tier, _root, _dir in candidates)
+        winners = [skill_dir for tier, _root, skill_dir in candidates if tier == top_tier]
+        if len(winners) == 1 or provably_same_skill([d / "SKILL.md" for d in winners]):
+            return {"path": winners[0]}
+        logger.warning(
+            "Ambiguous categorized skill '%s' across same-tier roots (%s) — refusing to guess",
+            name,
+            "; ".join(str(p) for p in winners),
+        )
+        return None
+
     display_matches: list[Path] = []
     seen_display: set = set()
     for skills_dir in get_all_skills_dirs():
@@ -282,11 +373,6 @@ def _find_skill(name: str) -> Optional[dict[str, Any]]:
         for skill_dir in _iter_skill_dirs(skills_dir):
             if skill_dir.name == name:
                 return {"path": skill_dir}
-            if local_root is not None:
-                resolved = skill_dir.resolve()
-                if (resolved.is_relative_to(local_root)
-                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
-                    return {"path": skill_dir}
             if _read_frontmatter_name(skill_dir / "SKILL.md") == name:
                 key = skill_dir / "SKILL.md"
                 with suppress(Exception):

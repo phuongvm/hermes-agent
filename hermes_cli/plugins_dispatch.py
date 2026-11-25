@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import functools
 import inspect
 import logging
 import queue
@@ -209,6 +210,14 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     return hook_name in _HOOK_TIMEOUT_BOUNDED_HOOKS or hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
 
 
+def _fmt_hook_seconds(seconds: float) -> str:
+    """Render hook timeout/elapsed durations cleanly (``%.1fs`` for >=0.1s, sub-100ms preserved)."""
+    value = max(0.0, float(seconds))
+    if value == 0.0 or value >= 0.1:
+        return f"{value:.1f}s"
+    return f"{value:.3g}s"
+
+
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
 
 
@@ -247,6 +256,22 @@ def resolve_plugin_command_result(result: Any) -> Any:
 
 
 class PluginDispatchMixin:
+    def _hook_callback_meta(self, cb: Callable) -> tuple[str, str, str]:
+        """Return ``(callback_name, plugin_owner, callback_module)`` without mutating *cb*."""
+        target = cb.func if isinstance(cb, functools.partial) else cb
+        callback_name = getattr(cb, "__name__", None) or getattr(target, "__name__", None) or repr(cb)
+        owners = getattr(self, "_hook_callback_owners", None) or {}
+        owner = owners.get(id(cb))
+        if not owner:
+            owner = (
+                getattr(cb, "_hermes_plugin_name", None)
+                or getattr(target, "_hermes_plugin_name", None)
+                or getattr(cb, "__module__", None)
+                or "unknown"
+            )
+        module = getattr(target, "__module__", None) or getattr(cb, "__module__", None) or "unknown"
+        return str(callback_name), str(owner), str(module)
+
     @staticmethod
     def _hook_callback_kwargs(callback: Callable, payload: dict[str, Any]) -> dict[str, Any]:
         """The slice of *payload* a callback accepts: everything for ``**kwargs`` (or
@@ -355,7 +380,7 @@ class PluginDispatchMixin:
         suppressed, still running for this call id, over the abandoned-worker cap, timed out
         (worker abandoned, never joined), or the worker could not be started. Exceptions
         propagate."""
-        callback_name = getattr(cb, "__name__", repr(cb))
+        callback_name, plugin_owner, callback_module = self._hook_callback_meta(cb)
         # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
         # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
         suppression_key = (hook_name, id(cb))
@@ -366,8 +391,9 @@ class PluginDispatchMixin:
             if (gate_key in self._hook_running_callbacks
                     or (suppressed_until is not None and suppressed_until > time.monotonic())):
                 logger.warning(
-                    "Hook '%s' callback %s skipped after previous "
-                    "timeout or while still running", hook_name, callback_name)
+                    "Hook '%s' callback %s (plugin=%s, module=%s) skipped after previous "
+                    "timeout or while still running",
+                    hook_name, callback_name, plugin_owner, callback_module)
                 return _HOOK_SKIPPED
             # Workers abandoned on timeout still hold threads. Once the suppression window has
             # passed, a fresh call id may start a new worker (a hung guard must not fail every
@@ -378,9 +404,9 @@ class PluginDispatchMixin:
             abandoned = self._hook_abandoned.get(suppression_key)
             if abandoned and len(abandoned) >= _HOOK_MAX_ABANDONED_WORKERS:
                 logger.warning(
-                    "Hook '%s' callback %s (%s) skipped: %d abandoned worker(s) still running — "
+                    "Hook '%s' callback %s (plugin=%s, module=%s) skipped: %d abandoned worker(s) still running — "
                     "the plugin is hung; fix or disable it (retried when a worker finishes)",
-                    hook_name, callback_name, getattr(cb, "__module__", "unknown plugin"), len(abandoned))
+                    hook_name, callback_name, plugin_owner, callback_module, len(abandoned))
                 return _HOOK_SKIPPED
             if suppressed_until is not None:
                 self._hook_timeout_suppressed_until.pop(suppression_key, None)
@@ -411,26 +437,31 @@ class PluginDispatchMixin:
                 done.set()
 
         thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
+        started_at = time.monotonic()
         try:
             thread.start()
         except RuntimeError as exc:
             _release_token()  # the runner's finally never runs when OS thread creation fails
             logger.warning(
-                "Hook '%s' callback %s worker failed to start: %s — skipping",
-                hook_name, callback_name, exc)
+                "Hook '%s' callback %s (plugin=%s, module=%s) worker failed to start: %s — skipping",
+                hook_name, callback_name, plugin_owner, callback_module, exc)
             return _HOOK_SKIPPED
         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
+            now = time.monotonic()
+            elapsed = max(0.0, now - started_at)
             with self._hook_timeout_lock:
                 # See #6622.
                 self._hook_timeout_suppressed_until[suppression_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
+                    now + self._hook_timeout_suppression_seconds)
                 # The worker may have finished (and released its token) between the wait
                 # expiring and this lock; recording it as abandoned then would block the
                 # callback for that call id until reload with no thread behind it.
                 if self._hook_running_callbacks.get(gate_key) is token:
                     self._hook_abandoned.setdefault(suppression_key, set()).add(gate_key)
             logger.warning(
-                "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
+                "Hook '%s' callback %s (plugin=%s, module=%s) timed out after %s (elapsed=%s) — skipping",
+                hook_name, callback_name, plugin_owner, callback_module,
+                _fmt_hook_seconds(timeout), _fmt_hook_seconds(elapsed))
             return _HOOK_SKIPPED
         if "exc" in failure:
             raise failure["exc"]
@@ -630,7 +661,8 @@ class PluginDispatchMixin:
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []):
-            callback_name = getattr(cb, "__name__", repr(cb))
+            callback_name, plugin_owner, callback_module = self._hook_callback_meta(cb)
+            started_at = time.monotonic()
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))
                 if inspect.isawaitable(ret):
@@ -638,7 +670,11 @@ class PluginDispatchMixin:
                 if ret is not None:
                     results.append(ret)
             except TimeoutError:
-                logger.warning("Hook '%s' callback %s timed out after %.0fs", hook_name, callback_name, timeout)
+                elapsed = max(0.0, time.monotonic() - started_at)
+                logger.warning(
+                    "Hook '%s' callback %s (plugin=%s, module=%s) timed out after %s (elapsed=%s)",
+                    hook_name, callback_name, plugin_owner, callback_module,
+                    _fmt_hook_seconds(timeout), _fmt_hook_seconds(elapsed))
                 if fail_closed:  # policy hook: fail closed with a block directive
                     results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
             except (Exception, SystemExit) as exc:

@@ -16,6 +16,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import socket
 import stat
@@ -37,7 +38,28 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 # Single-line JSON in/out; bounded so a misbehaving peer can't balloon memory.
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
-_DEFAULT_CLIENT_TIMEOUT = 2.0
+_CONTROL_PIPE_TIMEOUT_ENV = "HERMES_CONTROL_PIPE_TIMEOUT"
+
+
+def _resolve_default_client_timeout(*, is_windows: Optional[bool] = None) -> float:
+    """Resolve platform default client timeout (5.0s Windows, 2.0s POSIX; env clamped to 1.0..30.0s)."""
+    win = _IS_WINDOWS if is_windows is None else bool(is_windows)
+    default = 5.0 if win else 2.0
+    raw = os.environ.get(_CONTROL_PIPE_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to default %.1fs", _CONTROL_PIPE_TIMEOUT_ENV, raw, default)
+        return default
+    if not math.isfinite(value):
+        logger.warning("Non-finite %s=%r; falling back to default %.1fs", _CONTROL_PIPE_TIMEOUT_ENV, raw, default)
+        return default
+    return min(30.0, max(1.0, value))
+
+
+_DEFAULT_CLIENT_TIMEOUT = _resolve_default_client_timeout()
 # What a filesystem that cannot host an AF_UNIX node answers: a Docker Desktop (virtiofs) bind mount
 # refuses the socket, and an inode a previous container left there can be neither stat'ed nor
 # removed from inside (#123761). Not EADDRINUSE: a live sibling must keep failing loudly.
@@ -474,17 +496,18 @@ class _PipeControlProtocol(asyncio.Protocol):
 
 
 def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,
-                          timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
+                          timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale
     socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.
     ``params`` carries verb arguments (e.g. ``{"old": ..., "new": ...}``). Never raises."""
+    effective_timeout = _resolve_default_client_timeout() if timeout is None else timeout
     payload: dict[str, Any] = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
     if params:
         payload["params"] = params
     request = json.dumps(payload).encode("utf-8") + b"\n"
     query = _query_windows_pipe if _IS_WINDOWS else _query_unix_socket
     try:
-        raw = query(Path(home), request, timeout)
+        raw = query(Path(home), request, effective_timeout)
         response = json.loads(raw.decode("utf-8")) if raw else None
     except Exception:
         return None
@@ -533,15 +556,28 @@ def _windows_pipe_exchange(home: Path, request: bytes, timeout: float) -> Option
     # speaks the same framing (a plain open() got no answer in the live Windows pipe test).
     from gateway.runtime_bootstrap_windows import query_runtime_control
 
-    return query_runtime_control(Path(home), request, timeout)
+    deadline = time.monotonic() + timeout
+    try:
+        return query_runtime_control(Path(home), request, timeout)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 231:
+            raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.15, remaining * 0.25))
+        retry_budget = deadline - time.monotonic()
+        if retry_budget <= 0:
+            return None
+        return query_runtime_control(Path(home), request, retry_budget)
 
 
-def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
+def identify_gateway(home: Path, *, timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
     """Convenience wrapper: ``identify`` the gateway serving ``home``."""
     return query_gateway_control(home, "identify", timeout=timeout)
 
 
-def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+def pause_gateway_for_update(home: Path, *, timeout: Optional[float] = None,
                              force: bool = False) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` to restart for an update. Returns the ACK ``{"pausing",
     "already_stopping", "pid", "drain_timeout", "force", "waiting_on"}`` or None when no gateway

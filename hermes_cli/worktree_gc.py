@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -241,11 +242,63 @@ def prune_missing_registrations(repo_root: str, *, dry_run: bool = False) -> lis
     result = _git(["worktree", "prune"], cwd=repo_root, timeout=15)
     if result.returncode != 0:
         return [f"failed to prune stale registrations: {result.stderr.strip()}"]
+    invalidate_worktree_audit_cache(repo_root)
     return [f"pruned stale registration {r.path}" for r in stale]
 
 
+_AUDIT_CACHE_TTL_S = 60.0
+_AUDIT_CACHE_MAX_ENTRIES = 64
+_AUDIT_CACHE: dict[
+    tuple[str, bool, Optional[float]],
+    tuple[float, int, int, tuple[str, ...], tuple[TreeRecord, ...]],
+] = {}
+_AUDIT_CACHE_LOCK = threading.Lock()
+
+
+def _audit_monotonic() -> float:
+    return time.monotonic()
+
+
+def _repo_cache_key(repo_root: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(str(repo_root)))
+    except OSError:
+        return os.path.normcase(str(repo_root))
+
+
+def _worktrees_dir_signature(worktrees_dir: Path) -> Optional[tuple[int, int, tuple[str, ...]]]:
+    try:
+        st = worktrees_dir.stat()
+        names = tuple(sorted(entry.name for entry in worktrees_dir.iterdir()))
+        return (st.st_mtime_ns, len(names), names)
+    except OSError:
+        return None
+
+
+def _clone_tree_records(records) -> list[TreeRecord]:
+    return [
+        TreeRecord(
+            name=r.name, path=r.path, branch=r.branch, age_days=r.age_days,
+            size_mb=r.size_mb, verdict=r.verdict, reason=r.reason, untracked=list(r.untracked),
+        )
+        for r in records
+    ]
+
+
+def invalidate_worktree_audit_cache(repo_root: Optional[str] = None) -> None:
+    """Clear cached ``audit_worktrees`` entries (for ``repo_root`` when given, else all)."""
+    with _AUDIT_CACHE_LOCK:
+        if repo_root is None:
+            _AUDIT_CACHE.clear()
+            return
+        target = _repo_cache_key(repo_root)
+        for key in [k for k in _AUDIT_CACHE if k[0] == target]:
+            _AUDIT_CACHE.pop(key, None)
+
+
 def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
-                    older_than_days: Optional[float] = None) -> list[TreeRecord]:
+                    older_than_days: Optional[float] = None,
+                    use_cache: bool = True) -> list[TreeRecord]:
     """Classify every tree under ``.worktrees/`` without mutating anything.
 
     ``older_than_days`` only ever RESTRICTS: a reapable tree younger than the threshold is kept
@@ -254,7 +307,20 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
     from hermes_cli import worktree_ops as _ops
     worktrees_dir = Path(repo_root) / ".worktrees"
     if not worktrees_dir.exists():
+        invalidate_worktree_audit_cache(repo_root)
         return []
+
+    cache_key = (_repo_cache_key(repo_root), bool(with_sizes), older_than_days)
+    dir_sig = _worktrees_dir_signature(worktrees_dir)
+    if use_cache and dir_sig is not None:
+        now_mono = _audit_monotonic()
+        with _AUDIT_CACHE_LOCK:
+            cached = _AUDIT_CACHE.get(cache_key)
+            if cached is not None:
+                cached_at, c_mtime, c_count, c_names, cached_records = cached
+                if (now_mono - cached_at) < _AUDIT_CACHE_TTL_S and (c_mtime, c_count, c_names) == dir_sig:
+                    return _clone_tree_records(cached_records)
+                _AUDIT_CACHE.pop(cache_key, None)
 
     if _ops._repo_is_shallow(repo_root):
         _ops._deepen_shallow_repo(repo_root)
@@ -286,6 +352,15 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
 
     if len(merge_cache) != cache_size_before:
         _ops._save_worktree_merge_cache(merge_cache)
+    post_sig = _worktrees_dir_signature(worktrees_dir)
+    if post_sig is not None:
+        with _AUDIT_CACHE_LOCK:
+            _AUDIT_CACHE.pop(cache_key, None)
+            _AUDIT_CACHE[cache_key] = (
+                _audit_monotonic(), post_sig[0], post_sig[1], post_sig[2], tuple(_clone_tree_records(records))
+            )
+            while len(_AUDIT_CACHE) > _AUDIT_CACHE_MAX_ENTRIES:
+                _AUDIT_CACHE.pop(next(iter(_AUDIT_CACHE)))
     return records
 
 
@@ -298,7 +373,7 @@ def reclaim_worktrees(
     """Remove every reap-verdict tree from a frozen audit list — never re-globs inside the
     destructive loop, so trees created by concurrent sessions after the audit are out of scope."""
     if records is None:
-        records = audit_worktrees(repo_root, with_sizes=False)
+        records = audit_worktrees(repo_root, with_sizes=False, use_cache=False)
     actions: list[str] = []
     for record in records:
         if record.verdict not in _REAP_VERDICTS:
@@ -335,6 +410,7 @@ def reclaim_worktrees(
     if not dry_run:
         with contextlib.suppress(Exception):
             _git(["worktree", "prune"], cwd=repo_root, timeout=15)
+        invalidate_worktree_audit_cache(repo_root)
     return actions
 
 

@@ -12,12 +12,16 @@ import codecs
 import hashlib
 import io
 import json
+import os
+import stat
+import tempfile
+import threading
 import tokenize
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from tools.skills_guard_credentials import SKILL_ONLY_PATTERNS, code_views, raise_provider_key_reads
 from tools.threat_patterns import FORGET_RULES_RAW_RE, mask_negated_forget
@@ -954,16 +958,141 @@ def content_hash(skill_path: Path) -> str:
     return f"sha256:{_content_digest(skill_path)[:16]}"
 
 
+_STAT_INDEX_FILENAME = "_stat_index.json"
+_STAT_INDEX_MAX_ENTRIES = 2048
+_stat_index_lock = threading.Lock()
+
+
+def _skill_dir_stat_signature(skill_path: Path) -> Optional[str]:
+    """Metadata-only SHA-256 over sorted ``(rel_posix, size, mtime_ns, exec_bits)`` without reading file bytes."""
+    try:
+        top_st = skill_path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(top_st.st_mode):
+        return None
+    if stat.S_ISREG(top_st.st_mode):
+        return hashlib.sha256(
+            f"file\0{top_st.st_size}\0{top_st.st_mtime_ns}\0{top_st.st_mode & 0o111}".encode("utf-8")
+        ).hexdigest()
+    if not stat.S_ISDIR(top_st.st_mode):
+        return None
+    rows: list[tuple[str, str]] = []
+    try:
+        for entry in skill_path.rglob("*"):
+            st = entry.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                rel = entry.relative_to(skill_path).as_posix()
+                try:
+                    target = os.readlink(entry)
+                except OSError:
+                    target = "<unreadable>"
+                rows.append((rel, f"L:{target}"))
+            elif stat.S_ISREG(st.st_mode):
+                rel = entry.relative_to(skill_path).as_posix()
+                rows.append((rel, f"F:{st.st_size}:{st.st_mtime_ns}:{st.st_mode & 0o111}"))
+    except OSError:
+        return None
+    rows.sort(key=lambda item: item[0])
+    h = hashlib.sha256()
+    h.update(f"count={len(rows)}\0".encode("utf-8"))
+    for rel, meta in rows:
+        h.update(f"{rel}\0{meta}\0".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _stat_index_key(skill_path: Path, source_identity: str, trust_level: str) -> str:
+    try:
+        resolved = str(skill_path.resolve())
+    except OSError:
+        resolved = str(skill_path)
+    return f"{resolved}|{source_identity}|{trust_level}|{SCANNER_VERSION}"
+
+
+def _try_stat_index_lookup(
+    cache_root: Path, index_key: str, stat_sig: str, *, source: str, source_url: str, effective_trust: str
+) -> Optional[dict]:
+    index_path = cache_root / _STAT_INDEX_FILENAME
+    with _stat_index_lock, suppress(OSError, json.JSONDecodeError, TypeError, ValueError):
+        raw_index = json.loads(index_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(raw_index, dict):
+            return None
+        entry = raw_index.get(index_key)
+        if not isinstance(entry, dict) or entry.get("stat_sig") != stat_sig:
+            return None
+        cache_name = entry.get("cache_file")
+        if not isinstance(cache_name, str) or not cache_name or "/" in cache_name or "\\" in cache_name:
+            return None
+        cached = json.loads((cache_root / cache_name).read_text(encoding="utf-8-sig"))
+        if not isinstance(cached, dict):
+            return None
+        expected_meta = {
+            "scanner_version": SCANNER_VERSION,
+            "source": source,
+            "source_url": source_url,
+            "trust_level": effective_trust,
+        }
+        if not all(cached.get(k) == v for k, v in expected_meta.items()):
+            return None
+        bundle_hash = cached.get("bundle_hash")
+        if not (isinstance(bundle_hash, str) and bundle_hash.startswith("sha256:")) or cached.get("verdict") not in VERDICT_INDEX:
+            return None
+        return cached
+    return None
+
+
+def _record_stat_index_entry(cache_root: Path, index_key: str, stat_sig: str, cache_filename: str) -> None:
+    index_path = cache_root / _STAT_INDEX_FILENAME
+    with _stat_index_lock, suppress(OSError):
+        cache_root.mkdir(parents=True, exist_ok=True)
+        data: dict = {}
+        with suppress(OSError, json.JSONDecodeError, TypeError, ValueError):
+            loaded = json.loads(index_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                data = loaded
+        data.pop(index_key, None)
+        data[index_key] = {"stat_sig": stat_sig, "cache_file": cache_filename}
+        while len(data) > _STAT_INDEX_MAX_ENTRIES:
+            data.pop(next(iter(data)))
+        fd, tmp_name = tempfile.mkstemp(prefix="._stat_idx_", suffix=".tmp", dir=str(cache_root))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp_name, index_path)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+
+
 def scan_skill_cached(skill_path: Path, source: str = "community", *, source_url: str = "",
                       cache_dir: Path | None = None, trust_level: str | None = None) -> tuple[ScanResult, dict]:
-    """Scan plus attestation dict; the cache (keyed by content digest + source identity) only serves exact
-    current content under the current scanner version."""
-    digest = _content_digest(skill_path)
+    """Scan plus attestation dict; the cache (keyed by content digest + source identity, with a directory
+    stat-signature fast-path) only serves exact current content under the current scanner version."""
+    effective_trust = trust_level or _resolve_trust_level(source)
     cache_root = cache_dir or skill_path.parent / ".scan-cache"
     source_identity = hashlib.sha256(f"{source}\0{source_url}".encode()).hexdigest()[:16]
+    stat_sig = _skill_dir_stat_signature(skill_path)
+    idx_key = _stat_index_key(skill_path, source_identity, effective_trust) if stat_sig is not None else ""
+
+    if stat_sig is not None:
+        fast_cached = _try_stat_index_lookup(
+            cache_root, idx_key, stat_sig, source=source, source_url=source_url, effective_trust=effective_trust
+        )
+        if fast_cached is not None:
+            result = ScanResult(
+                skill_path.name, source, fast_cached["trust_level"], fast_cached["verdict"],
+                [Finding(**item) for item in fast_cached.get("findings", [])],
+                fast_cached["scanned_at"], fast_cached.get("summary", ""),
+            )
+            provenance = {**fast_cached, "fresh": False}
+            result.scan_provenance = provenance
+            return result, provenance
+
+    digest = _content_digest(skill_path)
     cache_file = cache_root / f"{digest}-{source_identity}.json"
     expected = {"bundle_hash": f"sha256:{digest}", "scanner_version": SCANNER_VERSION, "source": source,
-                "source_url": source_url, "trust_level": trust_level or _resolve_trust_level(source)}
+                "source_url": source_url, "trust_level": effective_trust}
     cached = None
     with suppress(OSError, json.JSONDecodeError):
         cached = json.loads(cache_file.read_text(encoding="utf-8-sig"))
@@ -981,6 +1110,8 @@ def scan_skill_cached(skill_path: Path, source: str = "community", *, source_url
         with suppress(OSError):
             cache_root.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    if stat_sig is not None:
+        _record_stat_index_entry(cache_root, idx_key, stat_sig, cache_file.name)
     result.scan_provenance = provenance
     return result, provenance
 

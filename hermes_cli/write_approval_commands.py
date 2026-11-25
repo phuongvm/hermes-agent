@@ -292,7 +292,15 @@ def _dispose_pending_native(
             return result
         result["replayed"] = True
         if isinstance(applier_result, dict):
-            for k in ("replaced_entry", "replaced_entries", "removed_entry", "removed_entries"):
+            for k in (
+                "replaced_entry",
+                "replaced_entries",
+                "patched_entry",
+                "patched_entry_before",
+                "patched_entries",
+                "removed_entry",
+                "removed_entries",
+            ):
                 if k in applier_result:
                     result[k] = applier_result[k]
     result["discarded"] = wa.discard_pending(subsystem, pending_id)
@@ -421,16 +429,40 @@ def _canonical_skill_identity(target: str, resolved: dict) -> str:
 
 
 def _find_canonical_skill_matches(name: str) -> list[Path]:
-    """Return every active skill directory whose basename matches ``name``.
+    """Return active canonical skill directories matching ``name`` (bare or categorized).
 
     Governance preflight uses native ``_find_skill`` resolver to match
-    disposition replay behavior.
+    disposition replay behavior, and surfaces same-tier divergent categorized
+    candidates when ``_find_skill`` refuses an ambiguous collision.
     """
-    from tools.skill_manager_tool import _find_skill
+    if not isinstance(name, str) or not name.strip():
+        return []
+    from tools.path_security import has_traversal_component
+    if has_traversal_component(name) or has_traversal_component(name.replace("\\", "/")) or Path(name).is_absolute():
+        return []
+
+    from tools.skill_manager_tool import _categorized_skill_candidates, _find_skill
 
     resolved = _find_skill(name)
     if resolved and resolved.get("path"):
         return [Path(resolved["path"]).resolve()]
+
+    if "/" in name or "\\" in name:
+        candidates = _categorized_skill_candidates(name)
+        if not candidates:
+            return []
+        top_tier = min(tier for tier, _root, _dir in candidates)
+        cat_matches: list[Path] = []
+        seen_cat: set[str] = set()
+        for tier, _root, skill_dir in candidates:
+            if tier != top_tier:
+                continue
+            path = skill_dir.resolve()
+            key = str(path)
+            if key not in seen_cat:
+                seen_cat.add(key)
+                cat_matches.append(path)
+        return cat_matches
 
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
 

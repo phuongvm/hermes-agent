@@ -24,8 +24,10 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from weakref import WeakKeyDictionary
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -775,26 +777,165 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody, profile: Optio
     return {"pull_requests": found, "scanned": wanted}
 
 
+PROFILES_CACHE_TTL_S = 15.0
+PROFILES_CACHE_MAX_STALE_S = 60.0
+PROFILES_COLD_TIMEOUT_S = 10.0
+PROFILES_REFRESH_TIMEOUT_S = 10.0
+
+
+def _profiles_monotonic() -> float:
+    return time.monotonic()
+
+
+def _profiles_cache_key() -> tuple[str, Optional[str]]:
+    from hermes_constants import get_hermes_home
+    from hermes_cli.isolated_scope import isolated_launch_profile
+
+    return (str(get_hermes_home()), isolated_launch_profile())
+
+
+def _fallback_profiles_response() -> dict[str, Any]:
+    from hermes_cli import profiles as profiles_mod
+
+    return {"profiles": scope_to_launch_profile(_fallback_profile_dicts(profiles_mod), lambda row: row.get("name"))}
+
+
 @functools.partial(coalesced_read, thread_runner=lambda func: run_in_threadpool(func), timeout=10.0)
 def _read_profiles():
     from hermes_cli import profiles as profiles_mod
-    try:
-        # Polled by the Desktop on every focus/roster tick: never walk skill trees in-request.
-        profiles = [_profile_to_dict(p) for p in profiles_mod.list_profiles(lazy_skill_count=True)]
-    except Exception:
-        _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        profiles = _fallback_profile_dicts(profiles_mod)
+
+    # Polled by the Desktop on every focus/roster tick: never walk skill trees in-request.
+    profiles = [_profile_to_dict(p) for p in profiles_mod.list_profiles(lazy_skill_count=True)]
     return {"profiles": scope_to_launch_profile(profiles, lambda row: row.get("name"))}
+
+
+@dataclass
+class _CachedProfilesEntry:
+    value: dict[str, Any]
+    ts: float
+    gen: int
+
+
+@dataclass
+class _InFlightProfilesRefresh:
+    task: asyncio.Task
+    start_gen: int
+
+
+class _ProfilesSWRCache:
+    """Singleflight SWR cache for ``GET /api/profiles`` with generation-counted invalidation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, Optional[str]], _CachedProfilesEntry] = {}
+        self._generation: int = 0
+        self._in_flight: WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[tuple[str, Optional[str]], _InFlightProfilesRefresh]
+        ] = WeakKeyDictionary()
+
+    def invalidate(self) -> int:
+        with self._lock:
+            self._generation += 1
+            self._entries.clear()
+            return self._generation
+
+    def _start_worker(
+        self, loop: asyncio.AbstractEventLoop, key: tuple[str, Optional[str]], *, soft_timeout: Optional[float]
+    ) -> _InFlightProfilesRefresh:
+        loop_map = self._in_flight.setdefault(loop, {})
+        existing = loop_map.get(key)
+        if existing is not None and not existing.task.done():
+            return existing
+        with self._lock:
+            start_gen = self._generation
+        holder_ref: list[_InFlightProfilesRefresh] = []
+
+        async def _worker() -> dict[str, Any]:
+            try:
+                coro = _read_profiles()
+                result = await (asyncio.wait_for(coro, timeout=soft_timeout) if soft_timeout is not None else coro)
+                snapshot = copy.deepcopy(result)
+                now_done = _profiles_monotonic()
+                with self._lock:
+                    if start_gen == self._generation:
+                        self._entries[key] = _CachedProfilesEntry(value=snapshot, ts=now_done, gen=start_gen)
+                return result
+            finally:
+                if holder_ref and loop_map.get(key) is holder_ref[0]:
+                    loop_map.pop(key, None)
+                    if not loop_map:
+                        self._in_flight.pop(loop, None)
+
+        task = loop.create_task(_worker())
+        holder = _InFlightProfilesRefresh(task=task, start_gen=start_gen)
+        holder_ref.append(holder)
+        loop_map[key] = holder
+        task.add_done_callback(lambda d: None if d.cancelled() else d.exception())
+        return holder
+
+    async def wait_background_idle(self, timeout: float = 2.0) -> None:
+        loop = asyncio.get_running_loop()
+        loop_map = self._in_flight.get(loop)
+        if not loop_map:
+            return
+        tasks = [h.task for h in list(loop_map.values()) if not h.task.done()]
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
+
+    async def get(self) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        key = _profiles_cache_key()
+        now = _profiles_monotonic()
+        with self._lock:
+            gen = self._generation
+            entry = self._entries.get(key)
+            if entry is not None:
+                age = now - entry.ts
+                if entry.gen != gen or age >= PROFILES_CACHE_MAX_STALE_S:
+                    self._entries.pop(key, None)
+                    entry = None
+                elif age < PROFILES_CACHE_TTL_S:
+                    return copy.deepcopy(entry.value)
+
+        if entry is not None:
+            loop_map = self._in_flight.setdefault(loop, {})
+            existing = loop_map.get(key)
+            if existing is None or existing.task.done():
+                self._start_worker(loop, key, soft_timeout=PROFILES_REFRESH_TIMEOUT_S)
+            return copy.deepcopy(entry.value)
+
+        deadline = time.monotonic() + PROFILES_COLD_TIMEOUT_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log.warning("GET /api/profiles timed out after 10s; falling back to profile directory scan")
+                return _fallback_profiles_response()
+            with self._lock:
+                target_gen = self._generation
+            holder = self._start_worker(loop, key, soft_timeout=None)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(holder.task), timeout=remaining)
+            except TimeoutError:
+                _log.warning("GET /api/profiles timed out after 10s; falling back to profile directory scan")
+                return _fallback_profiles_response()
+            except Exception:
+                _log.exception("GET /api/profiles failed; falling back to profile directory scan")
+                return _fallback_profiles_response()
+            if holder.start_gen == target_gen:
+                return copy.deepcopy(result)
+
+
+_PROFILES_SWR_CACHE = _ProfilesSWRCache()
+
+
+def invalidate_profiles_cache() -> int:
+    """Invalidate cached ``GET /api/profiles`` snapshots across generations."""
+    return _PROFILES_SWR_CACHE.invalidate()
 
 
 @router.get("/api/profiles")
 async def list_profiles_endpoint():
-    try:
-        return await _read_profiles()
-    except TimeoutError:
-        _log.warning("GET /api/profiles timed out after 10s; falling back to profile directory scan")
-        from hermes_cli import profiles as profiles_mod
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+    return await _PROFILES_SWR_CACHE.get()
 
 
 @router.post("/api/profiles")
@@ -824,6 +965,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         # Off the loop: creation asks a live multiplexer to serve the profile now over its control
         # socket, and on the gateway's own listener (the Webapp) that socket answers on this loop.
         result = await asyncio.to_thread(provision_profile, request)
+    invalidate_profiles_cache()
     path = result.path
 
     # Hub installs spawn async, scoped via `-p <name>` (a fresh subprocess re-binds
@@ -873,6 +1015,7 @@ async def set_active_profile_endpoint(body: ProfileActiveUpdate):
     with _profile_errors("POST /api/profiles/active failed"):
         # Stats the target, creates the state directory, writes via temp file + replace.
         await run_in_threadpool(profiles_mod.set_active_profile, body.name)
+    invalidate_profiles_cache()
     return {"ok": True, "active": profiles_mod.normalize_profile_name(body.name)}
 
 
@@ -927,6 +1070,7 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
         # Stops a running gateway (10 s poll), renames the directory, lets the profile's memory
         # provider re-key its state and regenerates the wrapper script.
         path = await run_in_threadpool(profiles_mod.rename_profile, name, body.new_name)
+    invalidate_profiles_cache()
     # For the default profile the rename lands as a presentation-only display_name; the
     # canonical id ("default") is always returned so callers keying on `name` stay correct.
     try:
@@ -954,8 +1098,10 @@ async def delete_profile_endpoint(name: str):
             # loop that parks every request past the desktop's 10 s WebSocket ready-probe.
             path = await run_in_threadpool(profiles_mod.delete_profile, name, yes=True)
     except ProfileIdentitySettlementPending as exc:
+        invalidate_profiles_cache()
         return {"ok": True, "path": str(exc.path), "identity_settled": False,
                 "settlement_pending": True, "retry_command": exc.retry_command}
+    invalidate_profiles_cache()
     return {"ok": True, "path": str(path)}
 
 
@@ -993,6 +1139,7 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
     except OSError as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
+    invalidate_profiles_cache()
     return {"ok": True}
 
 
@@ -1007,6 +1154,7 @@ async def update_profile_description_endpoint(name: str, body: ProfileDescriptio
                          not_found=(), bad_request=()):
         await run_in_threadpool(
             profiles_mod.write_profile_meta, profile_dir, description=text, description_auto=False)
+    invalidate_profiles_cache()
     return {"ok": True, "description": text, "description_auto": False}
 
 
@@ -1023,6 +1171,7 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
     with _profile_errors("PUT /api/profiles/%s/model failed", name,
                          not_found=(), bad_request=(ModelAssignmentRejected,)):
         await run_in_threadpool(_write_profile_model, profile_dir, provider, model)
+    invalidate_profiles_cache()
     return {"ok": True, "provider": provider, "model": model}
 
 
@@ -1042,6 +1191,8 @@ async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
                          not_found=(), bad_request=()):
         # A synchronous LLM round-trip with a 60 s ceiling; on the loop it stalls everything.
         outcome = await run_in_threadpool(_run)
+    if outcome.ok:
+        invalidate_profiles_cache()
     # description_auto mirrors ok: a failed sweep leaves any existing description untouched.
     return {"ok": bool(outcome.ok), "reason": outcome.reason, "description": outcome.description,
             "description_auto": bool(outcome.ok)}
@@ -1086,6 +1237,7 @@ async def import_profile_endpoint(body: ProfileImport):
                          bad_request=(ValueError, FileExistsError)):
         profile_dir = await run_in_threadpool(
             profiles_mod.import_profile, archive, name=(body.name or "").strip() or None)
+    invalidate_profiles_cache()
 
     imported = profile_dir.name
 

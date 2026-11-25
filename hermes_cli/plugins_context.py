@@ -844,6 +844,8 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
             _facade().logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                                      key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
+        if kind == "hook":
+            self._manager.__dict__.setdefault("_hook_callback_owners", {})[id(callback)] = self.manifest.name
         handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
         _facade().logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
