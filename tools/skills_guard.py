@@ -973,7 +973,7 @@ def _skill_dir_stat_signature(skill_path: Path) -> Optional[str]:
         return None
     if stat.S_ISREG(top_st.st_mode):
         return hashlib.sha256(
-            f"file\0{top_st.st_size}\0{top_st.st_mtime_ns}\0{top_st.st_mode & 0o111}".encode("utf-8")
+            f"file\0{top_st.st_size}\0{top_st.st_mtime_ns}\0{top_st.st_mode & 0o111}".encode()
         ).hexdigest()
     if not stat.S_ISDIR(top_st.st_mode):
         return None
@@ -995,9 +995,9 @@ def _skill_dir_stat_signature(skill_path: Path) -> Optional[str]:
         return None
     rows.sort(key=lambda item: item[0])
     h = hashlib.sha256()
-    h.update(f"count={len(rows)}\0".encode("utf-8"))
+    h.update(f"count={len(rows)}\0".encode())
     for rel, meta in rows:
-        h.update(f"{rel}\0{meta}\0".encode("utf-8"))
+        h.update(f"{rel}\0{meta}\0".encode())
     return h.hexdigest()
 
 

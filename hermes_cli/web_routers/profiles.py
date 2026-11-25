@@ -918,8 +918,8 @@ class _ProfilesSWRCache:
             except TimeoutError:
                 _log.warning("GET /api/profiles timed out after 10s; falling back to profile directory scan")
                 return _fallback_profiles_response()
-            except Exception:
-                _log.exception("GET /api/profiles failed; falling back to profile directory scan")
+            except Exception:  # health: allow BLE001 -- cold profile read failure degrades to directory scan fallback
+                _log.error("GET /api/profiles failed; falling back to profile directory scan", exc_info=True)
                 return _fallback_profiles_response()
             if holder.start_gen == target_gen:
                 return copy.deepcopy(result)

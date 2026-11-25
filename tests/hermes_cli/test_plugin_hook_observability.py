@@ -243,10 +243,10 @@ def test_async_hook_timeout_logs_owner_module_elapsed_and_fails_closed_for_polic
     monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1)
 
     async def slow_observer(**_kwargs):
-        await asyncio.sleep(5.0)
+        await asyncio.Event().wait()
 
     async def slow_guard(**_kwargs):
-        await asyncio.sleep(5.0)
+        await asyncio.Event().wait()
 
     slow_observer.__module__ = "hermes_plugins.nerve.async_obs"
     slow_guard.__module__ = "hermes_plugins.guard.policy"
