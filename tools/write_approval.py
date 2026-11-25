@@ -141,7 +141,7 @@ def pending_count(subsystem: str) -> int:
     return 0
 
 
-def _extract_pending_skill_names(record: dict[str, Any]) -> list[str]:
+def extract_pending_skill_names(record: dict[str, Any]) -> list[str]:
     """Ordered unique target skill names referenced by a pending skill record."""
     payload = record.get("payload")
     if not isinstance(payload, dict):
@@ -161,6 +161,9 @@ def _extract_pending_skill_names(record: dict[str, Any]) -> list[str]:
     return [default_name] if default_name else []
 
 
+_extract_pending_skill_names = extract_pending_skill_names
+
+
 def pending_skill_targets(subsystem: str = SKILLS) -> dict[str, list[str]]:
     """Map each pending target skill name to its ordered list of pending record IDs."""
     targets: dict[str, list[str]] = {}
@@ -168,7 +171,7 @@ def pending_skill_targets(subsystem: str = SKILLS) -> dict[str, list[str]]:
         pid = str(record.get("id") or "").strip()
         if not pid:
             continue
-        for name in _extract_pending_skill_names(record):
+        for name in extract_pending_skill_names(record):
             bucket = targets.setdefault(name, [])
             if pid not in bucket:
                 bucket.append(pid)

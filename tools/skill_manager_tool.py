@@ -774,7 +774,7 @@ def _run_write_gate(build_staging):
     payload, gist = build_staging(wa)
     origin = wa.current_origin()
     if origin == "background_review":
-        targets = wa._extract_pending_skill_names({"payload": payload})
+        targets = wa.extract_pending_skill_names({"payload": payload})
         dups = wa.find_duplicate_pending_skills(targets)
         if dups:
             target, ids = next(iter(dups.items()))

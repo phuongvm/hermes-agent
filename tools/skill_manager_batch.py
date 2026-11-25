@@ -220,7 +220,7 @@ def _stage_split_background_batch(operations, names, tool_error):
     """Split cross-skill background_review batches per target skill at staging time."""
     try:
         from tools import write_approval as wa
-    except Exception:
+    except ImportError:
         return None
     if wa.current_origin() != "background_review":
         return None
@@ -309,21 +309,14 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
         return err
     if not _smt._skill_gate_bypass.get():
         unique_targets = list(dict.fromkeys(names))
-        if len(unique_targets) > 1:
-            split_staged = _stage_split_background_batch(operations, names, tool_error)
-            if split_staged == "":
-                pass
-            elif split_staged is not None:
-                return split_staged
-            else:
-                def _staging(wa):
-                    acts = ", ".join(op["action"] for op in operations)
-                    gist = f"batch({len(operations)} ops: {acts}) on {', '.join(sorted(set(names)))}"
-                    return {"action": "batch", "operations": operations}, gist
-                staged = _smt._run_write_gate(_staging)
-                if staged is not None:
-                    return staged
-        else:
+        split_staged = (
+            _stage_split_background_batch(operations, names, tool_error)
+            if len(unique_targets) > 1
+            else None
+        )
+        if split_staged not in (None, ""):
+            return split_staged
+        if split_staged is None:
             def _staging(wa):
                 norm_ops = [op if op.get("name") else {**op, "name": names[i]}
                             for i, op in enumerate(operations)]
