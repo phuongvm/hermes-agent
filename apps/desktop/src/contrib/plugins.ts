@@ -13,6 +13,7 @@
  *    — the agent's/user's doors, watched + hot-reloaded by the runtime loader.
  */
 
+import { resolveBundledPackageName } from './bundled-plugin-policy'
 import { trackGatewayEventDisposers } from './events'
 import { createPluginContext, declaredCapabilities, type HermesPlugin } from './plugin'
 import { pluginActive, publishPlugin } from './plugins-store'
@@ -46,13 +47,16 @@ export function discoverBundledPlugins(): void {
     // plugin publishes a record with activate/deactivate handles, and a
     // persisted disable survives boots by skipping registration here.
     const capabilities = declaredCapabilities(plugin)
+    const packageName = resolveBundledPackageName(plugin)
+    const defaultEnabled = plugin.defaultEnabled ?? true
 
     const record = {
       id: plugin.id,
       name: plugin.name ?? plugin.id,
       description: plugin.description,
       capabilities,
-      kind: 'bundled' as const
+      kind: 'bundled' as const,
+      ...(packageName ? { packageName } : {})
     }
 
     let disposers: (() => void)[] = []
@@ -78,9 +82,9 @@ export function discoverBundledPlugins(): void {
       disposers = []
     }
 
-    publishPlugin({ ...record, status: 'disabled' }, { activate, deactivate })
+    publishPlugin({ ...record, status: 'disabled' }, { activate, deactivate }, { defaultEnabled })
 
-    if (pluginActive(plugin.id, plugin.defaultEnabled ?? true)) {
+    if (pluginActive(plugin.id, defaultEnabled)) {
       activate()
     }
   }

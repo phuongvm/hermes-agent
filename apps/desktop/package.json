@@ -30,6 +30,8 @@
     "start": "pnpm run build && electron .",
     "build:webapp": "node scripts/build-webapp.mjs",
     "build": "node scripts/build.mjs",
+    "sync:plugins": "node ../../scripts/build/sync-desktop-plugins.mjs",
+    "check:plugins": "node ../../scripts/build/sync-desktop-plugins.mjs --check",
     "i18n:keys": "node scripts/i18n-keys.mjs",
     "smoke:browser-host": "node scripts/smoke-browser-host.mjs",
     "prebuilder": "node scripts/patch-electron-builder-mac-binary.mjs",

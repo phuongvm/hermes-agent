@@ -199,6 +199,8 @@ export interface HermesPlugin {
   name?: string
   /** One-liner for the settings inventory (what the plugin adds). */
   description?: string
+  /** Unified agent+desktop package name when bundled outside the disk marker door. */
+  readonly packageName?: string
   /** Registers on load when the user hasn't chosen (default true). Set false
    *  for opt-in plugins: they inventory in Capabilities ▸ Plugins, off until the
    *  user flips the switch. */

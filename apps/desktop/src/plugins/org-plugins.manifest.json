@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    {
+      "id": "crew",
+      "packageName": "crew",
+      "sha256": "16f6163d2116cfec80e581edd734bb0ccfeaac60cca8f93b16691330f6faf6c7",
+      "syncedAtMs": 1795504104645,
+      "sourceHint": "crew/desktop/plugin.js"
+    },
+    {
+      "id": "openspec",
+      "packageName": "openspec",
+      "sha256": "9d7d4b262c0a726fcb7e8f0fc596fab0ec2377cc96da212e6339a0c29b9feb0b",
+      "syncedAtMs": 1793463183276,
+      "sourceHint": "hermes-openspec/desktop/plugin.js"
+    },
+    {
+      "id": "radar",
+      "packageName": "radar",
+      "sha256": "bbe5eeab6814824a24432aae4d226793d9ba2efbc283159db77037842b3f82ed",
+      "syncedAtMs": 1793550198735,
+      "sourceHint": "radar/desktop/plugin.js"
+    },
+    {
+      "id": "redline",
+      "packageName": "redline",
+      "sha256": "d53eab8fe9b2fe86969f322efdd73daf632994dcdf9b423992996817096e9f26",
+      "syncedAtMs": 1793461901884,
+      "sourceHint": "hermes-redline/desktop/plugin.js"
+    }
+  ]
+}

@@ -1,11 +1,16 @@
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesReadDirResult } from '@/global'
 import type * as HermesModule from '@/hermes'
 import { $previewScriptGrants, grantPreviewScript } from '@/store/plugin-preview-grants'
 
+import { bundledOrgPluginMeta } from './bundled-plugin-policy'
 import { emitGatewayEvent } from './events'
-import { $pluginRecords, publishPlugin, setPluginEnabled } from './plugins-store'
+import { $pluginDecisions, $pluginRecords, dropPlugin, publishPlugin, setPluginEnabled } from './plugins-store'
 import {
   discoverRuntimePlugins,
   loadRuntimePlugin,
@@ -539,6 +544,386 @@ describe('bundled-shadowed disk copies', () => {
       createObjectURL.mockRestore()
       revokeObjectURL.mockRestore()
       vi.stubGlobal('Blob', RealBlob)
+    }
+  })
+
+  it('linked dev checkout overrides bundled org plugin (deactivating bundled first), stays active across hot-reload, and restores bundled on retire', async () => {
+    const root = '/local/.hermes/desktop-plugins'
+    const sourceDir = '/workspace/oss/crew/desktop'
+    let desktopEntryPresent = true
+    let diskCopy = 'export default { id: "crew", name: "Crew Dev v1", register: globalThis.__crewDiskV1 }'
+
+    const bundledDeactivate = vi.fn()
+
+    const bundledActivate = vi.fn(() => {
+      publishPlugin({ id: 'crew', kind: 'bundled', name: 'Crew', packageName: 'crew', status: 'loaded' })
+    })
+
+    const diskRegisterV1 = vi.fn()
+    const diskRegisterV2 = vi.fn()
+
+    Object.assign(globalThis, { __crewDiskV1: diskRegisterV1, __crewDiskV2: diskRegisterV2 })
+    $pluginDecisions.set({})
+    publishPlugin(
+      { id: 'crew', kind: 'bundled', name: 'Crew', packageName: 'crew', status: 'loaded' },
+      { activate: bundledActivate, deactivate: bundledDeactivate },
+      { defaultEnabled: true }
+    )
+
+    desktopPluginsRoot.mockResolvedValue(root)
+    readDir.mockImplementation(async dir => {
+      if (dir === root) {
+        return { entries: desktopEntryPresent ? [{ isDirectory: true, name: 'crew', path: `${root}/crew` }] : [] }
+      }
+
+      if (dir === `${root}/crew`) {
+        return {
+          entries: [
+            { isDirectory: false, name: '.hermes-package.json', path: `${root}/crew/.hermes-package.json` },
+            { isDirectory: false, name: 'plugin.js', path: `${root}/crew/plugin.js` }
+          ]
+        }
+      }
+
+      return { entries: [] }
+    })
+    readFileText.mockImplementation(async file =>
+      file.endsWith('.hermes-package.json')
+        ? { text: JSON.stringify({ linked: true, package: 'crew', source: sourceDir, sourceMtimeMs: 1 }) }
+        : { text: diskCopy }
+    )
+    watchPreviewFile.mockImplementation(async file => ({ id: `w:${file}` }))
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(
+        blob =>
+          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+      )
+
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const RealBlob = globalThis.Blob
+    vi.stubGlobal(
+      'Blob',
+      class {
+        parts: string[]
+        constructor(parts: string[]) {
+          this.parts = parts
+        }
+      }
+    )
+
+    try {
+      await discoverRuntimePlugins()
+
+      expect(bundledDeactivate).toHaveBeenCalledTimes(1)
+      expect(diskRegisterV1).toHaveBeenCalledTimes(1)
+      expect(bundledDeactivate.mock.invocationCallOrder[0]).toBeLessThan(diskRegisterV1.mock.invocationCallOrder[0])
+      expect($pluginRecords.get()['crew:disk-shadowed']).toBeUndefined()
+      expect($pluginRecords.get().crew).toMatchObject({
+        file: `${root}/crew/plugin.js`,
+        id: 'crew',
+        kind: 'disk',
+        name: 'Crew Dev v1',
+        packageName: 'crew',
+        status: 'loaded'
+      })
+
+      // Hot-reload on subsequent scan preserves defaultEnabled:true posture even though crew is now kind:'disk'.
+      diskCopy = 'export default { id: "crew", name: "Crew Dev v2", register: globalThis.__crewDiskV2 }'
+      await discoverRuntimePlugins()
+      expect(diskRegisterV2).toHaveBeenCalledTimes(1)
+      expect($pluginRecords.get().crew).toMatchObject({
+        kind: 'disk',
+        name: 'Crew Dev v2',
+        status: 'loaded'
+      })
+
+      // Removing the linked folder retires the disk override and restores bundled Crew live.
+      desktopEntryPresent = false
+      await discoverRuntimePlugins()
+      expect(bundledActivate).toHaveBeenCalledTimes(1)
+      expect($pluginRecords.get().crew).toMatchObject({
+        id: 'crew',
+        kind: 'bundled',
+        name: 'Crew',
+        packageName: 'crew',
+        status: 'loaded'
+      })
+    } finally {
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      vi.stubGlobal('Blob', RealBlob)
+      unloadRuntimePlugin('crew')
+      dropPlugin('crew')
+      delete (globalThis as unknown as { __crewDiskV1?: unknown }).__crewDiskV1
+      delete (globalThis as unknown as { __crewDiskV2?: unknown }).__crewDiskV2
+    }
+  })
+
+  it('newer non-linked unified package overrides bundled plugin and restores bundled when retired', async () => {
+    const root = '/local/.hermes/desktop-plugins'
+    const radarMeta = bundledOrgPluginMeta('radar')!
+    let desktopEntryPresent = true
+
+    const bundledDeactivate = vi.fn()
+
+    const bundledActivate = vi.fn(() => {
+      publishPlugin({ id: 'radar', kind: 'bundled', name: 'Radar', packageName: 'radar', status: 'loaded' })
+    })
+
+    const diskRegister = vi.fn()
+    Object.assign(globalThis, { __radarNewerRegister: diskRegister })
+    $pluginDecisions.set({})
+
+    publishPlugin(
+      { id: 'radar', kind: 'bundled', name: 'Radar', packageName: 'radar', status: 'loaded' },
+      { activate: bundledActivate, deactivate: bundledDeactivate },
+      { defaultEnabled: true }
+    )
+
+    desktopPluginsRoot.mockResolvedValue(root)
+    readDir.mockImplementation(async dir => {
+      if (dir === root) {
+        return { entries: desktopEntryPresent ? [{ isDirectory: true, name: 'radar', path: `${root}/radar` }] : [] }
+      }
+
+      if (dir === `${root}/radar`) {
+        return {
+          entries: [
+            { isDirectory: false, name: '.hermes-package.json', path: `${root}/radar/.hermes-package.json` },
+            { isDirectory: false, name: 'plugin.js', path: `${root}/radar/plugin.js` }
+          ]
+        }
+      }
+
+      return { entries: [] }
+    })
+    readFileText.mockImplementation(async file =>
+      file.endsWith('.hermes-package.json')
+        ? {
+            text: JSON.stringify({
+              package: 'radar',
+              source: '/local/.hermes/plugins/radar/desktop',
+              sourceMtimeMs: radarMeta.syncedAtMs + 10_000
+            })
+          }
+        : { text: 'export default { id: "radar", name: "Radar Newer", register: globalThis.__radarNewerRegister }' }
+    )
+    watchPreviewFile.mockImplementation(async file => ({ id: `w:${file}` }))
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(
+        blob =>
+          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+      )
+
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const RealBlob = globalThis.Blob
+    vi.stubGlobal(
+      'Blob',
+      class {
+        parts: string[]
+        constructor(parts: string[]) {
+          this.parts = parts
+        }
+      }
+    )
+
+    try {
+      await discoverRuntimePlugins()
+
+      expect(bundledDeactivate).toHaveBeenCalledTimes(1)
+      expect(diskRegister).toHaveBeenCalledTimes(1)
+      expect($pluginRecords.get()['radar:disk-shadowed']).toBeUndefined()
+      expect($pluginRecords.get().radar).toMatchObject({
+        kind: 'disk',
+        name: 'Radar Newer',
+        packageName: 'radar',
+        status: 'loaded'
+      })
+
+      desktopEntryPresent = false
+      await discoverRuntimePlugins()
+      expect(bundledActivate).toHaveBeenCalledTimes(1)
+      expect($pluginRecords.get().radar).toMatchObject({
+        kind: 'bundled',
+        name: 'Radar',
+        packageName: 'radar',
+        status: 'loaded'
+      })
+    } finally {
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      vi.stubGlobal('Blob', RealBlob)
+      unloadRuntimePlugin('radar')
+      dropPlugin('radar')
+      delete (globalThis as unknown as { __radarNewerRegister?: unknown }).__radarNewerRegister
+    }
+  })
+
+  it('deduplicates identical or older non-linked unified package copies without publishing :disk-shadowed rows', async () => {
+    const root = '/local/.hermes/desktop-plugins'
+    const testDir = dirname(fileURLToPath(import.meta.url))
+    const redlineExactSource = readFileSync(resolve(testDir, '../plugins/redline/plugin.js'), 'utf8')
+    const redlineMeta = bundledOrgPluginMeta('redline')!
+    const openspecMeta = bundledOrgPluginMeta('openspec')!
+
+    const redlineDeactivate = vi.fn()
+    const openspecDeactivate = vi.fn()
+    const openspecDiskRegister = vi.fn()
+    Object.assign(globalThis, { __openspecOldRegister: openspecDiskRegister })
+
+    publishPlugin(
+      { id: 'redline', kind: 'bundled', name: 'Redline', packageName: 'redline', status: 'loaded' },
+      { activate: vi.fn(), deactivate: redlineDeactivate },
+      { defaultEnabled: true }
+    )
+    publishPlugin(
+      { id: 'openspec', kind: 'bundled', name: 'OpenSpec', packageName: 'openspec', status: 'loaded' },
+      { activate: vi.fn(), deactivate: openspecDeactivate },
+      { defaultEnabled: true }
+    )
+
+    desktopPluginsRoot.mockResolvedValue(root)
+    readDir.mockImplementation(async dir => {
+      if (dir === root) {
+        return {
+          entries: [
+            { isDirectory: true, name: 'openspec', path: `${root}/openspec` },
+            { isDirectory: true, name: 'redline', path: `${root}/redline` }
+          ]
+        }
+      }
+
+      if (dir === `${root}/redline` || dir === `${root}/openspec`) {
+        return {
+          entries: [
+            { isDirectory: false, name: '.hermes-package.json', path: `${dir}/.hermes-package.json` },
+            { isDirectory: false, name: 'plugin.js', path: `${dir}/plugin.js` }
+          ]
+        }
+      }
+
+      return { entries: [] }
+    })
+    readFileText.mockImplementation(async file => {
+      if (file === `${root}/redline/.hermes-package.json`) {
+        return {
+          text: JSON.stringify({
+            package: 'redline',
+            source: '/local/.hermes/plugins/redline/desktop',
+            sourceMtimeMs: redlineMeta.syncedAtMs + 50_000
+          })
+        }
+      }
+
+      if (file === `${root}/redline/plugin.js`) {
+        return { text: redlineExactSource }
+      }
+
+      if (file === `${root}/openspec/.hermes-package.json`) {
+        return {
+          text: JSON.stringify({
+            package: 'openspec',
+            source: '/local/.hermes/plugins/openspec/desktop',
+            sourceMtimeMs: openspecMeta.syncedAtMs - 1_000
+          })
+        }
+      }
+
+      return { text: 'export default { id: "openspec", register: globalThis.__openspecOldRegister }' }
+    })
+    watchPreviewFile.mockImplementation(async file => ({ id: `w:${file}` }))
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(
+        blob =>
+          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+      )
+
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const RealBlob = globalThis.Blob
+    vi.stubGlobal(
+      'Blob',
+      class {
+        parts: string[]
+        constructor(parts: string[]) {
+          this.parts = parts
+        }
+      }
+    )
+
+    try {
+      await discoverRuntimePlugins()
+
+      expect(redlineDeactivate).not.toHaveBeenCalled()
+      expect(openspecDeactivate).not.toHaveBeenCalled()
+      expect(openspecDiskRegister).not.toHaveBeenCalled()
+      expect($pluginRecords.get().redline).toMatchObject({ kind: 'bundled', status: 'loaded' })
+      expect($pluginRecords.get().openspec).toMatchObject({ kind: 'bundled', status: 'loaded' })
+      expect($pluginRecords.get()['redline:disk-shadowed']).toBeUndefined()
+      expect($pluginRecords.get()['openspec:disk-shadowed']).toBeUndefined()
+
+      // Retiring a deduplicated disk folder must leave the active bundled plugins intact.
+      readDir.mockResolvedValue({ entries: [] })
+      await discoverRuntimePlugins()
+      expect($pluginRecords.get().redline).toMatchObject({ kind: 'bundled', status: 'loaded' })
+      expect($pluginRecords.get().openspec).toMatchObject({ kind: 'bundled', status: 'loaded' })
+    } finally {
+      readDir.mockResolvedValue({ entries: [] })
+      await discoverRuntimePlugins()
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      vi.stubGlobal('Blob', RealBlob)
+      dropPlugin('redline')
+      dropPlugin('openspec')
+      delete (globalThis as unknown as { __openspecOldRegister?: unknown }).__openspecOldRegister
+    }
+  })
+
+  it('publishes :disk-shadowed when an unmarked standalone disk folder collides with a bundled org plugin', async () => {
+    publishPlugin({ id: 'crew', kind: 'bundled', name: 'Crew', packageName: 'crew', status: 'loaded' })
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(
+        blob =>
+          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+      )
+
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const RealBlob = globalThis.Blob
+    vi.stubGlobal(
+      'Blob',
+      class {
+        parts: string[]
+        constructor(parts: string[]) {
+          this.parts = parts
+        }
+      }
+    )
+
+    try {
+      const id = await loadRuntimePlugin('export default { id: "crew", name: "Crew", register() {} }', 'crew', {
+        file: '/local/.hermes/desktop-plugins/crew/plugin.js'
+      })
+
+      expect(id).toBeNull()
+      expect($pluginRecords.get().crew).toMatchObject({ kind: 'bundled', status: 'loaded' })
+      expect($pluginRecords.get()['crew:disk-shadowed']).toMatchObject({
+        file: '/local/.hermes/desktop-plugins/crew/plugin.js',
+        kind: 'disk',
+        status: 'disabled'
+      })
+    } finally {
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      vi.stubGlobal('Blob', RealBlob)
+      dropPlugin('crew')
+      dropPlugin('crew:disk-shadowed')
     }
   })
 })

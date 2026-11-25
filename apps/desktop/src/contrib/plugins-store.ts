@@ -99,12 +99,32 @@ interface PluginHandle {
 /** Loader-owned lifecycle handles, keyed by plugin id. */
 const handles = new Map<string, PluginHandle>()
 
+/** Original `defaultEnabled` posture registered with a plugin's handle. */
+const handleDefaults = new Map<string, boolean>()
+
+interface SuspendedBundledEntry {
+  defaultEnabled: boolean
+  handle?: PluginHandle
+  record: PluginRecord
+}
+
+/** Bundled plugins temporarily suspended while a local disk override owns the id. */
+const suspendedBundled = new Map<string, SuspendedBundledEntry>()
+
 /** Publish/refresh a plugin's record + its activate/deactivate handles. */
-export function publishPlugin(record: PluginRecord, handle?: PluginHandle): void {
+export function publishPlugin(
+  record: PluginRecord,
+  handle?: PluginHandle,
+  meta?: { defaultEnabled?: boolean }
+): void {
   $pluginRecords.set({ ...$pluginRecords.get(), [record.id]: record })
 
   if (handle) {
     handles.set(record.id, handle)
+  }
+
+  if (meta?.defaultEnabled !== undefined) {
+    handleDefaults.set(record.id, meta.defaultEnabled)
   }
 }
 
@@ -120,6 +140,63 @@ export function dropPlugin(id: string): void {
   const { [id]: _dropped, ...rest } = $pluginRecords.get()
   $pluginRecords.set(rest)
   handles.delete(id)
+  handleDefaults.delete(id)
+}
+
+export function suspendedBundledDefault(id: string): boolean | undefined {
+  return suspendedBundled.get(id)?.defaultEnabled
+}
+
+/** Deactivate and park a bundled plugin so an authorized disk override can take
+ *  over its id without double-registering contributions, timers, or listeners. */
+export function suspendBundledPlugin(id: string): { defaultEnabled: boolean } | null {
+  const current = $pluginRecords.get()[id]
+
+  if (!current || current.kind !== 'bundled') {
+    return null
+  }
+
+  const handle = handles.get(id)
+  const defaultEnabled = handleDefaults.get(id) ?? true
+
+  if (handle) {
+    try {
+      handle.deactivate()
+    } catch (error) {
+      console.error(`[plugins] ${id}: disposer failed during bundled suspend`, error)
+    }
+  }
+
+  suspendedBundled.set(id, {
+    defaultEnabled,
+    handle,
+    record: { ...current, error: undefined, status: 'disabled' }
+  })
+  dropPlugin(id)
+
+  return { defaultEnabled }
+}
+
+/** Restore a previously suspended bundled plugin after its disk override retires. */
+export function restoreBundledPlugin(id: string): boolean {
+  const entry = suspendedBundled.get(id)
+
+  if (!entry) {
+    return false
+  }
+
+  suspendedBundled.delete(id)
+  publishPlugin({ ...entry.record, status: 'disabled' }, entry.handle, { defaultEnabled: entry.defaultEnabled })
+
+  if (pluginActive(id, entry.defaultEnabled)) {
+    if (entry.handle) {
+      void entry.handle.activate()
+    } else {
+      patchPlugin(id, { status: 'loaded' })
+    }
+  }
+
+  return true
 }
 
 /** Turn on the desktop half of unified package *packageName*. A half ships

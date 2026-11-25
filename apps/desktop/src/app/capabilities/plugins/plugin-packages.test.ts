@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { resolveBundledPackageName } from '@/contrib/bundled-plugin-policy'
 import type { PluginRecord } from '@/contrib/plugins-store'
 import type { AgentPluginRow } from '@/store/agent-plugins'
 
@@ -144,5 +145,91 @@ describe('mergePluginPackages', () => {
       ['snapcompact', 'agent'],
       ['desktop:bots', 'desktop']
     ])
+  })
+
+  it('merges bundled org plugins (crew, openspec, radar, redline) into single kind:"both" rows while keeping hermes-bots, kanban, and radio as kind:"desktop"', () => {
+    const orgIds = ['crew', 'openspec', 'radar', 'redline'] as const
+    const standaloneIds = ['hermes-bots', 'kanban', 'radio'] as const
+
+    const desktopRecords: PluginRecord[] = [
+      ...orgIds.map(id =>
+        desktop({
+          id,
+          kind: 'bundled',
+          name: id.toUpperCase(),
+          packageName: resolveBundledPackageName({ id })
+        })
+      ),
+      ...standaloneIds.map(id =>
+        desktop({
+          id,
+          kind: 'bundled',
+          name: id,
+          packageName: resolveBundledPackageName({ id })
+        })
+      )
+    ]
+
+    const agentRows: AgentPluginRow[] = orgIds.map(id =>
+      agent({
+        description: `${id} backend`,
+        has_desktop_half: true,
+        name: id
+      })
+    )
+
+    const rows = mergePluginPackages(desktopRecords, agentRows)
+
+    // Exactly 4 unified rows + 3 standalone desktop rows = 7 rows (zero duplicate desktop:<org> rows).
+    expect(rows).toHaveLength(7)
+
+    for (const id of orgIds) {
+      const row = rows.find(candidate => candidate.key === id)
+
+      expect(row).toMatchObject({
+        agentMissingInProfile: false,
+        desktopMissing: false,
+        key: id,
+        kind: 'both'
+      })
+      expect(row?.desktop?.kind).toBe('bundled')
+      expect(rows.find(candidate => candidate.key === `desktop:${id}`)).toBeUndefined()
+    }
+
+    for (const id of standaloneIds) {
+      const row = rows.find(candidate => candidate.key === `desktop:${id}`)
+
+      expect(row).toMatchObject({
+        agent: null,
+        agentMissingInProfile: false,
+        desktopMissing: false,
+        key: `desktop:${id}`,
+        kind: 'desktop'
+      })
+    }
+  })
+
+  it('flags agentMissingInProfile:true without duplicate rows when a bundled org plugin has no matching agent row in the selected profile', () => {
+    const rows = mergePluginPackages(
+      [
+        desktop({
+          id: 'crew',
+          kind: 'bundled',
+          name: 'Crew',
+          packageName: resolveBundledPackageName({ id: 'crew' })
+        })
+      ],
+      []
+    )
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      agent: null,
+      agentMissingInProfile: true,
+      desktopMissing: false,
+      key: 'crew',
+      kind: 'both'
+    })
+    expect(rows[0].desktop?.kind).toBe('bundled')
   })
 })

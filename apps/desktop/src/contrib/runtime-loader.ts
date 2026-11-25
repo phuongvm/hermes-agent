@@ -43,6 +43,7 @@ import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { notifyError } from '@/store/notifications'
 import { forgetPluginPreviewAccess } from '@/store/plugin-preview-grants'
 
+import { evaluateBundledCollision } from './bundled-plugin-policy'
 import { trackGatewayEventDisposers } from './events'
 import { createPluginContext, declaredCapabilities, type HermesPlugin } from './plugin'
 import {
@@ -51,7 +52,10 @@ import {
   type PackageOrigin,
   pluginActive,
   type PluginKind,
-  publishPlugin
+  publishPlugin,
+  restoreBundledPlugin,
+  suspendBundledPlugin,
+  suspendedBundledDefault
 } from './plugins-store'
 
 interface LoadOptions {
@@ -64,9 +68,13 @@ interface LoadOptions {
   file?: string
   /** Inventory bucket; the disk door is the default runtime source. */
   kind?: PluginKind
+  /** Symlinked dev checkout source directory from `.hermes-package.json`. */
+  linkedSource?: string
   /** Agent package whose desktop half this is (unified packages). */
   packageName?: string
   packageOrigin?: PackageOrigin
+  /** Source `plugin.js` mtimeMs stamped into `.hermes-package.json`. */
+  sourceMtimeMs?: number
 }
 
 /** Live runtime plugins: id -> disposers (unload/reload support). */
@@ -444,18 +452,41 @@ export async function loadRuntimePlugin(
     // undiscoverable while (on shells without the bundled twin) the same
     // folder actively breaks the feature it shadows. The inventory row
     // carries the file path so Capabilities → Plugins can reveal it for deletion.
-    if ($pluginRecords.get()[plugin.id]?.kind === 'bundled') {
-      console.info(`[plugins] ${origin} skipped — "${plugin.id}" already ships bundled with the app`)
-      publishPlugin({
-        id: `${plugin.id}:disk-shadowed`,
-        name: `${plugin.name ?? plugin.id} (stale disk copy)`,
-        description: `Shadowed by the bundled "${plugin.id}" plugin — this folder is no longer used and can be deleted.`,
-        kind: options.kind ?? 'disk',
-        file: options.file,
-        status: 'disabled'
+    const currentBundled = $pluginRecords.get()[plugin.id]
+
+    if (currentBundled?.kind === 'bundled') {
+      const collision = evaluateBundledCollision(currentBundled, {
+        id: plugin.id,
+        linkedSource: options.linkedSource,
+        packageName: options.packageName,
+        source,
+        sourceMtimeMs: options.sourceMtimeMs
       })
 
-      return null
+      if (collision.action === 'dedup-bundled') {
+        dropPlugin(`${plugin.id}:disk-shadowed`)
+        console.info(`[plugins] ${origin} deduplicated (${collision.reason}) — "${plugin.id}" already active bundled`)
+
+        return null
+      }
+
+      if (collision.action === 'shadow-stale') {
+        console.info(`[plugins] ${origin} skipped — "${plugin.id}" already ships bundled with the app`)
+        publishPlugin({
+          id: `${plugin.id}:disk-shadowed`,
+          name: `${plugin.name ?? plugin.id} (stale disk copy)`,
+          description: `Shadowed by the bundled "${plugin.id}" plugin — this folder is no longer used and can be deleted.`,
+          kind: options.kind ?? 'disk',
+          file: options.file,
+          status: 'disabled'
+        })
+
+        return null
+      }
+
+      dropPlugin(`${plugin.id}:disk-shadowed`)
+      console.info(`[plugins] ${origin} overriding bundled "${plugin.id}" (${collision.reason})`)
+      suspendBundledPlugin(plugin.id)
     }
 
     // Two files claiming one id (a standalone install beside a unified-package
@@ -535,7 +566,10 @@ export async function loadRuntimePlugin(
     // reactivates via the handle above) — it just never registers. A root-level
     // `defaultEnabled: false` caps the plugin's own default: the user's explicit
     // enable still wins, a plugin can't self-enable past its root's posture.
-    if (pluginActive(plugin.id, (plugin.defaultEnabled ?? true) && (options.defaultEnabled ?? true))) {
+    const effectiveDefault =
+      (plugin.defaultEnabled ?? true) && (suspendedBundledDefault(plugin.id) ?? options.defaultEnabled ?? true)
+
+    if (pluginActive(plugin.id, effectiveDefault)) {
       activate()
     }
 
@@ -604,6 +638,7 @@ interface PackageMarker {
   linkedSource?: string
   origin?: PackageOrigin
   package: string
+  sourceMtimeMs?: number
 }
 
 /** The installer-written JSON files in a plugin folder, parsed (`null` when absent or unreadable), from one
@@ -643,6 +678,7 @@ async function readFolderJson(
 }
 
 const nonEmpty = (value: unknown) => (typeof value === 'string' && value ? value : undefined)
+const finiteNumber = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined)
 
 function packageOrigin(parsed: Record<string, unknown>): PackageOrigin | undefined {
   const repo = nonEmpty(parsed.repo)
@@ -657,7 +693,12 @@ function packageMarker(parsed: null | Record<string, unknown>): null | PackageMa
   const pkg = nonEmpty(parsed?.package)
 
   return parsed && pkg
-    ? { linkedSource: parsed.linked ? nonEmpty(parsed.source) : undefined, origin: packageOrigin(parsed), package: pkg }
+    ? {
+        linkedSource: parsed.linked ? nonEmpty(parsed.source) : undefined,
+        origin: packageOrigin(parsed),
+        package: pkg,
+        sourceMtimeMs: finiteNumber(parsed.sourceMtimeMs)
+      }
     : null
 }
 
@@ -667,7 +708,12 @@ function packageMarker(parsed: null | Record<string, unknown>): null | PackageMa
 async function readFolderIdentity(
   desktop: Window['hermesDesktop'],
   folder: string
-): Promise<Pick<DiskPlugin, 'defaultEnabled' | 'packageName' | 'packageOrigin' | 'sourceFile'>> {
+): Promise<
+  Pick<
+    DiskPlugin,
+    'defaultEnabled' | 'linkedSource' | 'packageName' | 'packageOrigin' | 'sourceFile' | 'sourceMtimeMs'
+  >
+> {
   const [markerJson, originJson] = await readFolderJson(desktop, folder, [PACKAGE_MARKER, INSTALL_ORIGIN])
   const marker = packageMarker(markerJson)
   const standalone = !marker && originJson ? packageOrigin(originJson) : undefined
@@ -675,9 +721,11 @@ async function readFolderIdentity(
   return {
     // A unified package's desktop half ships opt-in, like its agent half.
     defaultEnabled: marker ? false : undefined,
+    linkedSource: marker?.linkedSource,
     packageName: marker?.package,
     packageOrigin: marker ? marker.origin : standalone?.catalogName ? standalone : undefined,
-    sourceFile: marker?.linkedSource ? `${marker.linkedSource}/plugin.js` : undefined
+    sourceFile: marker?.linkedSource ? `${marker.linkedSource}/plugin.js` : undefined,
+    sourceMtimeMs: marker?.sourceMtimeMs
   }
 }
 
@@ -685,6 +733,10 @@ interface DiskPlugin {
   /** Root posture, forwarded on every (re)load of this entry. */
   defaultEnabled?: boolean
   file: string
+  /** Symlinked dev checkout source directory from `.hermes-package.json`. */
+  linkedSource?: string
+  /** Bundled plugin id currently suspended by this disk entry, if any. */
+  overrodeBundledId?: string
   /** Agent package this folder is the desktop half of (unified packages). */
   packageName?: string
   packageOrigin?: PackageOrigin
@@ -694,6 +746,8 @@ interface DiskPlugin {
   origin: string
   /** Linked dev package only: the SOURCE `desktop/plugin.js` this copy came from. */
   sourceFile?: string
+  /** Source `plugin.js` mtimeMs from `.hermes-package.json`. */
+  sourceMtimeMs?: number
   /** Watch on `sourceFile` — a save re-syncs the copy, then reloads it. */
   sourceWatchId?: null | string
   watchId: null | string
@@ -708,8 +762,13 @@ let scanInFlight: null | Promise<void> = null
 
 /** Drop a folder-named error record — unless that name is the live plugin id
  *  of ANOTHER disk entry (two roots can carry same-named folders; a broken one
- *  must not clobber its healthy namesake's inventory row). */
+ *  must not clobber its healthy namesake's inventory row) or an active bundled
+ *  plugin whose disk copy was deduplicated. */
 function dropOriginRecord(origin: string, except: DiskPlugin): void {
+  if ($pluginRecords.get()[origin]?.kind === 'bundled') {
+    return
+  }
+
   for (const other of disk.values()) {
     if (other !== except && other.id === origin) {
       return
@@ -761,8 +820,10 @@ async function loadDiskPlugin(entry: DiskPlugin): Promise<boolean> {
     const id = await loadRuntimePlugin(text, entry.origin, {
       defaultEnabled: entry.defaultEnabled,
       file: entry.file,
+      linkedSource: entry.linkedSource,
       packageName: entry.packageName,
-      packageOrigin: entry.packageOrigin
+      packageOrigin: entry.packageOrigin,
+      sourceMtimeMs: entry.sourceMtimeMs
     })
 
     // loadRuntimePlugin only disposes the NEW id, so the previous incarnation
@@ -773,7 +834,19 @@ async function loadDiskPlugin(entry: DiskPlugin): Promise<boolean> {
     // would show a broken file as "loaded" and re-enable stale code.
     if (prevId && prevId !== id) {
       unloadRuntimePlugin(prevId)
-      dropPlugin(prevId)
+
+      if (prevId !== entry.origin || id !== null) {
+        dropPlugin(prevId)
+      }
+
+      if (id !== null && entry.overrodeBundledId === prevId) {
+        restoreBundledPlugin(prevId)
+        entry.overrodeBundledId = undefined
+      }
+    }
+
+    if (id && suspendedBundledDefault(id) !== undefined) {
+      entry.overrodeBundledId = id
     }
 
     entry.id = id
@@ -1029,6 +1102,8 @@ async function scanOnce(desktop: NonNullable<Window['hermesDesktop']>, reloadKno
 /** Forget a disk entry whose folder is gone: unload its registration, drop
  *  its inventory rows and its preview-script grants, stop its file watch. */
 function retireDiskPlugin(file: string, record: DiskPlugin): void {
+  const restoreId = record.id ?? record.overrodeBundledId
+
   if (record.id) {
     unloadRuntimePlugin(record.id)
     dropPlugin(record.id)
@@ -1037,6 +1112,10 @@ function retireDiskPlugin(file: string, record: DiskPlugin): void {
   }
 
   dropOriginRecord(record.origin, record)
+
+  if (restoreId) {
+    restoreBundledPlugin(restoreId)
+  }
 
   if (record.watchId) {
     void window.hermesDesktop?.stopPreviewFileWatch(record.watchId)
