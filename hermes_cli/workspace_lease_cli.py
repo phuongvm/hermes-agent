@@ -86,6 +86,12 @@ def configure_lease_subcommands(lease_parser: argparse.ArgumentParser) -> None:
         help="Bounded manual poll wait in seconds before deferring (exit 75)",
     )
     p_acq.add_argument("--poll-interval-s", type=float, default=2.0)
+    p_acq.add_argument(
+        "--exempt-turn-holder",
+        dest="exempt_turn_holder",
+        default=None,
+        help="Exact cron turn lease holder to self-exempt when verified as a live OS ancestor",
+    )
 
     p_commit = sub.add_parser("commit", help="Journaled lock-held atomic fenced commit")
     _add_common_lease_Flags(p_commit, is_subparser=True)
@@ -129,7 +135,7 @@ def configure_lease_subcommands(lease_parser: argparse.ArgumentParser) -> None:
     p_git.add_argument("--ref", default="refs/heads/main")
     p_git.add_argument("--new-sha", required=True)
     p_git.add_argument("--old-sha", default=None)
-    p_git.add_argument("--reset-mode", choices=("hard", "mixed"), default="hard")
+    p_git.add_argument("--reset-mode", choices=("hard", "mixed", "ff-only"), default="hard")
     p_git.add_argument("--fetch-from", default=None)
     p_git.add_argument("--fetch-refspec", default=None)
     p_git.add_argument("--refresh-index", action="store_true", default=False)
@@ -194,6 +200,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
                 ttl_s=float(getattr(args, "ttl_s", MAX_LEASE_TTL_S)),
                 wait_seconds=float(getattr(args, "wait_seconds", 0.0)),
                 poll_interval_s=float(getattr(args, "poll_interval_s", 2.0)),
+                exempt_turn_holder=getattr(args, "exempt_turn_holder", None),
             )
             print(json.dumps(report.to_dict()))
             return int(report.exit_code)

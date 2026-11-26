@@ -1794,3 +1794,197 @@ def test_probe_state_db_prefers_session_turn_leases(tmp_path: Path) -> None:
 
     rep_idle = coord.acquire_workspace_lease(scopes=("repo:oss/crew",), mode="exclusive_cutover", holder="test")
     assert rep_idle.status == "ACQUIRED"
+
+
+def test_cron_turn_lease_self_exemption_five_gates_unit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Task 2.3 (a)-(g): 5-gate fail-closed cron turn self-exemption unit matrix."""
+    import hermes_cli.workspace_lease as wl
+    from process_identity import holder_namespace_token
+
+    assert Path(wl.__file__).resolve().is_relative_to(Path(__file__).resolve().parents[1])
+    ns_tok = holder_namespace_token()
+    cron_holder = f"pid=1000{ns_tok}:turn=s-cron:cron:job1:exec1:abcd1234:platform=cron"
+    state_db = tmp_path / "state_gates.db"
+
+    def _set_rows(rows: list[tuple[str, str, float]]) -> None:
+        with sqlite3.connect(state_db) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT, acquired_at REAL, expires_at REAL)")
+            c.execute("DELETE FROM session_turn_leases")
+            c.executemany("INSERT INTO session_turn_leases VALUES (?, ?, 990.0, ?)", rows)
+
+    ppid_map = {3000: 2000, 2000: 1000, 1000: 1, 9999: 1}
+    start_ns: dict[int, int | None] = {1: 50, 1000: 100, 2000: 200, 3000: 300, 9999: 250}
+
+    def _acq(name: str, *, exempt: str | None = cron_holder, caller: int = 3000) -> LeaseExecutionReport:
+        coord = WorkspaceLeaseCoordinator(
+            lease_dir=tmp_path / name, state_db_path=state_db, process_inspector=start_ns.get,
+            parent_pid_inspector=ppid_map.get, caller_pid=caller, clock=lambda: 1000.0,
+        )
+        return coord.acquire_workspace_lease(("repo:oss/crew",), "exclusive_cutover", "cutover", exempt_turn_holder=exempt)
+
+    # (a) Sole active cron lease with verified live OS ancestor + monotonic start_ns -> ACQUIRED
+    _set_rows([("s-cron", cron_holder, 1300.0)])
+    rep_ok = _acq("l_ok")
+    assert rep_ok.status == "ACQUIRED" and rep_ok.exit_code == 0 and rep_ok.details.get("exempted_turn_holder") == cron_holder
+
+    # (b) Second active lease (lower expires_at behind higher expires_at cron row -> proves NO LIMIT 1)
+    _set_rows([("s-cron", cron_holder, 1500.0), ("s-sentinel", f"pid=9999{ns_tok}:turn=s-sentinel:t1:beef:platform=cron", 1100.0)])
+    rep_two = _acq("l_two")
+    assert rep_two.exit_code == 75 and rep_two.details["session_id"] == "s-sentinel" and rep_two.details["active_turn_count"] == 2
+
+    # (c) Spoofed --exempt-turn-holder from non-ancestor PID (9999) or self-PID (1000) -> exit 75
+    _set_rows([("s-cron", cron_holder, 1300.0)])
+    for bad_caller in (9999, 1000):
+        assert _acq(f"l_spoof_{bad_caller}", caller=bad_caller).exit_code == 75
+
+    # (d) PID reuse spoof: parent_start_ns > child_start_ns OR unreadable start_time_ns (None) -> exit 75
+    for bad_start, tag in ((250, "l_reuse"), (None, "l_none")):
+        start_ns[1000] = bad_start
+        assert _acq(tag).exit_code == 75
+    start_ns[1000] = 100
+
+    # (e) Non-cron platforms, malformed holders, or uncheckable PID namespace -> exit 75
+    for idx, bad_holder in enumerate((
+        f"pid=1000{ns_tok}:turn=s1:t1:abcd:platform=desktop",
+        f"pid=1000{ns_tok}:turn=s1:t1:abcd:platform=cli",
+        f"pid=1000{ns_tok}:turn=s1:t1:abcd:platform=subagent",
+        f"pid=1000{ns_tok}:turn=s1:t1:abcd:platform=unknown",
+        "pid=0:turn=s1:platform=cron",
+        "malformed-holder-string",
+    )):
+        _set_rows([("s-bad", bad_holder, 1300.0)])
+        assert _acq(f"l_bad_{idx}", exempt=bad_holder).exit_code == 75
+
+    _set_rows([("s-cron", cron_holder, 1300.0)])
+    monkeypatch.setattr(wl, "holder_pid_checkable", lambda _h: False)
+    assert _acq("l_pidns").exit_code == 75
+    monkeypatch.undo()
+
+    # (f) Omitted, empty, or mismatched --exempt-turn-holder -> exit 75
+    for idx, arg in enumerate((None, "", cron_holder + "x")):
+        assert _acq(f"l_omit_{idx}", exempt=arg).exit_code == 75
+
+    # (g) Legacy sessions-table fallback without session_turn_leases -> never bypassed (exit 75)
+    legacy_db = tmp_path / "legacy_state.db"
+    with sqlite3.connect(legacy_db) as c:
+        c.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, status TEXT, updated_at REAL)")
+        c.execute("INSERT INTO sessions VALUES ('s-cron', 'running', 995.0)")
+    coord_leg = WorkspaceLeaseCoordinator(
+        lease_dir=tmp_path / "l_leg", state_db_path=legacy_db, process_inspector=start_ns.get,
+        parent_pid_inspector=ppid_map.get, caller_pid=3000, clock=lambda: 1000.0,
+    )
+    assert coord_leg.acquire_workspace_lease(("repo:oss/crew",), "exclusive_cutover", "cutover", exempt_turn_holder=cron_holder).exit_code == 75
+
+
+def test_cron_turn_lease_exempt_real_subprocess_ancestry(tmp_path: Path) -> None:
+    """Task 2.3 (h): Real OS subprocess integration test verifying live kernel ancestry walk."""
+    import os
+    from process_identity import holder_namespace_token
+
+    lease_script = Path(__file__).resolve().parents[1] / "hermes_cli" / "workspace_lease.py"
+    state_db, now = tmp_path / "live_subproc_state.db", time.time()
+    my_holder = f"pid={os.getpid()}{holder_namespace_token()}:turn=s-live:cron:j1:e1:cafe:platform=cron"
+    with sqlite3.connect(state_db) as c:
+        c.execute("CREATE TABLE session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT, acquired_at REAL, expires_at REAL)")
+        c.execute("INSERT INTO session_turn_leases VALUES ('s-live', ?, ?, ?)", (my_holder, now, now + 300.0))
+
+    wrapper = "import subprocess, sys; sys.exit(subprocess.run([sys.executable, '-B', '-E', *sys.argv[1:]], timeout=15).returncode)"
+    res_ok = subprocess.run(
+        [sys.executable, "-B", "-E", "-c", wrapper, str(lease_script), "--lease-dir", str(tmp_path / "l_ok"),
+         "--state-db", str(state_db), "acquire", "--scope", "repo:oss/crew", "--exempt-turn-holder", my_holder],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert res_ok.returncode == 0, res_ok.stderr or res_ok.stdout
+    payload_ok = json.loads(res_ok.stdout.strip())
+    assert payload_ok["status"] == "ACQUIRED" and payload_ok["details"]["exempted_turn_holder"] == my_holder
+
+    with sqlite3.connect(state_db) as c:
+        c.execute("INSERT INTO session_turn_leases VALUES ('s-other', ?, ?, ?)",
+                  (f"pid=999999{holder_namespace_token()}:turn=s-other:cron:j2:e2:beef:platform=cron", now, now + 200.0))
+    res_def = subprocess.run(
+        [sys.executable, "-B", "-E", str(lease_script), "--lease-dir", str(tmp_path / "l_def"),
+         "--state-db", str(state_db), "acquire", "--scope", "repo:oss/crew", "--exempt-turn-holder", my_holder],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert res_def.returncode == 75 and json.loads(res_def.stdout.strip())["reason_code"] == "DEFERRED_ACTIVE_SESSION"
+
+
+def test_atomic_fenced_git_ref_update_ff_only_zero_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Task 3.1 (a)-(h): Zero-checkout --reset-mode ff-only unit, CLI, and journal recovery tests."""
+    repo, remote = tmp_path / "primary_repo", tmp_path / "upstream_repo"
+    for r in (repo, remote):
+        r.mkdir()
+        subprocess.run(["git", "-C", str(r), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(r), "config", "user.email", "t@e.com"], check=True)
+        subprocess.run(["git", "-C", str(r), "config", "user.name", "T"], check=True)
+    shas: list[str] = []
+    for v in (1, 2, 3):
+        (remote / "f.py").write_text(f"v = {v}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(remote), "add", "f.py"], check=True)
+        subprocess.run(["git", "-C", str(remote), "commit", "-m", f"c{v}"], check=True, capture_output=True)
+        shas.append(subprocess.check_output(["git", "-C", str(remote), "rev-parse", "HEAD"], text=True).strip())
+    sha1, sha2, sha3 = shas
+    subprocess.run(["git", "-C", str(repo), "fetch", str(remote), "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "reset", "--hard", sha1], check=True, capture_output=True)
+
+    lease_dir, now_ts = tmp_path / "leases_ff", time.time()
+    coord = WorkspaceLeaseCoordinator(lease_dir=lease_dir, process_inspector=lambda _: 1, clock=lambda: now_ts)
+    token = coord.acquire_workspace_lease(("repo:oss/crew",), "exclusive_cutover", "c", holder_pid=9, process_start_time_ns=1).fencing_tokens["repo:oss/crew"]
+
+    # (e) stash_dirty=True rejected with ValueError; (d) ref_name="HEAD" rejected
+    with pytest.raises(ValueError, match="stash_dirty"):
+        coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha2, sha1, reset_mode="ff-only", stash_dirty=True)
+    with pytest.raises(ValueError, match="HEAD"):
+        coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "HEAD", sha2, sha1, reset_mode="ff-only")
+
+    # (a) Clean ff-only advances via git merge --ff-only with ZERO reset/checkout/switch; journal records ff-only
+    git_cmds: list[list[str]] = []
+    real_run = subprocess.run
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **kw: (git_cmds.append(list(cmd)), real_run(cmd, *a, **kw))[1])
+    assert coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha2, sha1, reset_mode="ff-only") == sha2
+    monkeypatch.setattr(subprocess, "run", real_run)
+    assert (repo / "f.py").read_text(encoding="utf-8") == "v = 2\n"
+    assert any("merge" in c and "--ff-only" in c for c in git_cmds)
+    assert not any({"reset", "checkout", "switch", "update-ref"} & set(c) for c in git_cmds)
+    assert coord.get_status()["journal"]["history"][-1]["reset_mode"] == "ff-only"
+
+    # (f) No-op when old_sha == new_sha; CLI --reset-mode ff-only advances sha2 -> sha3
+    assert coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha2, sha2, reset_mode="ff-only") == sha2
+    assert lease_cli_main(["--lease-dir", str(lease_dir), "git-ref-update", "--scope", "repo:oss/crew", "--token", token,
+                           "--repo-root", str(repo), "--ref", "refs/heads/main", "--old-sha", sha2, "--new-sha", sha3, "--reset-mode", "ff-only"]) == 0
+    assert (repo / "f.py").read_text(encoding="utf-8") == "v = 3\n"
+
+    # (b) Non-ancestor rollback sha3 -> sha1 refused; (c) dirty tracked tree refused; (d) wrong/detached HEAD refused
+    with pytest.raises(RuntimeError, match="non-fast-forward"):
+        coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha1, sha3, reset_mode="ff-only")
+    (repo / "f.py").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="dirty"):
+        coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha3, sha3, reset_mode="ff-only")
+    assert (repo / "f.py").read_text(encoding="utf-8") == "dirty\n"
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "f.py"], check=True, capture_output=True)
+    with pytest.raises(RuntimeError, match="symbolic HEAD"):
+        coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/other", sha3, sha3, reset_mode="ff-only")
+    subprocess.run(["git", "-C", str(repo), "checkout", "--detach", sha3], check=True, capture_output=True)
+    with pytest.raises(RuntimeError, match="symbolic HEAD"):
+        coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha3, sha3, reset_mode="ff-only")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True)
+
+    # (g) Crash recovery for ff-only: clean -> COMMITTED with 0 reset; dirty -> RuntimeError without reset; unadvanced -> ABORTED
+    tx_base = dict(tx_id="tx_ff_1", state="PUBLISH_INTENT", scope="repo:oss/crew", fencing_token=token, target_path=str(repo),
+                   backup_path=sha2, staged_path=sha3, staged_digest=sha3, started_at_epoch=1000.0, kind="git_ref", ref_name="refs/heads/main", reset_mode="ff-only")
+    (lease_dir / "workspace_lease.journal.json").write_text(json.dumps({"active_tx": tx_base}), encoding="utf-8")
+    rec_cmds: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **kw: (rec_cmds.append(list(cmd)), real_run(cmd, *a, **kw))[1])
+    assert coord.recover_interrupted_commit()[0].state == "COMMITTED" and not any("reset" in c for c in rec_cmds)
+    monkeypatch.setattr(subprocess, "run", real_run)
+    (repo / "f.py").write_text("dirty_after_crash\n", encoding="utf-8")
+    (lease_dir / "workspace_lease.journal.json").write_text(json.dumps({"active_tx": {**tx_base, "tx_id": "tx_ff_dirty"}}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="dirty"):
+        coord.recover_interrupted_commit()
+    assert (repo / "f.py").read_text(encoding="utf-8") == "dirty_after_crash\n"
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "f.py"], check=True, capture_output=True)
+    (lease_dir / "workspace_lease.journal.json").write_text(json.dumps({"active_tx": {**tx_base, "tx_id": "tx_ff_abort", "staged_digest": sha1}}), encoding="utf-8")
+    assert coord.recover_interrupted_commit()[0].state == "ABORTED"
+    # (h) Backward compatibility: default reset-mode remains 'hard' and 'mixed' still works
+    assert coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha2, sha3, reset_mode="mixed") == sha2
+    assert coord.atomic_fenced_git_ref_update("repo:oss/crew", token, repo, "refs/heads/main", sha3, sha2) == sha3

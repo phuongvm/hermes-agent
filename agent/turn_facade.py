@@ -78,6 +78,7 @@ class TurnFacadeMixin:
         from agent.subagent_lifecycle import bind_subagent_parent
         from agent.interrupt_scope import track_in_interrupt_scope
         from agent.turn_facade_lease import admit_durable_turn_lease, carry_unadmitted_user_message
+        from gateway.session_context import scoped_turn_lease_holder
         from hermes_cli.observability.relay_shared_metrics import finish_task_run, start_task_run
 
         effective_task_id = task_id or str(uuid.uuid4())
@@ -177,7 +178,8 @@ class TurnFacadeMixin:
             # Use the builder's turn label, not skill/memory write provenance. An ordinary turn
             # masks any inherited fork context, while a fork worker already owns its binding.
             with (bind_detached_fork_origin(getattr(self, "_turn_origin", None) or ""),
-                  bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self)):
+                  bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self),
+                  scoped_turn_lease_holder(getattr(lease, "holder", None))):
                 try:
                     if lease is not None:
                         lease.start()

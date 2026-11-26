@@ -24,6 +24,7 @@ the ``os.environ`` fallback.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -231,3 +232,172 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+# --------------------------------------------------------------------------- #
+# Turn lease holder ContextVar seam (HERMES_SESSION_TURN_LEASE_HOLDER)
+# --------------------------------------------------------------------------- #
+
+def test_scoped_turn_lease_holder_propagates_to_child_envs_and_restores_on_exit():
+    """scoped_turn_lease_holder binds HERMES_SESSION_TURN_LEASE_HOLDER in _VAR_MAP without
+    mutating os.environ or shifting set_session_vars positional args, and restores on exit/error."""
+    import re
+    from gateway.session_context import reset_session_vars, scoped_turn_lease_holder
+    from tools.environments.base_session_env import (
+        _SNAPSHOT_EXCLUDED_ENV_REGEX,
+        _export_dump_excluding_session_vars,
+    )
+    from tools.environments.local import build_subprocess_env
+
+    assert Path(sc.__file__).resolve().is_relative_to(Path(__file__).resolve().parents[2])
+    holder = "pid=31596:turn=local-abc:cron:job1:exec1:deadbeef:platform=cron"
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" in _VAR_MAP
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in os.environ
+
+    # Verify set_session_vars positional tuple mapping is untouched (actor_id/actor_name intact)
+    tokens = set_session_vars(
+        platform="cron",
+        session_id="local-abc",
+        user_id="route-u",
+        actor_id="actor-u",
+        actor_name="actor-n",
+    )
+    try:
+        assert sc.get_session_env("HERMES_SESSION_ACTOR_ID") == "actor-u"
+        assert sc.get_session_env("HERMES_SESSION_ACTOR_NAME") == "actor-n"
+        with scoped_turn_lease_holder(holder):
+            assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in os.environ
+            assert _make_run_env({}).get("HERMES_SESSION_TURN_LEASE_HOLDER") == holder
+            assert build_subprocess_env(scrub_secrets=True).get("HERMES_SESSION_TURN_LEASE_HOLDER") == holder
+            assert _sanitize_subprocess_env({"PATH": "/usr/bin"}).get("HERMES_SESSION_TURN_LEASE_HOLDER") == holder
+            assert hermes_subprocess_env().get("HERMES_SESSION_TURN_LEASE_HOLDER") == holder
+
+            # Nested None masks outer holder inside unleased child turn, then restores outer holder
+            with scoped_turn_lease_holder(None):
+                assert _make_run_env({}).get("HERMES_SESSION_TURN_LEASE_HOLDER") == ""
+            assert _make_run_env({}).get("HERMES_SESSION_TURN_LEASE_HOLDER") == holder
+
+        # Restored to _UNSET on normal exit (stripped because host is engaged)
+        assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in _make_run_env({})
+
+        # Restored on exception too
+        with pytest.raises(RuntimeError, match="boom"):
+            with scoped_turn_lease_holder(holder):
+                assert _make_run_env({}).get("HERMES_SESSION_TURN_LEASE_HOLDER") == holder
+                raise RuntimeError("boom")
+        assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in _make_run_env({})
+    finally:
+        clear_session_vars(tokens)
+
+    # clear_session_vars sets explicit ""; reset_session_vars restores _UNSET
+    assert sc.bound_session_env("HERMES_SESSION_TURN_LEASE_HOLDER") == ""
+    reset_session_vars()
+    assert sc._VAR_MAP["HERMES_SESSION_TURN_LEASE_HOLDER"].get() is sc._UNSET
+
+    # Excluded from shared bash session snapshots
+    decl_line = f'declare -x HERMES_SESSION_TURN_LEASE_HOLDER="{holder}"'
+    assert re.search(_SNAPSHOT_EXCLUDED_ENV_REGEX, decl_line) is not None
+    dump_script = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
+    assert "${!HERMES_SESSION_*}" in dump_script
+
+
+def test_engaged_unset_strips_foreign_turn_lease_holder(monkeypatch):
+    """Engaged multi-session host strips foreign os.environ[HERMES_SESSION_TURN_LEASE_HOLDER] when _UNSET."""
+    from tools.environments.local import build_subprocess_env
+
+    _engage()
+    monkeypatch.setenv(
+        "HERMES_SESSION_TURN_LEASE_HOLDER",
+        "pid=99999:turn=foreign:cron:jobX:execX:0000:platform=cron",
+    )
+
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in _make_run_env({})
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in build_subprocess_env(scrub_secrets=True)
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in _sanitize_subprocess_env(dict(os.environ))
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in hermes_subprocess_env()
+
+
+def test_turn_facade_run_conversation_binds_and_resets_turn_lease_holder(monkeypatch):
+    """TurnFacadeMixin.run_conversation binds lease.holder for the turn duration and resets on exit/error."""
+    import threading
+    from agent.turn_facade import TurnFacadeMixin
+    from tools.environments.local import build_subprocess_env
+
+    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
+
+    class _LeaseDb:
+        def __init__(self):
+            self.holders = []
+
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def acquire_session_turn_lease(self, session_id, holder, **kwargs):
+            self.holders.append(holder)
+            return True
+
+        def refresh_session_turn_lease(self, session_id, holder, **kwargs):
+            return True
+
+        def release_session_turn_lease(self, session_id, holder):
+            pass
+
+    class _DummyAgent(TurnFacadeMixin):
+        def __init__(self, db):
+            self._session_db = db
+            self.session_id = "local-cron-sess"
+            self.platform = "cron"
+            self.model = "test-model"
+            self.provider = "test-provider"
+            self._persist_disabled = False
+            self._interrupt_requested = False
+            self._interrupt_message = None
+            self._execution_thread_id = None
+            self._session_turn_lease_refresh_interval = 60.0
+            self._lock = threading.Lock()
+
+        def _conversation_root_id(self):
+            return self.session_id
+
+        def _emit_status(self, msg):
+            pass
+
+        def _emit_warning(self, msg):
+            pass
+
+        def _touch_activity(self, *args, **kwargs):
+            pass
+
+        def _liveness_activity_lock(self):
+            return self._lock
+
+        def _reset_activity_labels_after_turn(self):
+            pass
+
+    _engage()
+    db = _LeaseDb()
+    agent = _DummyAgent(db)
+    observed = {}
+
+    def _fake_loop(self_agent, user_message, *args, **kwargs):
+        observed["run_env"] = _make_run_env({}).get("HERMES_SESSION_TURN_LEASE_HOLDER")
+        observed["subproc_env"] = build_subprocess_env(scrub_secrets=True).get("HERMES_SESSION_TURN_LEASE_HOLDER")
+        if user_message == "raise":
+            raise ValueError("turn boom")
+        return {"final_response": "ok", "messages": []}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", _fake_loop)
+
+    res = agent.run_conversation("hello", task_id="cron:job1:exec1")
+    assert res["final_response"] == "ok"
+    assert len(db.holders) == 1
+    expected_holder = db.holders[0]
+    assert expected_holder.endswith(":platform=cron")
+    assert observed["run_env"] == expected_holder
+    assert observed["subproc_env"] == expected_holder
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in _make_run_env({})
+
+    with pytest.raises(ValueError, match="turn boom"):
+        agent.run_conversation("raise", task_id="cron:job1:exec2")
+    assert observed["run_env"] == db.holders[1]
+    assert "HERMES_SESSION_TURN_LEASE_HOLDER" not in _make_run_env({})

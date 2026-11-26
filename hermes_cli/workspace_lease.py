@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import sqlite3
@@ -39,6 +40,7 @@ from hermes_cli.workspace_lease_git import (
     execute_atomic_fenced_git_ref_update,
     recover_git_ref_journal_locked,
 )
+from process_identity import holder_pid_checkable
 from hermes_cli.workspace_lease_types import (
     ACTIVE_SESSION_WINDOW_S,
     DEFAULT_HEARTBEAT_INTERVAL_S,
@@ -119,6 +121,24 @@ __all__ = [
 
 _PROCESS_LOCK_REGISTRY_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
+_TURN_HOLDER_RE = re.compile(
+    r"^pid=(?P<pid>[1-9]\d*)(?::pidns=(?P<pidns>[1-9]\d*))?:turn=(?P<turn>[^\r\n]+):platform=(?P<platform>[A-Za-z0-9_.-]+)$"
+)
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
 
 
 def _get_inproc_lock(lock_path: Path) -> threading.RLock:
@@ -182,6 +202,70 @@ def _default_process_start_time_ns(pid: int) -> int | None:
         return 1
 
 
+def _read_proc_ppid(pid: int) -> int | None:
+    if pid <= 0:
+        return None
+    stat_path = Path(f"/proc/{pid}/stat")
+    if stat_path.is_file():
+        try:
+            content = stat_path.read_text(encoding="utf-8")
+            after_comm = content.rsplit(")", 1)[-1].split()
+            return int(after_comm[1])
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        import psutil
+
+        return int(psutil.Process(pid).ppid())
+    except Exception:  # health: allow BLE001 -- fail closed when pid gone or unreadable
+        return None
+
+
+def _default_parent_pid_map() -> dict[int, int]:
+    """Snapshot live `{pid: ppid}` map from OS kernel (Toolhelp32 on Windows, /proc on Linux)."""
+    if os.name == "nt":
+        th32cs_snapprocess = 0x00000002
+        invalid_handle = ctypes.c_void_p(-1).value
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = ctypes.c_int
+        k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32NextW.restype = ctypes.c_int
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
+        snap = k32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+        if not snap or snap == invalid_handle:
+            return {}
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            result: dict[int, int] = {}
+            ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                result[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                ok = k32.Process32NextW(snap, ctypes.byref(entry))
+            return result
+        finally:
+            k32.CloseHandle(snap)
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        result = {}
+        for child in proc_root.iterdir():
+            if child.name.isdigit():
+                ppid = _read_proc_ppid(int(child.name))
+                if ppid is not None:
+                    result[int(child.name)] = ppid
+        return result
+    try:
+        import psutil
+
+        return {p.pid: int(p.info.get("ppid") or 0) for p in psutil.process_iter(["ppid"])}
+    except Exception:  # health: allow BLE001 -- fail closed when OS process table unavailable
+        return {}
+
+
 def _default_lease_dir() -> Path:
     env_dir = os.environ.get("HERMES_LEASE_DIR")
     if env_dir:
@@ -223,6 +307,8 @@ class WorkspaceLeaseCoordinator:
         worktrees_root: Path | str | None = None,
         process_inspector: Callable[[int], int | None] | None = None,
         clock: Callable[[], float] | None = None,
+        parent_pid_inspector: Callable[[int], int | None] | None = None,
+        caller_pid: int | None = None,
     ) -> None:
         self.lease_dir = Path(lease_dir) if lease_dir is not None else _default_lease_dir()
         self.lock_path = self.lease_dir / "workspace_lease.lock"
@@ -232,6 +318,8 @@ class WorkspaceLeaseCoordinator:
         self.worktrees_root = Path(worktrees_root) if worktrees_root is not None else None
         self._process_inspector = process_inspector or _default_process_start_time_ns
         self._clock = clock or time.time
+        self._parent_pid_inspector = parent_pid_inspector
+        self._caller_pid = caller_pid
 
     def _now(self) -> float:
         return float(self._clock())
@@ -645,8 +733,113 @@ class WorkspaceLeaseCoordinator:
             ledger.history.append(stale_rec.to_dict())
             ledger.scope_states[scope_key] = "PREEMPTED"
 
+    def _resolve_ppid_lookup(self) -> Callable[[int], int | None]:
+        if self._parent_pid_inspector is not None:
+            return self._parent_pid_inspector
+        if os.name == "nt":
+            snap_map = _default_parent_pid_map()
+            return snap_map.get
+        return _read_proc_ppid
+
+    def _verify_live_ancestor_chain(
+        self, holder_pid: int, ppid_lookup: Callable[[int], int | None]
+    ) -> bool:
+        start_pid = int(self._caller_pid if self._caller_pid is not None else os.getpid())
+        if holder_pid <= 0 or start_pid <= 0 or holder_pid == start_pid:
+            return False
+        try:
+            child_start = self._process_inspector(start_pid)
+        except Exception:  # health: allow BLE001 -- fail closed on caller start-time inspection error
+            return False
+        if child_start is None or child_start <= 0:
+            return False
+        visited: set[int] = {start_pid}
+        cur = start_pid
+        for _ in range(64):
+            try:
+                raw_ppid = ppid_lookup(cur)
+            except Exception:  # health: allow BLE001 -- fail closed on OS parent-PID lookup error
+                return False
+            if raw_ppid is None or int(raw_ppid) <= 0:
+                return False
+            parent_pid = int(raw_ppid)
+            if parent_pid in visited:
+                return False
+            visited.add(parent_pid)
+            try:
+                parent_start = self._process_inspector(parent_pid)
+            except Exception:  # health: allow BLE001 -- fail closed on ancestor start-time inspection error
+                return False
+            if parent_start is None or parent_start <= 0 or parent_start > child_start:
+                return False
+            if parent_pid == holder_pid:
+                return True
+            cur = parent_pid
+            child_start = parent_start
+        return False
+
+    def _is_turn_lease_row_exempt(
+        self,
+        row_holder: Any,
+        exempt_turn_holder: str | None,
+        ppid_lookup: Callable[[int], int | None],
+    ) -> bool:
+        if not exempt_turn_holder or not isinstance(row_holder, str) or row_holder != exempt_turn_holder:
+            return False
+        match = _TURN_HOLDER_RE.fullmatch(row_holder)
+        if match is None or match.group("platform") != "cron":
+            return False
+        if not holder_pid_checkable(row_holder):
+            return False
+        return self._verify_live_ancestor_chain(int(match.group("pid")), ppid_lookup)
+
+    def _probe_turn_leases_table_locked(
+        self,
+        conn: sqlite3.Connection,
+        now: float,
+        exempt_turn_holder: str | None,
+        out_meta: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        turn_sql = (
+            "SELECT conversation_id, holder, expires_at FROM session_turn_leases "
+            "WHERE expires_at >= ? ORDER BY expires_at DESC"
+        )
+        turn_rows = conn.execute(turn_sql, (now,)).fetchall()
+        if not turn_rows:
+            return None
+        ppid_lookup: Callable[[int], int | None] | None = None
+        exempt_cache: dict[str, bool] = {}
+        for turn_row in turn_rows:
+            holder_val = turn_row[1]
+            if isinstance(holder_val, str) and exempt_turn_holder and holder_val == exempt_turn_holder:
+                if holder_val not in exempt_cache:
+                    if ppid_lookup is None:
+                        ppid_lookup = self._resolve_ppid_lookup()
+                    exempt_cache[holder_val] = self._is_turn_lease_row_exempt(
+                        holder_val, exempt_turn_holder, ppid_lookup
+                    )
+                if exempt_cache[holder_val]:
+                    continue
+            return (
+                "DEFERRED_ACTIVE_SESSION",
+                {
+                    "session_id": turn_row[0],
+                    "status": "running_turn",
+                    "holder": holder_val,
+                    "expires_at": turn_row[2],
+                    "active_turn_count": len(turn_rows),
+                },
+            )
+        if out_meta is not None and exempt_turn_holder:
+            out_meta["exempted_turn_holder"] = exempt_turn_holder
+        return None
+
     def _probe_state_db_sessions_locked(
-        self, now: float
+        self,
+        now: float,
+        *,
+        exempt_turn_holder: str | None = None,
+        out_meta: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]] | None:
         """Probe the configured `state.db` for active turns; any probe failure defers (fail closed).
 
@@ -670,17 +863,9 @@ class WorkspaceLeaseCoordinator:
         try:
             tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "session_turn_leases" in tables:
-                turn_sql = (
-                    "SELECT conversation_id, holder, expires_at FROM session_turn_leases "
-                    "WHERE expires_at >= ? LIMIT 1"
+                return self._probe_turn_leases_table_locked(
+                    conn, now, exempt_turn_holder, out_meta
                 )
-                turn_row = conn.execute(turn_sql, (now,)).fetchone()
-                if turn_row is not None:
-                    return (
-                        "DEFERRED_ACTIVE_SESSION",
-                        {"session_id": turn_row[0], "status": "running_turn", "holder": turn_row[1], "expires_at": turn_row[2]},
-                    )
-                return None
 
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
             if not columns:
@@ -748,9 +933,16 @@ class WorkspaceLeaseCoordinator:
             return None
 
     def _check_external_contention_locked(
-        self, now: float, canonical_scopes: Sequence[str] = ()
+        self,
+        now: float,
+        canonical_scopes: Sequence[str] = (),
+        *,
+        exempt_turn_holder: str | None = None,
+        out_meta: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]] | None:
-        state_db_result = self._probe_state_db_sessions_locked(now)
+        state_db_result = self._probe_state_db_sessions_locked(
+            now, exempt_turn_holder=exempt_turn_holder, out_meta=out_meta
+        )
         if state_db_result is not None:
             return state_db_result
 
@@ -792,6 +984,7 @@ class WorkspaceLeaseCoordinator:
         ttl_s: float,
         holder_pid: int,
         process_start_time_ns: int,
+        exempt_turn_holder: str | None = None,
     ) -> LeaseExecutionReport:
         clamped_ttl = _clamp_ttl_s(ttl_s)
         with self._acquire_kernel_mutex(timeout_s=5.0):
@@ -830,9 +1023,13 @@ class WorkspaceLeaseCoordinator:
                         },
                     )
 
+            acq_details: dict[str, Any] = {}
             if mode == "exclusive_cutover":
                 ext_conflict = self._check_external_contention_locked(
-                    now, canonical_scopes
+                    now,
+                    canonical_scopes,
+                    exempt_turn_holder=exempt_turn_holder,
+                    out_meta=acq_details,
                 )
                 if ext_conflict is not None:
                     reason_code, details = ext_conflict
@@ -976,6 +1173,7 @@ class WorkspaceLeaseCoordinator:
                 process_start_time_ns=process_start_time_ns,
                 fencing_tokens=wrapped_tokens,
                 fencing_token=primary_token,
+                details=acq_details,
             )
 
     def acquire_workspace_lease(
@@ -989,6 +1187,7 @@ class WorkspaceLeaseCoordinator:
         holder_pid: int | None = None,
         process_start_time_ns: int | None = None,
         stop_event: threading.Event | None = None,
+        exempt_turn_holder: str | None = None,
     ) -> LeaseExecutionReport:
         """Acquire a fenced lease over `scopes` in `shared_session` or `exclusive_cutover` mode."""
         if isinstance(scopes, str):
@@ -1016,6 +1215,7 @@ class WorkspaceLeaseCoordinator:
             ttl_s=clamped_ttl,
             holder_pid=pid,
             process_start_time_ns=start_ns,
+            exempt_turn_holder=exempt_turn_holder,
         )
         if report.status == "ACQUIRED" or float(wait_seconds) <= 0.0:
             return report
@@ -1064,6 +1264,7 @@ class WorkspaceLeaseCoordinator:
                     ttl_s=clamped_ttl,
                     holder_pid=pid,
                     process_start_time_ns=start_ns,
+                    exempt_turn_holder=exempt_turn_holder,
                 )
                 if report.status == "ACQUIRED":
                     return report
@@ -1344,6 +1545,9 @@ class WorkspaceLeaseCoordinator:
         - `reset_mode="mixed"` (overlay-preserving plugin alignment contract, S-04): updates `ref_name`
           and aligns `HEAD`/index to `new_sha` via `git reset --quiet --mixed <new_sha>` while intentionally
           leaving deployed working-tree overlay bytes untouched on disk.
+        - `reset_mode="ff-only"` (zero-checkout primary repo contract): verifies clean tracked tree,
+          symbolic `HEAD == ref_name`, CAS `old_sha`, and `merge-base --is-ancestor`, then advances via
+          `git merge --ff-only <new_sha>` with zero `git reset` / `git checkout` calls.
         """
         return execute_atomic_fenced_git_ref_update(
             self,
@@ -1614,6 +1818,7 @@ def acquire_workspace_lease(
     state_db_path: Path | str | None = None,
     worktrees_root: Path | str | None = None,
     wait_seconds: float = 0.0,
+    exempt_turn_holder: str | None = None,
 ) -> LeaseExecutionReport:
     coord = WorkspaceLeaseCoordinator(
         lease_dir=lease_dir,
@@ -1626,6 +1831,7 @@ def acquire_workspace_lease(
         holder=holder,
         ttl_s=ttl_s,
         wait_seconds=wait_seconds,
+        exempt_turn_holder=exempt_turn_holder,
     )
 
 

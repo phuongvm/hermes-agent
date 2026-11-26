@@ -69,10 +69,15 @@ _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", de
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Admitted DurableTurnLease.holder for the active turn (outside _SESSION_VARS so set_session_vars'
+# positional zip stays untouched, bridged via _VAR_MAP so child terminals receive it).
+_SESSION_TURN_LEASE_HOLDER = ContextVar("HERMES_SESSION_TURN_LEASE_HOLDER", default=_UNSET)
+
 # Legacy env-var name -> ContextVar for get_session_env (_SESSION_ASYNC_DELIVERY deliberately
 # absent: it is a bool capability, read via async_delivery_supported).
 _VAR_MAP = {var.name: var for var in (
-    *_SESSION_VARS, _CRON_AUTO_DELIVER_PLATFORM, _CRON_AUTO_DELIVER_CHAT_ID,
+    *_SESSION_VARS, _SESSION_TURN_LEASE_HOLDER,
+    _CRON_AUTO_DELIVER_PLATFORM, _CRON_AUTO_DELIVER_CHAT_ID,
     _CRON_AUTO_DELIVER_THREAD_ID,
 )}
 
@@ -142,6 +147,24 @@ def scoped_session_key(session_key: str) -> Iterator[None]:
         _SESSION_KEY.reset(token)
 
 
+@contextmanager
+def scoped_turn_lease_holder(holder: str | None = None) -> Iterator[None]:
+    """Bind the admitted ``DurableTurnLease.holder`` for this turn and restore the prior
+    value on exit; never touches ``os.environ``. When ``holder`` is ``None``/empty, masks any
+    inherited outer binding with ``""`` while leaving an unbound top-level ``_UNSET``."""
+    if holder:
+        next_val: Any = str(holder)
+    elif _SESSION_TURN_LEASE_HOLDER.get() is _UNSET:
+        next_val = _UNSET
+    else:
+        next_val = ""
+    token = _SESSION_TURN_LEASE_HOLDER.set(next_val)
+    try:
+        yield
+    finally:
+        _SESSION_TURN_LEASE_HOLDER.reset(token)
+
+
 def bound_session_key() -> str:
     """The route key bound in THIS context, ``""`` when none is: no ``os.environ`` fallback, so a
     thread that inherited no context never borrows another session's key."""
@@ -197,6 +220,7 @@ def clear_session_vars(tokens: list) -> None:
     declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
     for var in _SESSION_VARS:
         var.set("")
+    _SESSION_TURN_LEASE_HOLDER.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _SESSION_TURN_EVENT.set(None)

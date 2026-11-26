@@ -121,24 +121,37 @@ def recover_git_ref_journal_locked(
                 ["git", "-C", str(repo_root), "rev-parse", active_tx.ref_name or "HEAD"],
                 text=True,
                 stderr=subprocess.DEVNULL,
+                timeout=10.0,
             ).strip()
         )
     if current_sha == active_tx.staged_digest:
         reset_mode = getattr(active_tx, "reset_mode", "hard") or "hard"
-        stash_sha = getattr(active_tx, "stash_sha", "") or ""
-        stash_msg = (
-            getattr(active_tx, "stash_message", "")
-            or f"recovered-stash-{active_tx.tx_id}"
-        )
-        _reconcile_git_worktree_and_stash(
-            repo_root,
-            active_tx.staged_digest,
-            reset_mode=reset_mode,
-            stash_sha=stash_sha,
-            stash_message=stash_msg,
-            refresh_index=bool(getattr(active_tx, "refresh_index", False)),
-            error_context=f"during recovery of {active_tx.tx_id}",
-        )
+        if reset_mode == "ff-only":
+            dirty_tracked = subprocess.check_output(
+                ["git", "-C", str(repo_root), "status", "--porcelain", "--untracked-files=no"],
+                text=True,
+                timeout=10.0,
+            ).strip()
+            if dirty_tracked:
+                raise RuntimeError(
+                    f"Cannot auto-recover ff-only git_ref tx {active_tx.tx_id} on dirty tracked "
+                    f"tree without destructive reset: {dirty_tracked}"
+                )
+        else:
+            stash_sha = getattr(active_tx, "stash_sha", "") or ""
+            stash_msg = (
+                getattr(active_tx, "stash_message", "")
+                or f"recovered-stash-{active_tx.tx_id}"
+            )
+            _reconcile_git_worktree_and_stash(
+                repo_root,
+                active_tx.staged_digest,
+                reset_mode=reset_mode,
+                stash_sha=stash_sha,
+                stash_message=stash_msg,
+                refresh_index=bool(getattr(active_tx, "refresh_index", False)),
+                error_context=f"during recovery of {active_tx.tx_id}",
+            )
         record = ledger.active_records.get(active_tx.scope)
         if record is not None:
             record.last_committed_digest = active_tx.staged_digest
@@ -162,6 +175,66 @@ def recover_git_ref_journal_locked(
     return [done] if done else []
 
 
+def _validate_ff_only_preconditions(
+    repo: Path,
+    *,
+    ref_name: str,
+    resolved_old: str,
+    resolved_new: str,
+) -> str:
+    """Enforce zero-checkout fast-forward-only preconditions before any Git mutation."""
+    sym_res = subprocess.run(
+        ["git", "-C", str(repo), "symbolic-ref", "-q", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    sym_head = sym_res.stdout.strip() if sym_res.returncode == 0 else ""
+    if sym_res.returncode != 0 or sym_head != ref_name:
+        raise RuntimeError(
+            f"reset_mode='ff-only' requires symbolic HEAD on {ref_name!r}, "
+            f"got {sym_head or 'detached HEAD'!r}"
+        )
+    current_ref = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", ref_name],
+        text=True,
+        timeout=10.0,
+    ).strip()
+    expected_old = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", f"{resolved_old}^{{commit}}"],
+        text=True,
+        timeout=10.0,
+    ).strip()
+    if current_ref != expected_old:
+        raise RuntimeError(
+            f"reset_mode='ff-only' CAS mismatch on {ref_name}: "
+            f"expected {expected_old}, found {current_ref}"
+        )
+    dirty_tracked = subprocess.check_output(
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+        text=True,
+        timeout=10.0,
+    ).strip()
+    if dirty_tracked:
+        raise RuntimeError(
+            f"reset_mode='ff-only' refuses dirty tracked working tree on {repo}: {dirty_tracked}"
+        )
+    anc_res = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", expected_old, resolved_new],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    if anc_res.returncode != 0:
+        raise RuntimeError(
+            f"reset_mode='ff-only' refuses non-fast-forward update on {ref_name} "
+            f"from {expected_old} to {resolved_new}"
+        )
+    return expected_old
+
+
 def execute_atomic_fenced_git_ref_update(
     coord: WorkspaceLeaseCoordinator,
     scope: str,
@@ -180,10 +253,17 @@ def execute_atomic_fenced_git_ref_update(
 ) -> str:
     """Execute a fenced, journaled Git ref fast-forward + working-tree sync inside `workspace_lease.lock`."""
     repo = Path(repo_root)
-    if reset_mode not in ("hard", "mixed"):
+    if reset_mode not in ("hard", "mixed", "ff-only"):
         raise ValueError(
-            f"Unsupported git reset_mode {reset_mode!r}: expected 'hard' or 'mixed'"
+            f"Unsupported git reset_mode {reset_mode!r}: expected 'hard', 'mixed', or 'ff-only'"
         )
+    if reset_mode == "ff-only":
+        if stash_dirty:
+            raise ValueError("reset_mode='ff-only' cannot be combined with stash_dirty=True")
+        if not ref_name or ref_name == "HEAD":
+            raise ValueError(
+                f"reset_mode='ff-only' requires an explicit branch ref (e.g. 'refs/heads/main'), got {ref_name!r}"
+            )
     with coord._acquire_kernel_mutex(timeout_s=5.0):
         ledger = coord._read_ledger_locked()
         coord._recover_interrupted_commit_locked(ledger)
@@ -236,6 +316,13 @@ def execute_atomic_fenced_git_ref_update(
             ["git", "-C", str(repo), "rev-parse", f"{new_sha}^{{commit}}"],
             text=True,
         ).strip()
+        if reset_mode == "ff-only":
+            resolved_old = _validate_ff_only_preconditions(
+                repo,
+                ref_name=ref_name,
+                resolved_old=resolved_old,
+                resolved_new=resolved_new,
+            )
         token_slug = _token_to_slug(acquired_token)
         stash_sha = ""
         effective_stash_msg = ""
@@ -281,7 +368,16 @@ def execute_atomic_fenced_git_ref_update(
         )
         coord._write_journal_locked(journal_entry)
 
-        if resolved_old != resolved_new or stash_sha:
+        if reset_mode == "ff-only":
+            if resolved_old != resolved_new:
+                subprocess.run(
+                    ["git", "-C", str(repo), "merge", "--ff-only", resolved_new],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30.0,
+                )
+        elif resolved_old != resolved_new or stash_sha:
             if resolved_old != resolved_new and ref_name and ref_name != "HEAD":
                 cmd = [
                     "git",
