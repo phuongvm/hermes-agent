@@ -1298,6 +1298,9 @@ async def get_status(profile: Optional[str] = None,
                 status["webapp_state"] = move["state"]
                 if move["url"]:
                     status["webapp_url"] = move["url"]
+        e2e_nonce = os.environ.get("HERMES_E2E_INSTANCE_NONCE", "").strip()
+        if e2e_nonce:
+            status["instance_nonce"] = e2e_nonce
         return status
     finally:
         if status_scope is not None:
